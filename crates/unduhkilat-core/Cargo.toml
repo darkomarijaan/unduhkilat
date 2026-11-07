@@ -20,6 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 zeroize = "1"
 base64 = "0.22"
+ed25519-dalek = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 url = "2"
 librqbit = { version = "9.1", default-features = false, features = ["rust-tls"] }
 

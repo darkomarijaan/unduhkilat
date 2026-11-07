@@ -50,6 +50,15 @@
     return type === 'media' || /^(video|audio)\//.test(m) || /mpegurl|dash\+xml/.test(m) || /\.(m3u8|mpd)(\?|#|$)/i.test(url || '');
   }
 
+  /** Smaller than this is UI noise (click/notification sounds), not something to download. */
+  const MIN_MEDIA_BYTES = 64 * 1024;
+
+  /** A response whose known size is tiny and that is not a playlist/manifest. Unknown size is kept. */
+  function isTinyMedia(mime, url, size) {
+    if (size == null || size >= MIN_MEDIA_BYTES) return false;
+    return !(/mpegurl|dash\+xml/i.test(mime || '') || /\.(m3u8|mpd)(\?|#|$)/i.test(url || ''));
+  }
+
   function headerMap(list) {
     const out = {};
     for (const h of list || []) out[String(h.name).toLowerCase()] = h.value;
@@ -106,7 +115,7 @@
     return entry;
   }
 
-  const api = { RANGE_PARAMS, isHttp, normalizeUrl, classify, isMediaResponse, headerMap, sizeFromHeaders, cookieHeader, baseName, fileNameFromUrl, mergeCandidate };
+  const api = { RANGE_PARAMS, isHttp, normalizeUrl, classify, isMediaResponse, isTinyMedia, headerMap, sizeFromHeaders, cookieHeader, baseName, fileNameFromUrl, mergeCandidate };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.UK = api;
 })(typeof self !== 'undefined' ? self : globalThis);

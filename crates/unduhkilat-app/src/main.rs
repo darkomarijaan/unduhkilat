@@ -116,11 +116,33 @@ downloaded_files_touched: {}", r.database_purged, r.logs_purged, r.files_removed
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Update helper (FR-060): a copy of the new exe that swaps files after the old process exits.
+    if args.first().map(String::as_str) == Some("--apply-update") && args.len() == 4 {
+        let pid: u32 = args[1].parse().unwrap_or(0);
+        let code = match unduhkilat_core::update::run_apply(pid, std::path::Path::new(&args[2]), std::path::Path::new(&args[3])) {
+            Ok(()) => 0,
+            Err(msg) => {
+                rfd::MessageDialog::new().set_title("UnduhKilat").set_description(msg).set_level(rfd::MessageLevel::Error).show();
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     if let Some(cmd) = args.first().filter(|a| a.starts_with("--admin-")) {
         admin_command(cmd, &args[1..]);
     }
     if let Some(cmd @ ("register-host" | "unregister-host")) = args.first().map(String::as_str) {
         host_registration_command(cmd);
+    }
+    // A clicked magnet/link: hand it to the running instance and exit (no second window).
+    if let Some(link) = args.iter().find(|a| unduhkilat_core::protocol::is_link_arg(a)) {
+        if args.first().map(String::as_str) != Some("cli") {
+            if let Ok(paths) = AppPaths::from_current_exe() {
+                if unduhkilat_core::protocol::forward_link(&paths, link).is_ok() {
+                    return;
+                }
+            }
+        }
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
 
@@ -175,9 +197,15 @@ fn main() {
             Ok(st) => tracing::info!(?st, "native messaging host registration verified"),
             Err(e) => tracing::warn!(error = %e, "native messaging host registration failed; browser capture is unavailable"),
         }
+        // Lets UnduhKilat be chosen as the handler for magnet: links (Settings > Default apps).
+        if let Ok(exe) = std::env::current_exe() {
+            if let Err(e) = unduhkilat_core::protocol::register(&exe) {
+                tracing::warn!(error = %e, "magnet handler registration failed");
+            }
+        }
     }
 
-    let first_url = args.into_iter().find(|a| a.starts_with("http://") || a.starts_with("https://") || a.starts_with("ftp://"));
+    let first_url = args.into_iter().find(|a| unduhkilat_core::protocol::is_link_arg(a));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

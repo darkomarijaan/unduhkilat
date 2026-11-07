@@ -129,13 +129,13 @@ test('sniffed media becomes one deduplicated candidate with its size and is push
   const e = makeEnv(okHost);
   await tick();
   const hdr = (n, v) => ({ name: n, value: v });
-  e.L.headers({ tabId: 7, url: 'https://cdn.test/v.mp4?range=0-99', type: 'media', statusCode: 206, responseHeaders: [hdr('Content-Type', 'video/mp4'), hdr('Content-Range', 'bytes 0-99/5000')] });
-  e.L.headers({ tabId: 7, url: 'https://cdn.test/v.mp4?range=100-199', type: 'media', statusCode: 206, responseHeaders: [hdr('Content-Type', 'video/mp4'), hdr('Content-Range', 'bytes 100-199/5000')] });
+  e.L.headers({ tabId: 7, url: 'https://cdn.test/v.mp4?range=0-99', type: 'media', statusCode: 206, responseHeaders: [hdr('Content-Type', 'video/mp4'), hdr('Content-Range', 'bytes 0-99/5000000')] });
+  e.L.headers({ tabId: 7, url: 'https://cdn.test/v.mp4?range=100-199', type: 'media', statusCode: 206, responseHeaders: [hdr('Content-Type', 'video/mp4'), hdr('Content-Range', 'bytes 100-199/5000000')] });
   e.L.headers({ tabId: 7, url: 'https://cdn.test/app.js', type: 'script', statusCode: 200, responseHeaders: [hdr('Content-Type', 'text/javascript')] });
   e.L.headers({ tabId: -1, url: 'https://cdn.test/bg.mp4', type: 'media', statusCode: 200, responseHeaders: [hdr('Content-Type', 'video/mp4')] });
   const r = await e.ask({ type: 'get-candidates' }, 7);
   assert.equal(r.list.length, 1);
-  assert.equal(r.list[0].size, 5000);
+  assert.equal(r.list[0].size, 5000000);
   assert.deepEqual([...r.list[0].sources], ['network']); // copy: arrays from the vm realm differ in prototype
   assert.ok(e.sent.some(([id, m]) => id === 7 && m.type === 'candidates'));
 });
@@ -143,7 +143,7 @@ test('sniffed media becomes one deduplicated candidate with its size and is push
 test('DOM-hook and network candidates are unioned; HLS is listed but cannot be sent', async () => {
   const e = makeEnv(okHost);
   await tick();
-  e.L.headers({ tabId: 3, url: 'https://cdn.test/v.mp4', type: 'media', statusCode: 200, responseHeaders: [{ name: 'content-type', value: 'video/mp4' }, { name: 'content-length', value: '777' }] });
+  e.L.headers({ tabId: 3, url: 'https://cdn.test/v.mp4', type: 'media', statusCode: 200, responseHeaders: [{ name: 'content-type', value: 'video/mp4' }, { name: 'content-length', value: '777000' }] });
   await e.ask({ type: 'dom-media', items: [{ url: 'https://cdn.test/v.mp4' }, { url: 'https://cdn.test/live.m3u8' }, { url: 'blob:https://cdn.test/zzz' }] }, 3);
   const list = (await e.ask({ type: 'get-candidates' }, 3)).list;
   assert.equal(list.length, 2, 'blob: ignored, mp4 deduped across sources');
@@ -160,7 +160,7 @@ test('DOM-hook and network candidates are unioned; HLS is listed but cannot be s
   assert.equal(sentOk.ok, true);
   const req = e.posted.find((m) => m.command === 'media.send_to_app');
   assert.equal(req.payload.referer, 'https://page.test/watch');
-  assert.equal(req.payload.total_bytes, 777);
+  assert.equal(req.payload.total_bytes, 777000);
   assert.equal(req.payload.cookies, 'sid=abc; k=v');
 });
 
@@ -185,4 +185,12 @@ test('pushed status updates the popup list using the engine state names', async 
   e.port._onMsg({ type: 'event', event: 'browser.push_status', payload: { request_id: 'prop_1', download_id: 'dl-1', state: 'completed', downloaded_bytes: 100, total_bytes: 100 } });
   s = await e.ask({ type: 'popup-state' });
   assert.equal(s.tracked[0].state, 'completed');
+});
+
+test('tiny media (UI sounds) is not offered as a candidate', async () => {
+  const e = makeEnv(okHost);
+  await tick();
+  e.L.headers({ tabId: 9, url: 'https://www.youtube.com/s/sound/click.mp3', type: 'media', statusCode: 200, responseHeaders: [{ name: 'content-type', value: 'audio/mpeg' }, { name: 'content-length', value: '6800' }] });
+  const r = await e.ask({ type: 'get-candidates' }, 9);
+  assert.equal(r.list.length, 0);
 });

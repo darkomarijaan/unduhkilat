@@ -215,7 +215,9 @@ function onHeaders(d) {
   const mime = (h['content-type'] || '').split(';')[0].trim();
   if (!UK.isMediaResponse(d.type, mime, d.url)) return;
   if (d.statusCode !== 200 && d.statusCode !== 206) return;
-  UK.mergeCandidate(candidatesFor(d.tabId), { url: d.url, mime, size: UK.sizeFromHeaders(h), sources: ['network'] });
+  const size = UK.sizeFromHeaders(h);
+  if (UK.isTinyMedia(mime, d.url, size)) return; // e.g. YouTube's own UI sounds
+  UK.mergeCandidate(candidatesFor(d.tabId), { url: d.url, mime, size, sources: ['network'] });
   publish(d.tabId);
 }
 

@@ -65,3 +65,11 @@ test('cookieHeader and file names', () => {
   assert.equal(UK.baseName(''), '');
   assert.equal(UK.fileNameFromUrl('https://a.test/dir/My%20File.iso?x=1'), 'My File.iso');
 });
+
+test('isTinyMedia hides UI sounds but keeps playlists and unknown sizes', () => {
+  assert.ok(UK.isTinyMedia('audio/mpeg', 'https://a/x.mp3', 6800));
+  assert.ok(!UK.isTinyMedia('audio/mpeg', 'https://a/x.mp3', 5 * 1024 * 1024));
+  assert.ok(!UK.isTinyMedia('audio/mpeg', 'https://a/x.mp3', null), 'unknown size is not filtered');
+  assert.ok(!UK.isTinyMedia('application/vnd.apple.mpegurl', 'https://a/x', 900), 'playlists are small by nature');
+  assert.ok(!UK.isTinyMedia('', 'https://a/stream.m3u8?x=1', 900));
+});

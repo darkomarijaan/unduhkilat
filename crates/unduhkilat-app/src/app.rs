@@ -23,6 +23,7 @@ use unduhkilat_core::models::{Category, Download, DownloadState, Segment};
 use unduhkilat_core::bridge::{Bridge, Proposal};
 use unduhkilat_core::native;
 use unduhkilat_core::paths::AppPaths;
+use unduhkilat_core::update::{self, UpdateInfo};
 use unduhkilat_core::{category, repo};
 
 const DOCK_HEIGHT: f32 = 200.0;
@@ -143,6 +144,7 @@ struct SettingsState {
     cats: Vec<Category>,
     new_cat: (String, String, String),
     clip: bool,
+    upd: bool,
     t_seeding: bool,
     t_ratio: f32,
     t_dht: bool,
@@ -157,6 +159,17 @@ enum Msg {
     Torrent(String, Option<TorrentInfo>),
     Scan(std::result::Result<ScanResult, String>),
     Search(std::result::Result<SearchOutcome, String>),
+    /// Result of an update check; the flag says the user asked for it (so "up to date" is reported).
+    UpdateFound(std::result::Result<Option<UpdateInfo>, String>, bool),
+    /// The update was downloaded, verified and unpacked (or why not).
+    UpdateStaged(std::result::Result<(), String>),
+}
+
+#[derive(Clone)]
+enum UpdState {
+    None,
+    Available(UpdateInfo),
+    Working(String),
 }
 
 pub struct App {
@@ -200,6 +213,7 @@ pub struct App {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     notice: Option<(String, Instant)>,
+    update: UpdState,
 }
 
 impl App {
@@ -224,9 +238,14 @@ impl App {
             last_refresh: Instant::now() - Duration::from_secs(10), live: HashMap::new(), torrent: None, torrent_poll: Instant::now() - Duration::from_secs(10), grab: GrabState::default(), search: SearchState::default(), clip_rx, clip_enabled, events,
             selected: None, checked: HashSet::new(), filter: Filter::All, sort: (SortKey::None, true),
             screen: Screen::Downloads, dock_open: false, dock_height: DOCK_HEIGHT, add: None, settings: None,
-            log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None,
+            log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None, update: UpdState::None,
         };
         app.refresh();
+        // FR-060: look for a newer signed release (setting is on by default; tests/demos can skip it).
+        let check_on = app.manager.db().read(|c| repo::get_setting(c, keys::UPDATE_CHECK)).ok().flatten().map(|v| v != "0").unwrap_or(true);
+        if check_on && std::env::var_os("UNDUHKILAT_NO_UPDATE_CHECK").is_none() {
+            app.check_updates(false);
+        }
         // Test aid: open straight on a screen (settings, search, grabber, diagnostics, add).
         match std::env::var("UNDUHKILAT_START_SCREEN").ok().as_deref() {
             Some("settings") => app.open_settings_screen(),
@@ -246,6 +265,46 @@ impl App {
             priority: 0, referer: String::new(), cookies: String::new(), user_agent: String::new(), probe: String::new(), err: None,
             origin: None, torrent_file: None,
         });
+    }
+
+    /// Ask GitHub for a newer signed release (uses the app client, so the proxy applies).
+    fn check_updates(&mut self, manual: bool) {
+        let (tx, ctx, client) = (self.tx.clone(), self.ctx.clone(), self.manager.client());
+        self.rt.spawn(async move {
+            let r = update::check(&client, env!("CARGO_PKG_VERSION")).await.map_err(|e| e.message);
+            let _ = tx.send(Msg::UpdateFound(r, manual));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The user clicked "Perbarui": download, verify the signature, unpack. Nothing is replaced yet.
+    fn start_update(&mut self, info: UpdateInfo) {
+        self.update = UpdState::Working(info.version.clone());
+        let (tx, ctx, client) = (self.tx.clone(), self.ctx.clone(), self.manager.client());
+        let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        self.rt.spawn(async move {
+            let r = async {
+                let dir = dir.ok_or_else(|| unduhkilat_core::AppError::internal("cannot locate the app folder"))?;
+                let zip = update::download(&client, &info).await?;
+                update::stage(&zip, &update::staging_dir(&dir))
+            }
+            .await
+            .map_err(|e| format!("{}: {}", e.code, e.message));
+            let _ = tx.send(Msg::UpdateStaged(r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Hand over to the updater helper and exit. Running downloads are paused first (resume on next start).
+    fn apply_update(&mut self) {
+        let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) else { return };
+        if let Err(e) = update::spawn_apply(&update::staging_dir(&dir), &dir) {
+            self.update = UpdState::None;
+            self.notice = Some((format!("{}: {}", e.code, e.message), Instant::now()));
+            return;
+        }
+        let _ = self.rt.block_on(self.manager.shutdown(Duration::from_secs(15)));
+        std::process::exit(0);
     }
 
     /// FR-039: a download proposed by the browser. Nothing starts until the user confirms.
@@ -336,6 +395,24 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Notice(s) => self.notice = Some((s, Instant::now())),
+                Msg::UpdateFound(r, manual) => match r {
+                    Ok(Some(info)) => {
+                        if !matches!(self.update, UpdState::Working(_)) {
+                            self.update = UpdState::Available(info);
+                        }
+                    }
+                    Ok(None) if manual => self.notice = Some((format!("UnduhKilat {} sudah yang terbaru.", env!("CARGO_PKG_VERSION")), Instant::now())),
+                    Ok(None) => {}
+                    Err(e) if manual => self.notice = Some((e, Instant::now())),
+                    Err(e) => tracing::info!(error = %e, "update check failed"),
+                },
+                Msg::UpdateStaged(r) => match r {
+                    Ok(()) => self.apply_update(),
+                    Err(e) => {
+                        self.update = UpdState::None;
+                        self.notice = Some((e, Instant::now()));
+                    }
+                },
                 Msg::Search(r) => {
                     self.search.busy = false;
                     match r {
@@ -794,6 +871,27 @@ impl eframe::App for App {
         let ruled = |fill: Color32, m: egui::Margin| egui::Frame::new().fill(fill).stroke(Stroke::new(1.0, BORDER)).inner_margin(m);
 
         egui::Panel::top("head").exact_size(76.0).frame(flat(ACCENT, egui::Margin::symmetric(24, 8))).show(ui, |ui| self.header(ui, compact));
+        if !matches!(self.update, UpdState::None) {
+            let state = self.update.clone();
+            egui::Panel::top("update").frame(flat(SURFACE, egui::Margin::symmetric(24, 8))).show(ui, |ui| {
+                ui.horizontal(|ui| match state {
+                    UpdState::Available(info) => {
+                        ui.label(RichText::new(format!("Versi {} tersedia (Anda memakai {}).", info.version, env!("CARGO_PKG_VERSION"))).font(theme::bold(13.0)));
+                        ui.label(RichText::new("Unduhan yang berjalan akan dijeda lalu dilanjutkan setelah pembaruan.").color(FG_SECONDARY));
+                        if ui.button("Perbarui sekarang").clicked() {
+                            self.start_update(info);
+                        }
+                        if ui.button("Nanti").clicked() {
+                            self.update = UpdState::None;
+                        }
+                    }
+                    UpdState::Working(v) => {
+                        ui.label(RichText::new(format!("Mengunduh dan memverifikasi versi {v}... aplikasi akan dibuka ulang otomatis.")).font(theme::bold(13.0)));
+                    }
+                    UpdState::None => {}
+                });
+            });
+        }
         egui::Panel::bottom("status").exact_size(30.0).frame(ruled(SURFACE, egui::Margin::symmetric(20, 4))).show(ui, |ui| self.status_strip(ui));
 
         if !compact {
@@ -1006,6 +1104,7 @@ impl App {
             cats: self.categories.clone(),
             new_cat: (String::new(), String::new(), String::new()),
             clip: get(keys::CLIPBOARD_MONITOR).is_some_and(|v| v == "1"),
+            upd: get(keys::UPDATE_CHECK).map(|v| v != "0").unwrap_or(true),
             t_seeding: get(keys::TORRENT_SEEDING).map(|v| v != "0").unwrap_or(true),
             t_ratio: get(keys::TORRENT_SEED_RATIO).and_then(|v| v.parse().ok()).unwrap_or(1.0),
             t_dht: get(keys::TORRENT_DHT).map(|v| v != "0").unwrap_or(true),
@@ -1524,6 +1623,7 @@ impl App {
     fn settings_screen(&mut self, ui: &mut Ui) {
         let Some(mut s) = self.settings.take() else { self.open_settings_screen(); return };
         let mut save = false;
+        let mut check_now = false;
         ui.label(RichText::new("Pengaturan").font(theme::bold(17.0)));
         ui.add_space(6.0);
         ui.horizontal_top(|ui| {
@@ -1671,6 +1771,10 @@ impl App {
                         ui.checkbox(&mut s.close_to_tray, "Tutup jendela ke tray (unduhan tetap berjalan)");
                         ui.checkbox(&mut s.toast, "Tampilkan notifikasi saat unduhan selesai");
                         ui.checkbox(&mut s.clip, "Pantau clipboard: tawarkan tautan HTTP/HTTPS/FTP yang disalin");
+                        ui.checkbox(&mut s.upd, "Cek versi baru saat aplikasi dibuka (menghubungi github.com)");
+                        if ui.button("Periksa pembaruan sekarang").clicked() {
+                            check_now = true;
+                        }
                         ui.label(RichText::new("Hanya teks yang seluruhnya satu tautan yang ditawarkan, dan tidak ada yang diunduh sebelum Anda mengonfirmasi.").color(FG_SECONDARY));
                     }
                     SettingsTab::Categories => {
@@ -1724,6 +1828,7 @@ impl App {
             let (c, n, g, tray, toast) = (s.concurrency as usize, s.connections, s.global_kbps as u64, s.close_to_tray, s.toast);
             self.clip_enabled.store(s.clip, Ordering::Relaxed);
             let clip = s.clip;
+            let upd = s.upd;
             let (t_seed, t_ratio, t_dht, t_upnp, t_port) = (s.t_seeding, s.t_ratio.max(0.0), s.t_dht, s.t_upnp, s.t_port.min(65535));
             let net_changed = (t_dht, t_upnp, t_port) != s.t_net_orig;
             s.t_net_orig = (t_dht, t_upnp, t_port);
@@ -1733,6 +1838,7 @@ impl App {
                     repo::set_setting(conn, keys::DEFAULT_CONNECTIONS, &n.to_string())?;
                     repo::set_setting(conn, keys::CLOSE_TO_TRAY, if tray { "1" } else { "0" })?;
                     repo::set_setting(conn, keys::CLIPBOARD_MONITOR, if clip { "1" } else { "0" })?;
+                    repo::set_setting(conn, keys::UPDATE_CHECK, if upd { "1" } else { "0" })?;
                     repo::set_setting(conn, keys::TORRENT_SEEDING, if t_seed { "1" } else { "0" })?;
                     repo::set_setting(conn, keys::TORRENT_SEED_RATIO, &t_ratio.to_string())?;
                     repo::set_setting(conn, keys::TORRENT_DHT, if t_dht { "1" } else { "0" })?;
@@ -1746,6 +1852,9 @@ impl App {
                 m.set_concurrency_limit(c).await
             });
             self.notice = Some(("Pengaturan disimpan.".into(), Instant::now()));
+        }
+        if check_now {
+            self.check_updates(true);
         }
         self.settings = Some(s);
     }

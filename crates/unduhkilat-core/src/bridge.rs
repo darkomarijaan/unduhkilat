@@ -287,6 +287,26 @@ async fn dispatch(inner: &Arc<Inner>, req: Request) -> Result<Value> {
             // Nothing has started: the user still has to confirm (FR-039).
             Ok(json!({ "request_id": request_id, "state": "pending_confirmation" }))
         }
+        "app.open_link" => {
+            // A magnet/link clicked in any program (OS protocol handler); still only a proposal.
+            let url = req.payload.get("url").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
+            let scheme = url::Url::parse(&url).map(|u| u.scheme().to_string()).map_err(|_| AppError::new(ErrorCode::ErrInvalidUrlScheme, "not a valid link"))?;
+            if !matches!(scheme.as_str(), "http" | "https" | "ftp" | "magnet") {
+                return Err(AppError::new(ErrorCode::ErrInvalidUrlScheme, format!("{scheme} is not supported")));
+            }
+            if inner.pending.load(Ordering::SeqCst) >= MAX_PENDING {
+                return Err(AppError::internal("too many proposals are waiting for confirmation"));
+            }
+            let request_id = format!("prop_{}", uuid::Uuid::new_v4().simple());
+            let proposal = Proposal { request_id: request_id.clone(), source: "link".into(), url, file_name: None, mime_type: None, total_bytes: None, referer: None, user_agent: None, cookies: None };
+            inner.pending.fetch_add(1, Ordering::SeqCst);
+            if inner.proposals.send(proposal).is_err() {
+                inner.pending.fetch_sub(1, Ordering::SeqCst);
+                return Err(AppError::internal("the UI is not accepting proposals"));
+            }
+            (inner.wake)();
+            Ok(json!({ "request_id": request_id, "state": "pending_confirmation" }))
+        }
         "download.get" => {
             let id = req.payload.get("id").and_then(Value::as_str).ok_or_else(|| AppError::invalid("id is required"))?;
             Ok(trimmed(&inner.manager.get(id)?))

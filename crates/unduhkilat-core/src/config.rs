@@ -48,6 +48,7 @@ pub mod keys {
     pub const COMPLETION_TOAST: &str = "completion_toast_enabled";
     /// FR-040. Default OFF: reading the clipboard is opt-in.
     pub const CLIPBOARD_MONITOR: &str = "clipboard_monitor_enabled";
+    pub const UPDATE_CHECK: &str = "update_check_enabled";
     /// DEC-008. PROVISIONAL defaults: seeding on, ratio 1.0, DHT on, UPnP off, random port.
     pub const TORRENT_SEEDING: &str = "torrent_seeding_enabled";
     /// Global target share ratio; `0` means seed until the user stops it.

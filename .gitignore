@@ -6,3 +6,5 @@ node_modules/
 *.db-wal
 *.db-shm
 /data/
+
+target-alt/
