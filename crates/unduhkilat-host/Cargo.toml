@@ -1,0 +1,20 @@
+[package]
+name = "unduhkilat-host"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "unduhkilat-host"
+path = "src/main.rs"
+
+[dependencies]
+unduhkilat-core = { path = "../unduhkilat-core" }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-util", "net"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "process"] }
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+unduhkilat-core = { path = "../unduhkilat-core" }

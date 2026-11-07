@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<title>UnduhKilat</title>
+<style>
+  :root { --bg:#12151A; --surface:#1A1E26; --raised:#222732; --border:#2D3442; --fg:#E6EDF5; --fg2:#94A1B2; --muted:#5E6A7E; --accent:#00D2FF; --ok:#10B981; --warn:#F59E0B; --err:#EF4444; --focus:#38BDF8; }
+  * { box-sizing:border-box; }
+  body { margin:0; width:340px; background:var(--surface); color:var(--fg); font:13px "Segoe UI", Inter, sans-serif; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:12px; border-bottom:1px solid var(--border); }
+  h1 { font-size:14px; margin:0; font-weight:600; }
+  #state { font-size:12px; }
+  .ok { color:var(--ok); } .bad { color:var(--warn); }
+  label { display:flex; gap:8px; align-items:center; padding:12px; border-bottom:1px solid var(--border); }
+  input:focus-visible { outline:2px solid var(--focus); outline-offset:2px; }
+  ul { list-style:none; margin:0; padding:0; max-height:220px; overflow:auto; }
+  li { display:grid; grid-template-columns:1fr auto; gap:8px; padding:8px 12px; border-bottom:1px solid var(--border); font-size:12px; }
+  .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .st { font-family:"Cascadia Mono", Consolas, monospace; color:var(--fg2); }
+  .empty { padding:12px; color:var(--fg2); }
+</style>
+</head>
+<body>
+<header><h1>UnduhKilat</h1><span id="state"></span></header>
+<label><input type="checkbox" id="enabled"> Tangkap unduhan browser</label>
+<ul id="list"></ul>
+<div class="empty" id="empty" hidden>Belum ada unduhan dari browser.</div>
+<script src="popup.js"></script>
+</body>
+</html>

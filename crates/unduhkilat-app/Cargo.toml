@@ -1,0 +1,20 @@
+[package]
+name = "unduhkilat-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "UnduhKilat"
+path = "src/main.rs"
+
+[dependencies]
+unduhkilat-core = { path = "../unduhkilat-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts"] }
+egui_extras = "0.37.0"
+tray-icon = "0.26.1"
+rfd = "0.17.2"
+winrt-notification = "0.5.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+zeroize = "1.9.1"

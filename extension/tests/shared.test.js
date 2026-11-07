@@ -1,0 +1,67 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const UK = require('../shared.js');
+
+test('normalizeUrl drops fragments and range-only params, keeps real params', () => {
+  assert.equal(UK.normalizeUrl('https://a.test/v.mp4?id=7&range=0-999&rn=3#t=10'), 'https://a.test/v.mp4?id=7');
+  assert.equal(UK.normalizeUrl('https://a.test/v.mp4?id=7'), 'https://a.test/v.mp4?id=7');
+});
+
+test('normalizeUrl rejects non-http(s) schemes', () => {
+  for (const u of ['blob:https://a.test/x', 'data:video/mp4;base64,AA', 'file:///C:/x', 'javascript:1', 'not a url']) {
+    assert.equal(UK.normalizeUrl(u), null, u);
+  }
+});
+
+test('classify separates downloadable files from HLS/DASH manifests', () => {
+  assert.deepEqual(UK.classify('https://a/x.m3u8?t=1', ''), { kind: 'manifest', label: 'HLS' });
+  assert.deepEqual(UK.classify('https://a/x', 'application/vnd.apple.mpegurl'), { kind: 'manifest', label: 'HLS' });
+  assert.deepEqual(UK.classify('https://a/x.mpd', ''), { kind: 'manifest', label: 'DASH' });
+  assert.deepEqual(UK.classify('https://a/x', 'application/dash+xml'), { kind: 'manifest', label: 'DASH' });
+  assert.deepEqual(UK.classify('https://a/clip.mp4', ''), { kind: 'file', label: 'MP4' });
+  assert.deepEqual(UK.classify('https://a/s', 'audio/mp4'), { kind: 'file', label: 'MP4' });
+  assert.deepEqual(UK.classify('https://a/s', 'video/webm; codecs=vp9'), { kind: 'file', label: 'WEBM' });
+  assert.deepEqual(UK.classify('https://a/s', ''), { kind: 'file', label: 'Media' });
+});
+
+test('isMediaResponse recognises network media', () => {
+  assert.ok(UK.isMediaResponse('media', '', 'https://a/x'));
+  assert.ok(UK.isMediaResponse('xmlhttprequest', 'video/mp4', 'https://a/x'));
+  assert.ok(UK.isMediaResponse('xmlhttprequest', '', 'https://a/list.m3u8?x=1'));
+  assert.ok(!UK.isMediaResponse('script', 'text/javascript', 'https://a/app.js'));
+});
+
+test('sizeFromHeaders prefers the Content-Range total and ignores partial lengths', () => {
+  assert.equal(UK.sizeFromHeaders({ 'content-range': 'bytes 0-1/12345', 'content-length': '2' }), 12345);
+  assert.equal(UK.sizeFromHeaders({ 'content-length': '999' }), 999);
+  assert.equal(UK.sizeFromHeaders({ 'content-range': 'bytes 0-1/*', 'content-length': '2' }), null);
+  assert.equal(UK.sizeFromHeaders({}), null);
+});
+
+test('mergeCandidate unions the two detection sources and dedups by resolved URL (FR-042)', () => {
+  const m = new Map();
+  UK.mergeCandidate(m, { url: 'https://a.test/v.mp4?range=0-10', mime: 'video/mp4', size: 5000, sources: ['network'] });
+  UK.mergeCandidate(m, { url: 'https://a.test/v.mp4', mime: '', size: null, sources: ['page'] });
+  UK.mergeCandidate(m, { url: 'https://a.test/only-page.webm', sources: ['page'] });
+  UK.mergeCandidate(m, { url: 'https://a.test/only-net.mp4', sources: ['network'], size: 1 });
+  assert.equal(m.size, 3, 'one entry per resolved URL');
+  const both = m.get('https://a.test/v.mp4');
+  assert.deepEqual(both.sources.sort(), ['network', 'page']);
+  assert.equal(both.size, 5000, 'size discovered by one source is kept');
+  assert.ok(m.has('https://a.test/only-page.webm'), 'page-only candidate still appears');
+  assert.ok(m.has('https://a.test/only-net.mp4'), 'network-only candidate still appears');
+});
+
+test('mergeCandidate ignores unsupported URLs', () => {
+  const m = new Map();
+  assert.equal(UK.mergeCandidate(m, { url: 'blob:https://a/1', sources: ['page'] }), null);
+  assert.equal(m.size, 0);
+});
+
+test('cookieHeader and file names', () => {
+  assert.equal(UK.cookieHeader([{ name: 'a', value: '1' }, { name: 'b', value: '2' }]), 'a=1; b=2');
+  assert.equal(UK.cookieHeader([]), '');
+  assert.equal(UK.baseName('C:\\Users\\x\\Downloads\\f.zip'), 'f.zip');
+  assert.equal(UK.baseName(''), '');
+  assert.equal(UK.fileNameFromUrl('https://a.test/dir/My%20File.iso?x=1'), 'My File.iso');
+});

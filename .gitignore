@@ -1,0 +1,8 @@
+/target
+/dist
+/.playwright-mcp
+node_modules/
+*.db
+*.db-wal
+*.db-shm
+/data/
