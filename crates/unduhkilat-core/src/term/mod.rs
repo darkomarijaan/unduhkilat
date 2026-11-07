@@ -3,3 +3,4 @@
 pub mod engine;
 pub mod keys;
 pub mod mouse;
+pub mod paste;
