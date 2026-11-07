@@ -191,6 +191,20 @@ pub enum ExplorerMsg {
     Previewed { tab_id: u64, path: String, result: Result<Preview, AppError> },
     PdfPage { tab_id: u64, page: usize, result: Result<PageImage, AppError> },
     Opened(Result<PathBuf, AppError>),
+    /// A pasted picture reached the server at this path.
+    ImagePasted { tab_id: u64, result: Result<String, AppError> },
+}
+
+/// Answers every question with "no": used where nobody is there to ask.
+struct NoAnswer;
+
+impl unduhkilat_core::server::ssh::Interact for NoAnswer {
+    fn confirm_host_key<'a>(&'a self, _h: &'a str, _p: u16, _t: &'a str, _f: &'a str) -> futures_util::future::BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+    fn secret<'a>(&'a self, _n: &'a str, _k: unduhkilat_core::server::secrets::SecretKind) -> futures_util::future::BoxFuture<'a, Option<unduhkilat_core::server::secrets::SecretString>> {
+        Box::pin(async { None })
+    }
 }
 
 fn texture(ctx: &egui::Context, name: &str, img: &PageImage) -> egui::TextureHandle {
@@ -323,6 +337,13 @@ impl App {
                 let _ = std::process::Command::new("explorer").arg(&path).spawn();
             }
             ExplorerMsg::Opened(Err(e)) => self.notice = Some((e.message, std::time::Instant::now())),
+            ExplorerMsg::ImagePasted { tab_id, result: Ok(path) } => {
+                self.terminal.pasted.entry(tab_id).or_default().push(path.clone());
+                if let Some(s) = self.terminal.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.session.as_ref()) {
+                    s.send(format!("{path} ").into_bytes());
+                }
+            }
+            ExplorerMsg::ImagePasted { result: Err(e), .. } => self.notice = Some((e.message, std::time::Instant::now())),
             ExplorerMsg::Connected { tab_id, result } => {
                 self.servers.shell_waiters.remove(&(tab_id | EXPLORER_BIT));
                 self.servers.clear_prompts_if_idle();
@@ -517,6 +538,59 @@ impl App {
             .await;
             let _ = tx.send(Msg::Explorer(ExplorerMsg::Opened(result)));
             ctx.request_repaint();
+        });
+    }
+
+    /// Alt+V in an SSH tab: take the picture from the Windows clipboard, upload it with SFTP to a
+    /// temporary folder on the server, and type its path (what Claude Code reads a picture from).
+    pub(super) fn paste_clipboard_image(&mut self, tab_id: u64, server_id: String) {
+        let (svc, tx, ctx) = (self.manager.servers(), self.tx.clone(), self.ctx.clone());
+        let interact = Arc::new(super::servers::UiInteract { tx: tx.clone(), ctx: ctx.clone() });
+        self.notice = Some(("Mengunggah gambar dari papan klip...".into(), std::time::Instant::now()));
+        self.rt.spawn(async move {
+            let result: Result<String, AppError> = async {
+                let png = tokio::task::spawn_blocking(|| {
+                    let img = arboard::Clipboard::new().and_then(|mut c| c.get_image()).map_err(|_| AppError::new(unduhkilat_core::error::ErrorCode::ErrInvalidArgument, "Papan klip tidak berisi gambar."))?;
+                    unduhkilat_core::server::fs::encode_png_rgba(img.width as u32, img.height as u32, &img.bytes)
+                })
+                .await
+                .map_err(|_| AppError::internal("pembacaan papan klip berhenti"))??;
+                let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                let name = unduhkilat_core::server::fs::temp_image_name(millis, std::time::Instant::now().elapsed().as_nanos() as u64 ^ (millis as u64).rotate_left(17));
+                let path = join_remote(unduhkilat_core::server::fs::PASTE_DIR, &name);
+                let mut fs = svc.open_fs(&server_id, interact, CancellationToken::new()).await?;
+                let _ = fs.mkdir(unduhkilat_core::server::fs::PASTE_DIR).await; // exists already, usually
+                let outcome: Result<(), AppError> = async {
+                    use tokio::io::AsyncWriteExt;
+                    let mut w = fs.open_write(&path, 0, false).await?;
+                    w.write_all(&png).await.map_err(|e| AppError::new(unduhkilat_core::error::ErrorCode::ErrConnectionDropped, e.to_string()))?;
+                    w.shutdown().await.map_err(|e| AppError::new(unduhkilat_core::error::ErrorCode::ErrConnectionDropped, e.to_string()))?;
+                    Ok(())
+                }
+                .await;
+                fs.close().await;
+                outcome.map(|_| path)
+            }
+            .await;
+            let _ = tx.send(Msg::Explorer(ExplorerMsg::ImagePasted { tab_id, result }));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Delete the pictures pasted from a tab when it closes (best effort; they live in /tmp anyway).
+    pub(super) fn cleanup_pasted_images(&mut self, tab_id: u64) {
+        let Some(paths) = self.terminal.pasted.remove(&tab_id) else { return };
+        let Some(sid) = self.terminal.tabs.iter().find(|t| t.id == tab_id).and_then(|t| if let super::terminal::TabKind::Ssh { server_id } = &t.kind { Some(server_id.clone()) } else { None }) else { return };
+        let svc = self.manager.servers();
+        self.rt.spawn(async move {
+            // Nobody is there to answer a question during cleanup: it never prompts.
+            let quiet: Arc<dyn unduhkilat_core::server::ssh::Interact> = Arc::new(NoAnswer);
+            if let Ok(mut fs) = svc.open_fs(&sid, quiet, CancellationToken::new()).await {
+                for p in paths {
+                    let _ = fs.remove(&p, false).await;
+                }
+                fs.close().await;
+            }
         });
     }
 

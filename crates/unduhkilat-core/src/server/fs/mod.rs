@@ -146,3 +146,47 @@ mod tests {
 
 pub mod sftp;
 pub mod ftp;
+
+// ---- pasting a picture into a remote terminal (Alt+V) -------------------------------------------
+
+/// Folder on the server that receives pasted pictures.
+pub const PASTE_DIR: &str = "/tmp/unduhkilat";
+
+/// A unique, shell-safe file name for a pasted picture (`img-<milliseconds>-<nonce hex>.png`).
+pub fn temp_image_name(millis: u128, nonce: u64) -> String {
+    format!("img-{millis}-{nonce:016x}.png")
+}
+
+/// Encode RGBA pixels (as the clipboard gives them) as a PNG.
+pub fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+    use crate::error::{AppError, ErrorCode};
+    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec()).ok_or_else(|| AppError::new(ErrorCode::ErrInvalidArgument, "Data gambar di papan klip tidak lengkap."))?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).map_err(|e| AppError::internal(format!("gagal mengodekan PNG: {e}")))?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    #[test]
+    fn temp_image_name_is_unique_and_safe() {
+        let a = temp_image_name(1_700_000_000_123, 0xdead_beef);
+        assert_eq!(a, "img-1700000000123-00000000deadbeef.png");
+        assert_ne!(a, temp_image_name(1_700_000_000_123, 1), "the nonce separates two pastes in the same millisecond");
+        assert!(a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'), "nothing a shell would treat specially");
+        assert_eq!(join_remote(PASTE_DIR, &a), format!("/tmp/unduhkilat/{a}"));
+    }
+
+    #[test]
+    fn rgba_roundtrips_through_png() {
+        let rgba: Vec<u8> = (0..4 * 3 * 2).map(|i| (i * 7) as u8).collect();
+        let png = encode_png_rgba(3, 2, &rgba).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let back = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!((back.width(), back.height()), (3, 2));
+        assert_eq!(back.into_raw(), rgba);
+        assert!(encode_png_rgba(3, 2, &rgba[..10]).is_err(), "a short buffer is an error, not a panic");
+    }
+}

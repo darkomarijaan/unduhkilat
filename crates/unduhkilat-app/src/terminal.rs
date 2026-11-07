@@ -15,6 +15,8 @@ pub enum TermInput {
     Paste(String),
     /// Copy the selection to the clipboard.
     Copy,
+    /// Alt+V: upload the clipboard picture to the server and type its path.
+    PasteImage,
     /// Ask the system for the clipboard text; it comes back as a Paste event.
     RequestPaste,
 }
@@ -25,6 +27,8 @@ pub struct KeyContext {
     pub mods: egui::Modifiers,
     /// The Insert key is down (distinguishes Ctrl+Insert from Ctrl+C, Shift+Insert from Ctrl+V).
     pub insert_down: bool,
+    /// Alt+V pastes a picture (SSH tabs): the picture is uploaded and its path typed.
+    pub alt_v_image: bool,
 }
 
 fn mods_of(m: &egui::Modifiers) -> Mods {
@@ -141,6 +145,7 @@ pub fn translate_events(events: &[Event], modes: &TermModes, has_selection: bool
                 }
             }
             Event::Cut => out.push(TermInput::Bytes(vec![0x18])),
+            Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } if kc.alt_v_image && modifiers.alt && !modifiers.ctrl && !modifiers.shift => out.push(TermInput::PasteImage),
             // Committed IME text (Chinese, Japanese, Vietnamese, the emoji panel).
             Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => out.push(TermInput::Bytes(t.as_bytes().to_vec())),
             // egui only turns Ctrl+C / Ctrl+V into Copy / Paste events when Shift is up; the
@@ -217,6 +222,10 @@ pub struct TerminalView {
     reporting_drag: Option<MouseButton>,
     was_focused: bool,
     focused_once: bool,
+    /// Alt+V means "paste picture" in this view (SSH tabs).
+    pub alt_v_image: bool,
+    /// Set when Alt+V was pressed; the screen takes it and starts the upload.
+    pub image_requested: bool,
 }
 
 impl TerminalView {
@@ -383,7 +392,7 @@ impl TerminalView {
             o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Terminal, rect: area, cursor_rect: egui::Rect::from_min_size(area.min, Vec2::new(1.0, 16.0)), should_interrupt_composition: false });
         });
         let (events, mods, insert_down) = ui.input(|i| (i.events.clone(), i.modifiers, i.key_down(egui::Key::Insert)));
-        let inputs = translate_events(&events, &snap.modes, snap.has_selection, ctrl_v_pastes, &KeyContext { mods, insert_down });
+        let inputs = translate_events(&events, &snap.modes, snap.has_selection, ctrl_v_pastes, &KeyContext { mods, insert_down, alt_v_image: self.alt_v_image });
         if inputs.is_empty() {
             return None;
         }
@@ -412,6 +421,7 @@ impl TerminalView {
                     }
                 }
                 TermInput::RequestPaste => ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+                TermInput::PasteImage => self.image_requested = true,
             }
         }
         confirm
@@ -742,6 +752,8 @@ pub struct TerminalState {
     confirm_paste: Option<(u64, String)>,
     /// The terminal had keyboard focus in the last frame.
     pub captured: bool,
+    /// Server paths of pictures pasted with Alt+V, per tab; deleted when the tab closes.
+    pub pasted: std::collections::HashMap<u64, Vec<String>>,
     /// Terminal fills the window (no header, sidebar, or status bar).
     pub maximized: bool,
     settings: Option<TermSettings>,
@@ -944,6 +956,7 @@ impl App {
             }
             self.servers.shell_waiters.remove(&id);
             self.servers.shell_waiters.remove(&(id | super::explorer::EXPLORER_BIT));
+            self.cleanup_pasted_images(id);
             if let Some(mut ex) = self.terminal.tabs[i].explorer.take() {
                 ex.close(&self.rt);
             }
@@ -1044,13 +1057,19 @@ impl App {
             }
         }
         let maximized = self.terminal.maximized;
+        tab.view.alt_v_image = matches!(tab.kind, TabKind::Ssh { .. });
         draw_tab(ui, &mut tab, &settings, maximized, &mut outcome, &mut |ui: &mut egui::Ui| {
             if let Some(ex) = ex.as_mut() {
                 self.explorer_ui(ui, id, ex);
             }
         });
         tab.explorer = ex;
+        let paste_image = std::mem::take(&mut tab.view.image_requested);
+        let ssh_server = if let TabKind::Ssh { server_id } = &tab.kind { Some(server_id.clone()) } else { None };
         self.terminal.tabs.insert(idx, tab);
+        if let (true, Some(sid)) = (paste_image, ssh_server) {
+            self.paste_clipboard_image(id, sid);
+        }
         self.terminal.captured = self.terminal.tabs[idx].view.has_focus();
         if let Some(text) = outcome.paste_confirm {
             self.terminal.confirm_paste = Some((id, text));
@@ -1349,7 +1368,7 @@ mod tests {
         Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m }
     }
     fn ctx(mods: Modifiers) -> KeyContext {
-        KeyContext { mods, insert_down: false }
+        KeyContext { mods, insert_down: false, alt_v_image: false }
     }
     fn bytes(inputs: Vec<TermInput>) -> Vec<u8> {
         inputs.into_iter().flat_map(|i| match i { TermInput::Bytes(b) => b, other => panic!("unexpected {other:?}") }).collect()
@@ -1380,7 +1399,7 @@ mod tests {
     #[test]
     fn ctrl_shift_c_and_ctrl_insert_always_copy() {
         assert_eq!(tr(&[Event::Copy], CTRL_SHIFT), vec![TermInput::Copy]);
-        assert_eq!(translate_events(&[Event::Copy], &modes(), false, true, &KeyContext { mods: CTRL, insert_down: true }), vec![TermInput::Copy]);
+        assert_eq!(translate_events(&[Event::Copy], &modes(), false, true, &KeyContext { mods: CTRL, insert_down: true, alt_v_image: false }), vec![TermInput::Copy]);
     }
 
     #[test]
@@ -1391,7 +1410,7 @@ mod tests {
 
     #[test]
     fn ctrl_v_can_be_given_to_the_program() {
-        let off = |m, insert| translate_events(&[Event::Paste("x".into())], &modes(), false, false, &KeyContext { mods: m, insert_down: insert });
+        let off = |m, insert| translate_events(&[Event::Paste("x".into())], &modes(), false, false, &KeyContext { mods: m, insert_down: insert, alt_v_image: false });
         assert_eq!(off(CTRL, false), vec![TermInput::Bytes(vec![0x16])], "plain Ctrl+V goes to the program when the setting is off");
         assert_eq!(off(CTRL_SHIFT, false), vec![TermInput::Paste("x".into())], "Ctrl+Shift+V always pastes");
         assert_eq!(off(SHIFT, true), vec![TermInput::Paste("x".into())], "Shift+Insert always pastes");
@@ -1552,5 +1571,14 @@ mod tests {
         let manifest = include_str!("../Cargo.toml");
         let eframe_line = manifest.lines().find(|l| l.trim_start().starts_with("eframe")).expect("eframe dependency");
         assert!(eframe_line.contains("\"clipboard\""), "eframe features must include clipboard: {eframe_line}");
+    }
+
+    #[test]
+    fn alt_v_on_an_ssh_tab_asks_for_an_image_upload() {
+        let ssh = KeyContext { mods: ALT, insert_down: false, alt_v_image: true };
+        assert_eq!(translate_events(&[key(K::V, ALT)], &modes(), false, true, &ssh), vec![TermInput::PasteImage]);
+        let local = KeyContext { alt_v_image: false, ..ssh };
+        assert_eq!(bytes(translate_events(&[key(K::V, ALT)], &modes(), false, true, &local)), b"\x1bv", "elsewhere Alt+V still reaches the program");
+        assert!(!translate_events(&[key(K::V, CTRL)], &modes(), false, true, &ssh).contains(&TermInput::PasteImage), "Ctrl+V is not Alt+V");
     }
 }
