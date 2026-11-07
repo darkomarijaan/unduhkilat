@@ -153,8 +153,10 @@ pub fn normalize_startup(conn: &mut Connection) -> Result<usize> {
         [now()],
     )?;
     tx.execute("UPDATE segments SET state='pending', updated_at=?1 WHERE state='downloading'", [now()])?;
+    // Transfers with servers connect only when the user asks: a queued one does not start by itself.
+    let held = tx.execute("UPDATE downloads SET state='paused', updated_at=?1 WHERE state='queued' AND (original_url LIKE 'server://%' OR original_url LIKE 'server-up://%')", [now()])?;
     tx.commit()?;
-    Ok(n)
+    Ok(n + held)
 }
 
 // ---- segments --------------------------------------------------------------

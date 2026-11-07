@@ -17,6 +17,22 @@ const MAX_ROWS: usize = 5_000;
 const MAX_COLS: usize = 100;
 const MAX_SHEETS: usize = 30;
 const MAX_BLOCKS: usize = 50_000;
+/// One cell shows at most this many characters.
+const MAX_CELL_CHARS: usize = 4096;
+/// All the cell text of one workbook together.
+const MAX_TOTAL_TEXT: usize = 64 * 1024 * 1024;
+
+fn cap_text(mut s: String) -> String {
+    if s.chars().count() > MAX_CELL_CHARS {
+        s = s.chars().take(MAX_CELL_CHARS).collect();
+        s.push('\u{2026}');
+    }
+    s
+}
+
+fn too_much() -> AppError {
+    AppError::new(ErrorCode::ErrPreviewTooLarge, "Isi lembar kerja terlalu besar untuk dipratinjau. Gunakan Unduh.")
+}
 
 fn bad(what: &str) -> AppError {
     AppError::new(ErrorCode::ErrPreviewUnsupported, format!("{what} rusak atau bukan dokumen yang valid. Gunakan Unduh."))
@@ -251,7 +267,7 @@ fn shared_strings(z: &mut ZipArchive<Cursor<&[u8]>>) -> Result<Vec<String>> {
             Event::End(e) => match String::from_utf8_lossy(e.local_name().as_ref()).as_ref() {
                 "t" => in_t = false,
                 "rPh" => in_phonetic = false,
-                "si" => out.push(std::mem::take(&mut cur)),
+                "si" => out.push(cap_text(std::mem::take(&mut cur))),
                 _ => {}
             },
             Event::Eof => break,
@@ -308,14 +324,15 @@ pub fn xlsx_sheets(bytes: &[u8]) -> Result<Vec<Sheet>> {
     }
     let strings = shared_strings(&mut z)?;
     let mut out = Vec::new();
+    let mut used = 0usize;
     for (name, path) in sheets.into_iter().take(MAX_SHEETS) {
         let Some(xml) = read_part(&mut z, &path)? else { continue };
-        out.push(parse_sheet(&name, &xml, &strings)?);
+        out.push(parse_sheet(&name, &xml, &strings, &mut used)?);
     }
     Ok(out)
 }
 
-fn parse_sheet(name: &str, xml: &[u8], strings: &[String]) -> Result<Sheet> {
+fn parse_sheet(name: &str, xml: &[u8], strings: &[String], used: &mut usize) -> Result<Sheet> {
     let mut r = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -350,6 +367,11 @@ fn parse_sheet(name: &str, xml: &[u8], strings: &[String]) -> Result<Sheet> {
                             "b" => if value.trim() == "1" { "TRUE".to_string() } else { "FALSE".to_string() },
                             _ => std::mem::take(&mut value),
                         };
+                        let shown = cap_text(shown);
+                        *used += shown.len();
+                        if *used > MAX_TOTAL_TEXT {
+                            return Err(too_much());
+                        }
                         if row.len() <= cur_col {
                             row.resize(cur_col + 1, String::new());
                         }
@@ -390,6 +412,7 @@ pub fn ods_sheets(bytes: &[u8]) -> Result<Vec<Sheet>> {
         row_repeat: usize,
         value_attr: Option<String>,
         first_p: bool,
+        used: usize,
     }
     impl St {
         fn start_cell(&mut self, e: &BytesStart<'_>) {
@@ -399,10 +422,11 @@ pub fn ods_sheets(bytes: &[u8]) -> Result<Vec<Sheet>> {
             self.value_attr = attr(e, "value");
         }
         fn end_cell(&mut self) {
-            let text = if self.cell.is_empty() { self.value_attr.take().unwrap_or_default() } else { self.cell.clone() };
+            let text = cap_text(if self.cell.is_empty() { self.value_attr.take().unwrap_or_default() } else { self.cell.clone() });
             // Empty repeats keep later cells in their columns (trailing ones are trimmed at the row end).
             for _ in 0..self.cell_repeat.min(if text.is_empty() { MAX_COLS } else { 20 }) {
                 if self.row.len() < MAX_COLS {
+                    self.used += text.len();
                     self.row.push(text.clone());
                 }
             }
@@ -439,7 +463,7 @@ pub fn ods_sheets(bytes: &[u8]) -> Result<Vec<Sheet>> {
     let xml = need(&mut z, "content.xml", "Lembar kerja OpenDocument")?;
     let mut r = Reader::from_reader(xml.as_slice());
     let mut buf = Vec::new();
-    let mut st = St { sheets: Vec::new(), cur: None, row: Vec::new(), cell: String::new(), cell_repeat: 1, row_repeat: 1, value_attr: None, first_p: true };
+    let mut st = St { sheets: Vec::new(), cur: None, row: Vec::new(), cell: String::new(), cell_repeat: 1, row_repeat: 1, value_attr: None, first_p: true, used: 0 };
     let mut in_p = false;
     loop {
         match r.read_event_into(&mut buf).map_err(|_| bad("Lembar kerja OpenDocument"))? {
@@ -484,6 +508,9 @@ pub fn ods_sheets(bytes: &[u8]) -> Result<Vec<Sheet>> {
             _ => {}
         }
         buf.clear();
+        if st.used > MAX_TOTAL_TEXT {
+            return Err(too_much());
+        }
     }
     Ok(st.sheets)
 }
@@ -600,5 +627,30 @@ mod tests {
         assert_eq!(docx_blocks(b"not a zip at all").unwrap_err().code, ErrorCode::ErrPreviewUnsupported);
         assert_eq!(docx_blocks(&zip_of(&[("other.xml", "x")])).unwrap_err().code, ErrorCode::ErrPreviewUnsupported, "missing document part");
         assert!(docx_blocks(&zip_of(&[("word/document.xml", "<w:p><w:t>unclosed")])).is_ok() || docx_blocks(&zip_of(&[("word/document.xml", "<w:p><w:t>unclosed")])).is_err());
+    }
+
+    #[test]
+    fn a_shared_string_referenced_many_times_cannot_exhaust_memory() {
+        let big = "x".repeat(200_000);
+        let mut cells = String::new();
+        for i in 1..=30_000 {
+            cells.push_str(&format!(r#"<row r="{i}"><c r="A{i}" t="s"><v>0</v></c></row>"#));
+        }
+        let bomb = zip_of(&[
+            ("xl/workbook.xml", r#"<workbook xmlns:r="r"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#),
+            ("xl/_rels/workbook.xml.rels", r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#),
+            ("xl/sharedStrings.xml", &format!("<sst><si><t>{big}</t></si></sst>")),
+            ("xl/worksheets/sheet1.xml", &format!("<worksheet><sheetData>{cells}</sheetData></worksheet>")),
+        ]);
+        assert_eq!(xlsx_sheets(&bomb).unwrap_err().code, ErrorCode::ErrPreviewTooLarge, "30,000 copies of a 200 KB string are refused");
+        // One long cell alone is only shortened.
+        let one = zip_of(&[
+            ("xl/workbook.xml", r#"<workbook xmlns:r="r"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#),
+            ("xl/_rels/workbook.xml.rels", r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#),
+            ("xl/sharedStrings.xml", &format!("<sst><si><t>{big}</t></si></sst>")),
+            ("xl/worksheets/sheet1.xml", r#"<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>"#),
+        ]);
+        let s = xlsx_sheets(&one).unwrap();
+        assert!(s[0].rows[0][0].chars().count() <= 4100, "a cell shows at most a few KB");
     }
 }

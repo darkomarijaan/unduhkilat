@@ -24,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 const DOWN_PREFIX: &str = "server://";
 const UP_PREFIX: &str = "server-up://";
 const CHUNK: usize = 64 * 1024;
+/// A transfer that moves nothing for this long fails instead of hanging.
+const IDLE: Duration = Duration::from_secs(60);
 /// Everything but `/` is escaped, so names with spaces, `?`, `#`, or Unicode survive the URL.
 const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'/');
 
@@ -90,8 +92,10 @@ impl Interact for NoPrompt {
 }
 
 fn needs_the_user(mut e: AppError) -> AppError {
-    if matches!(e.code, ErrorCode::ErrHostKeyUnknown | ErrorCode::ErrSshAuthFailed) {
-        e.message = format!("{} Buka layar Server, tekan Uji sambungan untuk mengonfirmasi, lalu lanjutkan transfer ini.", e.message);
+    match e.code {
+        ErrorCode::ErrHostKeyUnknown => e.message = format!("{} Buka layar Server dan tekan Uji sambungan (atau buka Berkas server) untuk mengonfirmasi, lalu lanjutkan transfer ini.", e.message),
+        ErrorCode::ErrSshAuthFailed => e.message = format!("{} Transfer di antrean memakai kredensial yang tersimpan: aktifkan \"Simpan kredensial\" pada server ini, lalu lanjutkan transfer ini.", e.message),
+        _ => {}
     }
     e
 }
@@ -156,6 +160,25 @@ impl Meter {
     }
 }
 
+/// Open the local file a download writes to. A new download (`offset == 0`) never touches a file
+/// that already exists unless the user confirmed replacing it (it may have appeared after queueing);
+/// a resume keeps what was written and drops anything past `offset`.
+pub fn open_download_target(path: &std::path::Path, offset: i64, overwrite: bool) -> Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true);
+    if offset == 0 && !overwrite {
+        o.create_new(true);
+    } else {
+        o.create(true).truncate(false);
+    }
+    let f = o.open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => AppError::new(ErrorCode::ErrNameCollision, format!("{} sudah ada dan tidak ditimpa.", path.display())),
+        _ => io_err(&path.display().to_string(), e),
+    })?;
+    f.set_len(offset.max(0) as u64).map_err(|e| io_err("memotong berkas", e))?;
+    Ok(f)
+}
+
 fn io_err(what: &str, e: std::io::Error) -> AppError {
     AppError::new(ErrorCode::ErrPathUnwritable, format!("{what}: {e}"))
 }
@@ -177,8 +200,8 @@ async fn download(ctx: &TransferCtx, id: &str, target: &str, r: &RemoteRef, fs: 
     let have = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
     // Resume from what was recorded, never beyond what is really on disk.
     let offset = if dl.downloaded_bytes > 0 { dl.downloaded_bytes.min(have).min(total) } else { 0 };
-    let mut file = tokio::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&path).await.map_err(|e| io_err(&path.display().to_string(), e))?;
-    file.set_len(offset as u64).await.map_err(|e| io_err("memotong berkas", e))?;
+    let std_file = open_download_target(&path, offset, r.overwrite)?;
+    let mut file = tokio::fs::File::from_std(std_file);
     file.seek(std::io::SeekFrom::Start(offset as u64)).await.map_err(|e| io_err("mencari posisi berkas", e))?;
 
     let mut reader = fs.open_read(&r.path, offset as u64).await?;
@@ -193,7 +216,7 @@ async fn download(ctx: &TransferCtx, id: &str, target: &str, r: &RemoteRef, fs: 
         }
         let n = tokio::select! {
             _ = cancel.cancelled() => continue,
-            n = reader.read(&mut buf) => n.map_err(|e| AppError::new(ErrorCode::ErrConnectionDropped, format!("Unduhan dari server terputus: {e}")))?,
+            n = tokio::time::timeout(IDLE, reader.read(&mut buf)) => n.map_err(|_| AppError::new(ErrorCode::ErrConnectionDropped, "Server berhenti mengirim data. Lanjutkan untuk meneruskan."))?.map_err(|e| AppError::new(ErrorCode::ErrConnectionDropped, format!("Unduhan dari server terputus: {e}")))?,
         };
         if n == 0 {
             break;
@@ -244,11 +267,35 @@ async fn upload(ctx: &TransferCtx, id: &str, source: &str, r: &RemoteRef, fs: &m
             break;
         }
         ctx.throttle.acquire(bucket, n).await;
-        writer.write_all(&buf[..n]).await.map_err(|e| AppError::new(ErrorCode::ErrConnectionDropped, format!("Unggahan ke server terputus: {e}")))?;
+        let sent_ok = tokio::select! {
+            _ = cancel.cancelled() => None,
+            r = tokio::time::timeout(IDLE, writer.write_all(&buf[..n])) => Some(r),
+        };
+        match sent_ok {
+            None => {
+                drop(writer);
+                meter.save(ctx, id, sent).await;
+                return Ok(Outcome::Stopped);
+            }
+            Some(Err(_)) => return Err(AppError::new(ErrorCode::ErrConnectionDropped, "Server berhenti menerima data. Lanjutkan untuk meneruskan.")),
+            Some(Ok(r)) => r.map_err(|e| AppError::new(ErrorCode::ErrConnectionDropped, format!("Unggahan ke server terputus: {e}")))?,
+        }
         sent += n as i64;
         meter.tick(ctx, id, sent, total).await;
     }
-    writer.shutdown().await.map_err(|e| AppError::new(ErrorCode::ErrConnectionDropped, format!("Server tidak mengonfirmasi unggahan: {e}")))?;
+    let finished = tokio::select! {
+        _ = cancel.cancelled() => None,
+        r = tokio::time::timeout(IDLE, writer.shutdown()) => Some(r),
+    };
+    match finished {
+        None => {
+            drop(writer);
+            meter.save(ctx, id, sent).await;
+            return Ok(Outcome::Stopped);
+        }
+        Some(Err(_)) => return Err(AppError::new(ErrorCode::ErrConnectionDropped, "Server tidak mengonfirmasi unggahan (kehabisan waktu).")),
+        Some(Ok(r)) => r.map_err(|e| AppError::new(ErrorCode::ErrConnectionDropped, format!("Server tidak mengonfirmasi unggahan: {e}")))?,
+    }
     drop(writer);
     meter.save(ctx, id, sent).await;
     let size = fs.stat(&r.path).await?.size as i64;
@@ -273,5 +320,36 @@ mod tests {
         }
         assert!(parse_url("https://example.com/x").is_none());
         assert!(parse_url("server:///x").is_none(), "no server id");
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("uk-target-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(name)
+    }
+
+    #[test]
+    fn a_fresh_download_never_opens_an_existing_file_without_overwrite() {
+        let p = temp("a.bin");
+        std::fs::write(&p, b"somebody else's data").unwrap();
+        assert_eq!(open_download_target(&p, 0, false).err().unwrap().code, ErrorCode::ErrNameCollision, "a file that appeared after queueing is not truncated");
+        assert_eq!(std::fs::read(&p).unwrap(), b"somebody else's data");
+        drop(open_download_target(&p, 0, true).unwrap());
+        assert_eq!(std::fs::read(&p).unwrap(), b"", "a confirmed overwrite starts from an empty file");
+    }
+
+    #[test]
+    fn creating_and_resuming() {
+        let p = temp("b.bin");
+        drop(open_download_target(&p, 0, false).unwrap());
+        assert!(p.is_file(), "a missing file is created");
+        std::fs::write(&p, b"0123456789").unwrap();
+        drop(open_download_target(&p, 4, false).unwrap());
+        assert_eq!(std::fs::read(&p).unwrap(), b"0123", "resume keeps what was written and drops the unconfirmed tail");
     }
 }

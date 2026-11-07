@@ -6,6 +6,8 @@ use std::io::Cursor;
 
 /// Decoded pixels at most (about 200 MB of RGBA).
 const MAX_PIXELS: u64 = 50_000_000;
+/// Longest side shown; larger pictures are scaled down.
+const MAX_SIDE: u32 = 4096;
 
 pub fn decode(bytes: &[u8]) -> Result<PageImage> {
     let bad = || AppError::new(ErrorCode::ErrPreviewUnsupported, "Gambar rusak atau formatnya tidak didukung. Gunakan Unduh.");
@@ -14,7 +16,14 @@ pub fn decode(bytes: &[u8]) -> Result<PageImage> {
     if (w as u64) * (h as u64) > MAX_PIXELS {
         return Err(AppError::new(ErrorCode::ErrPreviewTooLarge, format!("Gambar {w}x{h} terlalu besar untuk dipratinjau. Gunakan Unduh.")));
     }
-    let img = image::load_from_memory(bytes).map_err(|_| bad())?.to_rgba8();
+    let mut img = image::load_from_memory(bytes).map_err(|_| bad())?.to_rgba8();
+    // A texture side above the GPU limit crashes the renderer: keep both sides within MAX_SIDE.
+    let longest = img.width().max(img.height());
+    if longest > MAX_SIDE {
+        let f = MAX_SIDE as f32 / longest as f32;
+        let (w, h) = (((img.width() as f32 * f) as u32).max(1), ((img.height() as f32 * f) as u32).max(1));
+        img = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
+    }
     Ok(PageImage { width: img.width(), height: img.height(), rgba: img.into_raw() })
 }
 
@@ -47,5 +56,17 @@ mod tests {
         let mut cut = png(50, 50);
         cut.truncate(40);
         assert!(decode(&cut).is_err(), "a truncated file is an error, not a panic");
+    }
+
+    #[test]
+    fn a_very_wide_picture_is_scaled_to_fit_a_texture() {
+        let wide = decode(&png(9000, 100)).unwrap();
+        assert!(wide.width <= 4096 && wide.height <= 4096, "{}x{}", wide.width, wide.height);
+        assert_eq!(wide.rgba.len(), (wide.width * wide.height * 4) as usize);
+        assert!(wide.height >= 1, "never collapses to nothing");
+        let ratio = wide.width as f32 / wide.height as f32;
+        assert!((ratio - 90.0).abs() < 8.0, "aspect ratio kept: {ratio}");
+        let small = decode(&png(300, 200)).unwrap();
+        assert_eq!((small.width, small.height), (300, 200), "small pictures are untouched");
     }
 }

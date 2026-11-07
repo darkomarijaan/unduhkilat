@@ -489,13 +489,11 @@ impl Manager {
         if !target.is_absolute() {
             return Err(AppError::new(ErrorCode::ErrInvalidPath, format!("{} bukan jalur absolut.", target.display())));
         }
-        if target.exists() {
-            if !overwrite {
-                return Err(AppError::new(ErrorCode::ErrNameCollision, format!("{} sudah ada.", target.display())));
-            }
-            std::fs::remove_file(&target).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, format!("{}: {e}", target.display())))?;
+        if target.exists() && !overwrite {
+            return Err(AppError::new(ErrorCode::ErrNameCollision, format!("{} sudah ada.", target.display())));
         }
-        let url = super::remote::make_url(super::remote::Direction::Download, server_id, remote_path, false);
+        // With a confirmed overwrite the old file stays until this download actually starts.
+        let url = super::remote::make_url(super::remote::Direction::Download, server_id, remote_path, overwrite);
         self.insert_remote(url, target, name, true).await
     }
 
@@ -722,9 +720,10 @@ impl Manager {
             self.db().write(move |c| Ok(c.execute("UPDATE torrents SET started=0, uploaded_bytes=0, seed_state='none' WHERE download_id=?1", [&id3]).map(|_| ())?)).await?;
             return Ok(());
         }
-        // The segment plan is gone, so the next run re-probes and re-allocates.
+        // The segment plan is gone, so the next run re-probes and re-allocates. For an upload
+        // `target_path` is the user's own file: it is never touched.
         let path = PathBuf::from(&dl.target_path);
-        if path.exists() {
+        if path.exists() && !super::remote::is_upload(&dl.original_url) {
             let f = std::fs::OpenOptions::new().write(true).open(&path).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
             f.set_len(0).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
         }

@@ -196,3 +196,57 @@ async fn an_unconfirmed_host_key_fails_with_a_hint_instead_of_prompting() {
     assert!(failed.error_message.unwrap_or_default().contains("Uji sambungan"), "the message says what to do");
     r.ssh.stop();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarting_an_upload_never_truncates_the_local_file() {
+    let r = rig(true).await;
+    std::fs::write(r.remote.join("same.txt"), b"server copy").unwrap();
+    let src = r.local.join("same.txt");
+    std::fs::write(&src, b"my precious local data").unwrap();
+    let dl = r.env.manager.enqueue_remote_upload(&r.server_id, &src, "/", false).await.unwrap();
+    r.env.manager.wait_for_state(&dl.id, DownloadState::Failed, T).await.unwrap();
+    r.env.manager.restart(&dl.id).await.unwrap();
+    r.env.manager.wait_for_state(&dl.id, DownloadState::Failed, T).await.unwrap();
+    assert_eq!(std::fs::read(&src).unwrap(), b"my precious local data", "\"Mulai ulang dari awal\" must never empty the user's source file");
+    assert_eq!(std::fs::read(r.remote.join("same.txt")).unwrap(), b"server copy");
+    r.ssh.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmed_overwrite_replaces_the_file_only_when_the_download_runs() {
+    let r = rig(true).await;
+    std::fs::write(r.remote.join("doc.txt"), b"new content from server").unwrap();
+    std::fs::write(r.local.join("doc.txt"), b"old local content").unwrap();
+    let e = r.env.manager.enqueue_remote_download(&r.server_id, "/doc.txt", &r.local, false).await.err().expect("refused without confirmation");
+    assert_eq!(e.code, ErrorCode::ErrNameCollision);
+    assert_eq!(std::fs::read(r.local.join("doc.txt")).unwrap(), b"old local content", "a refusal changes nothing");
+    let dl = r.env.manager.enqueue_remote_download(&r.server_id, "/doc.txt", &r.local, true).await.unwrap();
+    r.env.manager.wait_for_state(&dl.id, DownloadState::Completed, T).await.unwrap();
+    assert_eq!(std::fs::read(r.local.join("doc.txt")).unwrap(), b"new content from server");
+    r.ssh.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_server_transfers_are_paused_at_startup_so_nothing_connects_by_itself() {
+    let r = rig(true).await;
+    std::fs::write(r.remote.join("q.bin"), b"x").unwrap();
+    let src = r.local.join("u.bin");
+    std::fs::write(&src, b"y").unwrap();
+    let d = r.env.manager.enqueue_remote_download(&r.server_id, "/q.bin", &r.local, false).await.unwrap();
+    let u = r.env.manager.enqueue_remote_upload(&r.server_id, &src, "/", false).await.unwrap();
+    r.env.manager.wait_for_state(&d.id, DownloadState::Completed, T).await.unwrap();
+    r.env.manager.wait_for_state(&u.id, DownloadState::Completed, T).await.unwrap();
+    let (a, b) = (d.id.clone(), u.id.clone());
+    let states = r.env.manager.db().write_blocking(move |c| {
+        c.execute("UPDATE downloads SET state='queued' WHERE id IN (?1, ?2)", [&a, &b])?;
+        c.execute("INSERT INTO downloads (id, original_url, effective_url, target_path, file_name, state, created_at, updated_at) VALUES ('web1', 'https://example.com/f', 'https://example.com/f', 'C:/x/f', 'f', 'queued', 'now', 'now')", [])?;
+        unduhkilat_core::repo::normalize_startup(c)?;
+        let mut out = Vec::new();
+        for id in [&a, &b, &"web1".to_string()] {
+            out.push(c.query_row("SELECT state FROM downloads WHERE id=?1", [id], |r| r.get::<_, String>(0))?);
+        }
+        Ok(out)
+    }).unwrap();
+    assert_eq!(states, ["paused", "paused", "queued"], "server transfers wait for the user; ordinary downloads keep their place");
+    r.ssh.stop();
+}

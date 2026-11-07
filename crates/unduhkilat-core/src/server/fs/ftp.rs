@@ -58,13 +58,22 @@ pub fn ftp_mode(server: &Server) -> FtpMode {
 #[derive(Debug)]
 struct Capture {
     seen: Arc<Mutex<Option<String>>>,
+    /// Set once the user (or the pin table) accepted the certificate: every later handshake, the
+    /// data connections included, must present exactly this one.
+    pinned: Arc<Mutex<Option<String>>>,
     algs: WebPkiSupportedAlgorithms,
 }
 
 impl ServerCertVerifier for Capture {
     fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, _inter: &[CertificateDer<'_>], _name: &ServerName<'_>, _ocsp: &[u8], _now: UnixTime) -> std::result::Result<ServerCertVerified, rustls::Error> {
         let hex: String = Sha256::digest(end_entity.as_ref()).iter().map(|b| format!("{b:02x}")).collect();
-        *self.seen.lock().unwrap() = Some(format!("SHA256:{hex}"));
+        let fingerprint = format!("SHA256:{hex}");
+        if let Some(p) = self.pinned.lock().unwrap().as_ref() {
+            if *p != fingerprint {
+                return Err(rustls::Error::General("certificate differs from the pinned one".into()));
+            }
+        }
+        *self.seen.lock().unwrap() = Some(fingerprint);
         Ok(ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
@@ -78,12 +87,13 @@ impl ServerCertVerifier for Capture {
     }
 }
 
-fn connector() -> (AsyncRustlsConnector, Arc<Mutex<Option<String>>>) {
+fn connector() -> (AsyncRustlsConnector, Arc<Mutex<Option<String>>>, Arc<Mutex<Option<String>>>) {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let seen = Arc::new(Mutex::new(None));
-    let verifier = Capture { seen: seen.clone(), algs: provider.signature_verification_algorithms };
+    let pinned = Arc::new(Mutex::new(None));
+    let verifier = Capture { seen: seen.clone(), pinned: pinned.clone(), algs: provider.signature_verification_algorithms };
     let cfg = rustls::ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().expect("default protocol versions").dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_no_client_auth();
-    (AsyncRustlsConnector::from(tokio_rustls::TlsConnector::from(Arc::new(cfg))), seen)
+    (AsyncRustlsConnector::from(tokio_rustls::TlsConnector::from(Arc::new(cfg))), seen, pinned)
 }
 
 fn ftp_err(e: suppaftp::FtpError) -> AppError {
@@ -100,6 +110,16 @@ fn ftp_err(e: suppaftp::FtpError) -> AppError {
             }
         }
         other => AppError::new(ErrorCode::ErrRemoteFs, format!("Operasi FTP gagal: {other}")),
+    }
+}
+
+/// Every FTP command is bounded: a half-open connection must fail, not hang the queue or the explorer.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn within<T>(f: impl std::future::Future<Output = std::result::Result<T, suppaftp::FtpError>>) -> Result<T> {
+    match tokio::time::timeout(COMMAND_TIMEOUT, f).await {
+        Ok(r) => r.map_err(ftp_err),
+        Err(_) => Err(AppError::new(ErrorCode::ErrConnectionDropped, "Server FTP tidak menjawab. Sambungan mungkin terputus.")),
     }
 }
 
@@ -126,7 +146,7 @@ async fn open_inner(db: &Db, server: &Server, mode: FtpMode, interact: Arc<dyn I
     };
 
     let addr = format!("{}:{}", server.host, server.port);
-    let (tls, seen) = connector();
+    let (tls, seen, pinned) = connector();
     let mut tls = Some(tls);
     let mut ftp = match mode {
         FtpMode::Implicit => tokio::time::timeout(CONNECT_TIMEOUT, AsyncRustlsFtpStream::connect_secure_implicit(addr.as_str(), tls.take().expect("used once"), &server.host)).await,
@@ -145,13 +165,15 @@ async fn open_inner(db: &Db, server: &Server, mode: FtpMode, interact: Arc<dyn I
     if mode != FtpMode::Plain {
         let fingerprint = seen.lock().unwrap().clone().ok_or_else(|| AppError::new(ErrorCode::ErrConnectionDropped, "Server tidak menyajikan sertifikat."))?;
         pin(db, server, &fingerprint, interact.as_ref()).await?;
+        // From here on (data connections too) only this certificate is accepted.
+        *pinned.lock().unwrap() = Some(fingerprint);
     }
 
     ftp.login(server.username.as_str(), password.as_str()).await.map_err(|e| match e {
         suppaftp::FtpError::UnexpectedResponse(_) => AppError::new(ErrorCode::ErrSshAuthFailed, format!("Login ke \"{}\" ditolak: pengguna atau password salah.", server.name)),
         other => ftp_err(other),
     })?;
-    ftp.transfer_type(FileType::Binary).await.map_err(ftp_err)?;
+    within(ftp.transfer_type(FileType::Binary)).await?;
     Ok(Box::new(FtpFs { ftp }))
 }
 
@@ -228,41 +250,45 @@ impl AsyncRead for FtpDownload {
 #[async_trait]
 impl RemoteFs for FtpFs {
     async fn list(&mut self, dir: &str) -> Result<Vec<Entry>> {
-        let lines = self.ftp.list(Some(dir)).await.map_err(ftp_err)?;
+        let lines = within(self.ftp.list(Some(dir))).await?;
         Ok(lines.iter().filter_map(|l| ListFile::try_from(l.as_str()).ok()).filter(|f| f.name() != "." && f.name() != "..").map(|f| to_entry(dir, &f)).collect())
     }
 
     async fn stat(&mut self, path: &str) -> Result<Entry> {
         let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path).to_string();
-        if let Ok(size) = self.ftp.size(path).await {
+        if let Ok(Ok(size)) = tokio::time::timeout(COMMAND_TIMEOUT, self.ftp.size(path)).await {
             return Ok(Entry { name, path: path.to_string(), is_dir: false, size: size as u64, modified: None, is_link: false });
         }
         // Not a file with a size: a directory, if the server lets us enter it.
-        self.ftp.cwd(path).await.map_err(ftp_err)?;
-        Ok(Entry { name, path: path.to_string(), is_dir: true, size: 0, modified: None, is_link: false })
+        if within(self.ftp.cwd(path)).await.is_ok() {
+            return Ok(Entry { name, path: path.to_string(), is_dir: true, size: 0, modified: None, is_link: false });
+        }
+        // Servers without SIZE: look the name up in the parent folder's listing.
+        let parent = super::parent_remote(path);
+        self.list(&parent).await?.into_iter().find(|e| e.name == name).ok_or_else(|| AppError::new(ErrorCode::ErrNotFound, "Berkas atau folder tidak ditemukan di server."))
     }
 
     async fn mkdir(&mut self, path: &str) -> Result<()> {
-        self.ftp.mkdir(path).await.map_err(ftp_err)
+        within(self.ftp.mkdir(path)).await
     }
 
     async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
-        self.ftp.rename(from, to).await.map_err(ftp_err)
+        within(self.ftp.rename(from, to)).await
     }
 
     async fn remove(&mut self, path: &str, is_dir: bool) -> Result<()> {
         if is_dir {
-            self.ftp.rmdir(path).await.map_err(ftp_err)
+            within(self.ftp.rmdir(path)).await
         } else {
-            self.ftp.rm(path).await.map_err(ftp_err)
+            within(self.ftp.rm(path)).await
         }
     }
 
     async fn read_at(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         if offset > 0 {
-            self.ftp.resume_transfer(offset as usize).await.map_err(ftp_err)?;
+            within(self.ftp.resume_transfer(offset as usize)).await?;
         }
-        let mut stream = self.ftp.retr_as_stream(path).await.map_err(ftp_err)?;
+        let mut stream = within(self.ftp.retr_as_stream(path)).await?;
         let mut buf = vec![0u8; len];
         let mut got = 0;
         while got < len {
@@ -287,30 +313,50 @@ impl RemoteFs for FtpFs {
 
     async fn open_read(&mut self, path: &str, offset: u64) -> Result<RemoteReader> {
         if offset > 0 {
-            self.ftp.resume_transfer(offset as usize).await.map_err(ftp_err)?;
+            within(self.ftp.resume_transfer(offset as usize)).await?;
         }
-        let stream = self.ftp.retr_as_stream(path).await.map_err(ftp_err)?;
+        let stream = within(self.ftp.retr_as_stream(path)).await?;
         Ok(Box::new(FtpDownload(stream)))
     }
 
     async fn open_write(&mut self, path: &str, offset: u64, append: bool) -> Result<RemoteWriter> {
         let stream = if append {
-            self.ftp.append_with_stream(path).await
+            within(self.ftp.append_with_stream(path)).await
         } else {
             if offset > 0 {
-                self.ftp.resume_transfer(offset as usize).await.map_err(ftp_err)?;
+                within(self.ftp.resume_transfer(offset as usize)).await?;
             }
-            self.ftp.put_with_stream(path).await
-        }
-        .map_err(ftp_err)?;
+            within(self.ftp.put_with_stream(path)).await
+        }?;
         Ok(Box::new(FtpUpload { stream: Some(stream), finishing: None }))
     }
 
     async fn home(&mut self) -> Result<String> {
-        self.ftp.pwd().await.map_err(ftp_err)
+        within(self.ftp.pwd()).await
     }
 
     async fn close(mut self: Box<Self>) {
         let _ = self.ftp.quit().await;
+    }
+
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn once_pinned_every_later_handshake_must_present_the_same_certificate() {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let seen = Arc::new(Mutex::new(None));
+        let pinned = Arc::new(Mutex::new(None));
+        let v = Capture { seen: seen.clone(), pinned: pinned.clone(), algs: provider.signature_verification_algorithms };
+        let name = ServerName::try_from("127.0.0.1").unwrap();
+        let (a, b) = (CertificateDer::from(vec![1u8, 2, 3]), CertificateDer::from(vec![9u8, 9, 9]));
+        assert!(v.verify_server_cert(&a, &[], &name, &[], UnixTime::now()).is_ok(), "the first handshake is recorded, not judged");
+        let first = seen.lock().unwrap().clone().unwrap();
+        *pinned.lock().unwrap() = Some(first);
+        assert!(v.verify_server_cert(&a, &[], &name, &[], UnixTime::now()).is_ok(), "the pinned certificate keeps working (data connections)");
+        assert!(v.verify_server_cert(&b, &[], &name, &[], UnixTime::now()).is_err(), "a different certificate on a later connection is refused");
     }
 }
