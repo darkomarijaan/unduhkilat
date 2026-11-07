@@ -143,3 +143,5 @@ mod tests {
         assert_eq!(parent_remote("/"), "/");
     }
 }
+
+pub mod sftp;

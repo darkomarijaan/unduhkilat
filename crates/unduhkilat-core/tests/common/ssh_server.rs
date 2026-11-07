@@ -4,6 +4,9 @@
 
 #![allow(dead_code)]
 
+#[path = "sftp_server.rs"]
+mod sftp_server;
+
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Server as _, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
@@ -40,10 +43,14 @@ struct Shared {
     resizes: Arc<AtomicUsize>,
     open_shells: Arc<AtomicUsize>,
     shell_channels: Arc<Mutex<Vec<(ChannelId, server::Handle)>>>,
+    /// Serve this folder over the `sftp` subsystem when set.
+    sftp_root: Option<std::path::PathBuf>,
+    conn_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    conn_handles: Arc<Mutex<Vec<server::Handle>>>,
 }
 
 #[derive(Clone)]
-struct Conn(Shared);
+struct Conn(Shared, Arc<tokio::sync::Mutex<std::collections::HashMap<ChannelId, Channel<Msg>>>>);
 
 impl server::Handler for Conn {
     type Error = russh::Error;
@@ -99,8 +106,28 @@ impl server::Handler for Conn {
         Ok(())
     }
 
-    async fn channel_open_session(&mut self, _c: Channel<Msg>, reply: server::ChannelOpenHandle, _s: &mut Session) -> Result<(), Self::Error> {
+    async fn channel_open_session(&mut self, c: Channel<Msg>, reply: server::ChannelOpenHandle, s: &mut Session) -> Result<(), Self::Error> {
+        self.0.conn_handles.lock().unwrap().push(s.handle());
+        if self.0.sftp_root.is_some() {
+            self.1.lock().await.insert(c.id(), c);
+        }
         reply.accept().await;
+        Ok(())
+    }
+
+    async fn subsystem_request(&mut self, channel: ChannelId, name: &str, session: &mut Session) -> Result<(), Self::Error> {
+        let root = self.0.sftp_root.clone();
+        match (name, root) {
+            ("sftp", Some(root)) => {
+                let Some(ch) = self.1.lock().await.remove(&channel) else {
+                    session.channel_failure(channel)?;
+                    return Ok(());
+                };
+                session.channel_success(channel)?;
+                tokio::spawn(russh_sftp::server::run(ch.into_stream(), sftp_server::FolderSftp::new(root)));
+            }
+            _ => session.channel_failure(channel)?,
+        }
         Ok(())
     }
 
@@ -177,6 +204,15 @@ fn new_config() -> (Arc<server::Config>, String) {
 
 impl TestSsh {
     pub async fn start(cfg: TestSshConfig) -> TestSsh {
+        Self::start_inner(cfg, None).await
+    }
+
+    /// Like `start`, and the `sftp` subsystem serves `root` as `/`.
+    pub async fn start_with_sftp(cfg: TestSshConfig, root: std::path::PathBuf) -> TestSsh {
+        Self::start_inner(cfg, Some(root)).await
+    }
+
+    async fn start_inner(cfg: TestSshConfig, sftp_root: Option<std::path::PathBuf>) -> TestSsh {
         let shared = Shared {
             cfg: cfg.clone(),
             logins: Arc::new(AtomicUsize::new(0)),
@@ -185,6 +221,9 @@ impl TestSsh {
             resizes: Arc::new(AtomicUsize::new(0)),
             open_shells: Arc::new(AtomicUsize::new(0)),
             shell_channels: Arc::new(Mutex::new(Vec::new())),
+            sftp_root,
+            conn_tasks: Arc::new(Mutex::new(Vec::new())),
+            conn_handles: Arc::new(Mutex::new(Vec::new())),
         };
         let (sc, fp) = new_config();
         let config = Arc::new(Mutex::new(sc));
@@ -197,8 +236,8 @@ impl TestSsh {
                 let Ok((stream, _)) = listener.accept().await else { break };
                 // Each connection reads the current config, so `rotate_host_key` affects new connections.
                 let current = cfg_slot.lock().unwrap().clone();
-                let (handler, delay) = (Conn(sh.clone()), sh.cfg.accept_delay);
-                tokio::spawn(async move {
+                let (handler, delay) = (Conn(sh.clone(), Default::default()), sh.cfg.accept_delay);
+                let task = tokio::spawn(async move {
                     if let Some(d) = delay {
                         tokio::time::sleep(d).await;
                     }
@@ -206,6 +245,7 @@ impl TestSsh {
                         let _ = running.await;
                     }
                 });
+                sh.conn_tasks.lock().unwrap().push(task);
             }
         });
         TestSsh { addr, shared, config, fingerprint, accept_loop }
@@ -224,6 +264,17 @@ impl TestSsh {
     }
 
     /// Successful logins so far.
+    /// Drop every live connection abruptly (what a dying server or network looks like).
+    pub async fn kill_connections(&self) {
+        let handles: Vec<_> = self.shared.conn_handles.lock().unwrap().drain(..).collect();
+        for h in handles {
+            let _ = h.disconnect(russh::Disconnect::ByApplication, "server gone".into(), "en".into()).await;
+        }
+        for t in self.shared.conn_tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+    }
+
     pub fn login_count(&self) -> usize {
         self.shared.logins.load(Ordering::SeqCst)
     }
