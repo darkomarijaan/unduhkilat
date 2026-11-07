@@ -31,6 +31,8 @@ use unduhkilat_core::{category, repo};
 mod servers;
 #[path = "terminal.rs"]
 mod terminal;
+#[path = "explorer.rs"]
+mod explorer;
 
 const DOCK_HEIGHT: f32 = 200.0;
 /// Fixed height of one package card (DESIGN.md).
@@ -175,6 +177,7 @@ enum Msg {
     /// The update was downloaded, verified and unpacked (or why not).
     UpdateStaged(std::result::Result<(), String>),
     Servers(servers::ServersMsg),
+    Explorer(explorer::ExplorerMsg),
 }
 
 #[derive(Clone)]
@@ -438,6 +441,7 @@ impl App {
                     Err(e) => tracing::info!(error = %e, "update check failed"),
                 },
                 Msg::Servers(m) => self.servers_msg(m),
+                Msg::Explorer(m) => self.explorer_msg(m),
                 Msg::UpdateStaged(r) => match r {
                     Ok(()) => self.apply_update(),
                     Err(e) => {

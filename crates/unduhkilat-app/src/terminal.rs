@@ -703,6 +703,8 @@ pub fn settings_ui(ui: &mut egui::Ui, s: &mut TermSettings) {
 pub enum TabKind {
     Local(ShellKind),
     Ssh { server_id: String },
+    /// A file explorer only (FTP, FTPS, or SFTP without a terminal).
+    Files { server_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,6 +729,8 @@ pub struct TermTab {
     selected_file: Option<PathBuf>,
     /// Cancels a connection attempt that is still in progress (SSH tabs).
     cancel: Option<tokio_util::sync::CancellationToken>,
+    /// File explorer of an SSH or server tab; created the first time it is shown.
+    pub explorer: Option<super::explorer::ExplorerState>,
 }
 
 #[derive(Default)]
@@ -743,7 +747,34 @@ pub struct TerminalState {
     settings: Option<TermSettings>,
 }
 
+impl TermTab {
+    /// A tab that is only a file explorer (no terminal session).
+    pub fn files(id: u64, title: &str, subtitle: &str, server_id: &str) -> TermTab {
+        TermTab {
+            id,
+            base_title: title.to_string(),
+            subtitle: subtitle.to_string(),
+            kind: TabKind::Files { server_id: server_id.to_string() },
+            session: None,
+            status: TabStatus::Running,
+            view: TerminalView::default(),
+            show_files: true,
+            cwd: PathBuf::new(),
+            files_dir: PathBuf::new(),
+            selected_file: None,
+            cancel: None,
+            explorer: None,
+        }
+    }
+}
+
 impl TerminalState {
+    pub fn next_tab_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
     pub fn apply_settings(&mut self, s: TermSettings) {
         self.settings = Some(s);
     }
@@ -812,6 +843,7 @@ impl App {
                     cwd,
                     selected_file: None,
                     cancel: None,
+                    explorer: None,
                 });
                 self.terminal.active = self.terminal.tabs.len() - 1;
                 self.screen = Screen::Terminal;
@@ -841,6 +873,7 @@ impl App {
             files_dir: PathBuf::new(),
             selected_file: None,
             cancel: None,
+            explorer: None,
         });
         self.terminal.active = self.terminal.tabs.len() - 1;
         self.screen = Screen::Terminal;
@@ -910,6 +943,10 @@ impl App {
                 c.cancel();
             }
             self.servers.shell_waiters.remove(&id);
+            self.servers.shell_waiters.remove(&(id | super::explorer::EXPLORER_BIT));
+            if let Some(mut ex) = self.terminal.tabs[i].explorer.take() {
+                ex.close(&self.rt);
+            }
             if let Some(s) = &self.terminal.tabs[i].session {
                 s.close();
             }
@@ -939,6 +976,7 @@ impl App {
                         match &tab.kind {
                             TabKind::Local(_) => badge(ui, "LOKAL", egui::Color32::from_rgb(0x3A, 0x36, 0x32)),
                             TabKind::Ssh { .. } => badge(ui, "SSH", egui::Color32::from_rgb(0x6D, 0x4A, 0xFF)),
+                            TabKind::Files { .. } => badge(ui, "BERKAS", egui::Color32::from_rgb(0x1F, 0x7A, 0x5A)),
                         }
                         let r = ui.add(egui::Label::new(RichText::new(label).color(if active { egui::Color32::WHITE } else { FG })).sense(egui::Sense::click()));
                         if r.clicked() {
@@ -996,9 +1034,24 @@ impl App {
 
         let idx = self.terminal.active.min(self.terminal.tabs.len() - 1);
         let mut outcome = TabOutcome::default();
-        draw_tab(ui, &mut self.terminal.tabs[idx], &settings, self.terminal.maximized, &mut outcome);
+        // The tab is taken out of the list while it draws, so the explorer pane can use `self`.
+        let mut tab = self.terminal.tabs.remove(idx);
+        let id = tab.id;
+        let mut ex = tab.explorer.take();
+        if ex.is_none() {
+            if let TabKind::Ssh { server_id } | TabKind::Files { server_id } = &tab.kind {
+                ex = Some(self.new_explorer(server_id));
+            }
+        }
+        let maximized = self.terminal.maximized;
+        draw_tab(ui, &mut tab, &settings, maximized, &mut outcome, &mut |ui: &mut egui::Ui| {
+            if let Some(ex) = ex.as_mut() {
+                self.explorer_ui(ui, id, ex);
+            }
+        });
+        tab.explorer = ex;
+        self.terminal.tabs.insert(idx, tab);
         self.terminal.captured = self.terminal.tabs[idx].view.has_focus();
-        let id = self.terminal.tabs[idx].id;
         if let Some(text) = outcome.paste_confirm {
             self.terminal.confirm_paste = Some((id, text));
         }
@@ -1015,7 +1068,7 @@ impl App {
         if outcome.restart {
             let (kind, cwd) = match &self.terminal.tabs[idx].kind {
                 TabKind::Local(k) => (*k, self.terminal.tabs[idx].cwd.clone()),
-                TabKind::Ssh { .. } => return,
+                TabKind::Ssh { .. } | TabKind::Files { .. } => return,
             };
             match self.start_local_session(kind, &cwd) {
                 Ok(s) => {
@@ -1104,8 +1157,22 @@ struct TabOutcome {
 }
 
 /// One tab's toolbar, banner, terminal, and files pane, in the chosen layout.
-fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, maximized: bool, out: &mut TabOutcome) {
+fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, maximized: bool, out: &mut TabOutcome, explorer_ui: &mut dyn FnMut(&mut egui::Ui)) {
     let local = matches!(tab.kind, TabKind::Local(_));
+    if matches!(tab.kind, TabKind::Files { .. }) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&tab.subtitle).font(theme::mono(11.5)).color(FG_SECONDARY));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let label = if maximized { "Keluar layar penuh" } else { "Layar penuh" };
+                if ui.button(label).clicked() {
+                    out.toggle_max = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+        explorer_ui(ui);
+        return;
+    }
     ui.horizontal(|ui| {
         if settings.layout == TerminalLayout::A {
             ui.selectable_value(&mut tab.show_files, false, "Terminal");
@@ -1176,7 +1243,11 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, maxim
     match settings.layout {
         TerminalLayout::A => {
             if tab.show_files {
-                files_pane(ui, tab, &session, local, out);
+                if local {
+                    files_pane(ui, tab, &session, local, out);
+                } else {
+                    explorer_ui(ui);
+                }
             } else {
                 show_terminal(ui, tab, out);
             }
@@ -1187,7 +1258,13 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, maxim
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(Vec2::new(left, total.y), Layout::top_down(Align::Min), |ui| show_terminal(ui, tab, out));
                 ui.separator();
-                ui.allocate_ui_with_layout(Vec2::new((total.x - left - 16.0).max(120.0), total.y), Layout::top_down(Align::Min), |ui| files_pane(ui, tab, &session, local, out));
+                ui.allocate_ui_with_layout(Vec2::new((total.x - left - 16.0).max(120.0), total.y), Layout::top_down(Align::Min), |ui| {
+                    if local {
+                        files_pane(ui, tab, &session, local, out);
+                    } else {
+                        explorer_ui(ui);
+                    }
+                });
             });
         }
     }

@@ -297,6 +297,12 @@ impl App {
             ServersMsg::Loaded(Ok(list)) => {
                 self.servers.servers = list;
                 self.servers.loaded = true;
+                // Test aid: `UNDUHKILAT_START_SCREEN=files` opens the explorer of the first saved server.
+                if std::env::var("UNDUHKILAT_START_SCREEN").as_deref() == Ok("files") && self.terminal.tabs.is_empty() {
+                    if let Some(id) = self.servers.servers.first().map(|s| s.id.clone()) {
+                        self.open_files_tab(&id);
+                    }
+                }
             }
             ServersMsg::Loaded(Err(e)) => {
                 self.servers.loaded = true;
@@ -391,6 +397,7 @@ impl App {
         let mut delete: Option<(String, String)> = None;
         let mut cancel_test = false;
         let mut open_term: Option<String> = None;
+        let mut open_files: Option<String> = None;
         let busy = self.servers.testing.is_some();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for s in &list {
@@ -425,7 +432,9 @@ impl App {
                                 } else if ui.add_enabled(!busy, egui::Button::new("Uji sambungan")).clicked() {
                                     test = Some(s.id.clone());
                                 }
-                                ui.add_enabled(false, egui::Button::new("Berkas")).on_disabled_hover_text("Segera hadir");
+                                if ui.button("Berkas").on_hover_text("Jelajahi berkas di server ini").clicked() {
+                                    open_files = Some(s.id.clone());
+                                }
                                 if s.protocol.supports_jump() && ui.button("Terminal").on_hover_text("Buka shell SSH di server ini").clicked() {
                                     open_term = Some(s.id.clone());
                                 }
@@ -447,6 +456,9 @@ impl App {
         }
         if let Some(id) = open_term {
             self.open_ssh_terminal(&id);
+        }
+        if let Some(id) = open_files {
+            self.open_files_tab(&id);
         }
         if cancel_test {
             if let Some(t) = &self.servers.testing {

@@ -54,6 +54,8 @@ pub mod keys {
     pub const TERMINAL_FONT_SIZE: &str = "terminal_font_size";
     pub const TERMINAL_CTRL_V_PASTES: &str = "terminal_ctrl_v_pastes";
     pub const TERMINAL_LAYOUT: &str = "terminal_layout";
+    /// Largest file the preview will fetch whole, in MB (default 25).
+    pub const PREVIEW_MAX_MB: &str = "preview_max_mb";
     /// DEC-008. PROVISIONAL defaults: seeding on, ratio 1.0, DHT on, UPnP off, random port.
     pub const TORRENT_SEEDING: &str = "torrent_seeding_enabled";
     /// Global target share ratio; `0` means seed until the user stops it.
