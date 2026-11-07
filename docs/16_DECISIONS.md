@@ -75,3 +75,11 @@ Dokumen ini mencatat jawaban pengguna sesuai pilihan dan teks yang diberikan. La
 **Jawaban pengguna:** Tambahkan https://1337x.to/ sebagai sumber pencarian file.
 
 **Catatan implementasi:** 1337x.to dilindungi tantangan Cloudflare: permintaan otomatis dijawab HTTP 403 dengan halaman "Just a moment...". Melewatinya berarti menembus perlindungan anti-bot dan akan rapuh, sehingga 1337x tidak dimasukkan sebagai penyedia di dalam aplikasi. Sebagai gantinya, tombol "Cari di 1337x (browser)" di layar Cari membuka `https://1337x.to/search/<kata kunci>/1/` di browser pengguna; UnduhKilat sendiri tidak mengirim apa pun. Magnet yang diklik di sana diteruskan ke UnduhKilat lewat penangan magnet (pengguna harus memilih UnduhKilat sebagai aplikasi magnet default).
+
+## DEC-012 — Bagaimana terminal dibuat?
+
+**Status:** Dijawab
+
+**Jawaban pengguna:** Terminal dibuka juga dari folder di Windows (tanpa SSH), dengan tab dan tata letak yang bisa dipilih; mouse dan Ctrl+V seperti editor teks; kebutuhan utama menjalankan Claude Code. `Alt+V` (tempel gambar) belakangan.
+
+**Catatan implementasi:** Satu terminal dengan dua sumber, shell lokal (ConPTY lewat `portable-pty`) dan shell SSH (kanal PTY `russh`), keduanya lewat antarmuka `SourceIo`. Emulator memakai `alacritty_terminal`; keluaran diproses per 64 KB agar UI tidak macet. Sambungan SSH yang putus tidak disambung otomatis (tombol "Sambung ulang"). `Alt+V` ditunda ke setelah Rencana 2 (SFTP), karena perlu jalur unggah berkas. Verifikasi dengan Claude Code nyata belum dilakukan; lihat `docs/superpowers/spikes/2026-11-07-terminal-verification.md`.
