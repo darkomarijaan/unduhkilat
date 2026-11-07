@@ -5,7 +5,7 @@ use crate::db::Db;
 use crate::engine::proxy::ProxyConfig;
 use crate::error::Result;
 use crate::server::hostkeys;
-use crate::server::model::{NewServer, Server};
+use crate::server::model::{NewServer, Protocol, Server};
 use crate::server::secrets::{self, NewServerSecrets, SecretKind};
 use crate::server::ssh::{connect, ConnectOptions, Interact};
 use crate::server::store;
@@ -78,6 +78,24 @@ impl ServerService {
     }
 
     /// Connect through the whole chain, report, and disconnect. Nothing else is done on the server.
+    /// Connect and open the file system of a saved server: SFTP over SSH for SSH and SFTP entries
+    /// (through the whole jump chain), FTP or FTPS for the others. Nothing is contacted until this
+    /// is called.
+    pub async fn open_fs(&self, id: &str, interact: Arc<dyn Interact>, cancel: CancellationToken) -> Result<Box<dyn crate::server::fs::RemoteFs>> {
+        let server = self.db.read({
+            let id = id.to_string();
+            move |c| store::get_server(c, &id)
+        })?;
+        match server.protocol {
+            Protocol::Ssh | Protocol::Sftp => {
+                let opts = ConnectOptions { proxy: (self.proxy)(), ..Default::default() };
+                let session = connect(&self.db, id, interact, opts, cancel).await?;
+                crate::server::fs::sftp::open_sftp(session).await
+            }
+            Protocol::Ftp | Protocol::Ftps => crate::server::fs::ftp::open_ftp(&self.db, &server, interact, cancel).await,
+        }
+    }
+
     pub async fn test_connection(&self, id: &str, interact: Arc<dyn Interact>, cancel: CancellationToken) -> Result<TestReport> {
         let opts = ConnectOptions { proxy: (self.proxy)(), ..Default::default() };
         let session = connect(&self.db, id, interact, opts, cancel).await?;
