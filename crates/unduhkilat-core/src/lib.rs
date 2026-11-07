@@ -24,3 +24,5 @@ pub mod term;
 pub mod update;
 
 pub use error::{AppError, ErrorCode, Result};
+
+pub mod preview;
