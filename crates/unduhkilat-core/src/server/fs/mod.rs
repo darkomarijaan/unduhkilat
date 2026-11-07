@@ -145,3 +145,4 @@ mod tests {
 }
 
 pub mod sftp;
+pub mod ftp;
