@@ -2,7 +2,7 @@
 
 Manajer unduhan berkecepatan tinggi untuk Windows 10/11 (x64), ditulis dengan Rust. Portabel (cukup ZIP, tanpa instalasi), tanpa telemetri, dan tidak pernah memulai atau menimpa berkas tanpa konfirmasi Anda.
 
-> **Status: pra-rilis (0.1.3).** Mesin unduhan, torrent, ekstensi browser, dan antarmuka sudah berfungsi dan teruji, tetapi beberapa bagian belum diuji di lingkungan nyata. Lihat [Status](#status) sebelum memakainya untuk hal penting. Binari belum ditandatangani kode, jadi Windows SmartScreen mungkin memperingatkan saat pertama dijalankan.
+> **Status: pra-rilis (0.1.4).** Mesin unduhan, torrent, ekstensi browser, dan antarmuka sudah berfungsi dan teruji, tetapi beberapa bagian belum diuji di lingkungan nyata. Lihat [Status](#status) sebelum memakainya untuk hal penting. Binari belum ditandatangani kode, jadi Windows SmartScreen mungkin memperingatkan saat pertama dijalankan.
 
 ## Fitur
 
@@ -11,6 +11,7 @@ Manajer unduhan berkecepatan tinggi untuk Windows 10/11 (x64), ditulis dengan Ru
 - **BitTorrent**: berkas `.torrent` dan tautan magnet, tracker, DHT, PEX, seeding dengan target rasio. Memakai [`librqbit`](https://github.com/ikatson/rqbit).
 - **Pencarian berkas** dari Internet Archive, Academic Torrents, serta (opsional, mati secara bawaan) apibay dan Nyaa. Kata kunci hanya dikirim saat Anda menekan Cari.
 - **Google Drive publik**: tombol di layar Cari membuka `site:drive.google.com ...` di browser Anda; tautan file Drive yang Anda tempel otomatis diubah menjadi unduhan langsung (folder tidak didukung). Belum diuji dengan file Drive publik nyata.
+- **1337x**: tombol "Cari di 1337x (browser)" di layar Cari membuka pencarian 1337x.to di browser Anda. Situs itu memakai perlindungan Cloudflare sehingga tidak bisa dicari dari dalam aplikasi; magnet yang Anda klik di sana diteruskan ke UnduhKilat bila aplikasi ini dipilih sebagai penangan magnet.
 - **Site Grabber**: pindai satu halaman web, saring tautan dengan pola wildcard (`*.pdf`, `foto_???.jpg`, `*/a/*.zip`), pratinjau, lalu antrikan yang dicentang.
 - **Ekstensi Chromium** (Chrome, Edge, Brave) lewat Native Messaging: tangkap tautan unduhan dan media. Selalu ada dialog konfirmasi; tidak ada yang dimulai otomatis.
 - **Pemantau clipboard** (opsional, mati secara bawaan): menawarkan tautan HTTP/HTTPS/FTP yang Anda salin.

@@ -67,3 +67,11 @@ Dokumen ini mencatat jawaban pengguna sesuai pilihan dan teks yang diberikan. La
 **Jawaban pengguna:** Tambahkan pencarian `site:drive.google.com` agar file Drive yang memang dibagikan publik bisa dicari.
 
 **Catatan implementasi:** Mesin pencari menolak permintaan otomatis (DuckDuckGo dan Yandex menampilkan captcha, Brave membalas 429, Bing mengabaikan `site:`), dan men-scrape-nya melanggar syarat layanannya. Maka tombol "Cari file Drive publik di browser" di layar Cari membuka Google dengan `site:drive.google.com <kata kunci>` di browser pengguna; UnduhKilat sendiri tidak mengirim apa pun. Tautan Drive file (`/file/d/ID`, `open?id=`, `uc?id=`) otomatis diubah menjadi URL unduhan langsung `drive.usercontent.google.com/download?id=ID&export=download&confirm=t`; folder ditolak. Belum diuji terhadap file Drive publik nyata. Jalur alternatif di dalam aplikasi (Google Programmable Search API) butuh kunci API dari pengguna dan belum dibuat.
+
+## DEC-011 — Bisakah 1337x.to menjadi sumber pencarian?
+
+**Status:** Dijawab
+
+**Jawaban pengguna:** Tambahkan https://1337x.to/ sebagai sumber pencarian file.
+
+**Catatan implementasi:** 1337x.to dilindungi tantangan Cloudflare: permintaan otomatis dijawab HTTP 403 dengan halaman "Just a moment...". Melewatinya berarti menembus perlindungan anti-bot dan akan rapuh, sehingga 1337x tidak dimasukkan sebagai penyedia di dalam aplikasi. Sebagai gantinya, tombol "Cari di 1337x (browser)" di layar Cari membuka `https://1337x.to/search/<kata kunci>/1/` di browser pengguna; UnduhKilat sendiri tidak mengirim apa pun. Magnet yang diklik di sana diteruskan ke UnduhKilat lewat penangan magnet (pengguna harus memilih UnduhKilat sebagai aplikasi magnet default).

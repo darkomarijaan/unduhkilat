@@ -148,6 +148,10 @@ fn main() {
 
     let is_cli = args.first().map(String::as_str) == Some("cli");
     let _instance = match AppPaths::from_current_exe().ok().map(|p| boot::single_instance(&p)) {
+        Some(None) if args.iter().any(|a| a == unduhkilat_core::autostart::BACKGROUND_FLAG) => {
+            // Autostart while the app is already open: nothing to say, nothing to do.
+            std::process::exit(0);
+        }
         Some(None) => {
             let msg = "UnduhKilat sudah berjalan untuk folder data ini. Buka dari ikon tray di dekat jam.";
             if is_cli {
@@ -197,6 +201,10 @@ fn main() {
             Ok(st) => tracing::info!(?st, "native messaging host registration verified"),
             Err(e) => tracing::warn!(error = %e, "native messaging host registration failed; browser capture is unavailable"),
         }
+        // A moved portable folder would leave the "start with Windows" entry pointing nowhere.
+        if let Ok(exe) = std::env::current_exe() {
+            unduhkilat_core::autostart::refresh_if_stale(&exe);
+        }
         // Lets UnduhKilat be chosen as the handler for magnet: links (Settings > Default apps).
         if let Ok(exe) = std::env::current_exe() {
             if let Err(e) = unduhkilat_core::protocol::register(&exe) {
@@ -205,6 +213,7 @@ fn main() {
         }
     }
 
+    let start_hidden = args.iter().any(|a| a == unduhkilat_core::autostart::BACKGROUND_FLAG);
     let first_url = args.into_iter().find(|a| unduhkilat_core::protocol::is_link_arg(a));
 
     let options = eframe::NativeOptions {
@@ -247,6 +256,7 @@ fn main() {
             if let Some(u) = &first_url {
                 app.open_add_dialog(u);
             }
+            app.start_hidden = start_hidden;
             Ok(Box::new(app))
         }),
     );

@@ -3,6 +3,7 @@
 
 #[cfg(windows)]
 pub mod admin;
+pub mod autostart;
 pub mod bridge;
 pub mod category;
 pub mod clipboard;

@@ -145,6 +145,7 @@ struct SettingsState {
     new_cat: (String, String, String),
     clip: bool,
     upd: bool,
+    autostart: bool,
     t_seeding: bool,
     t_ratio: f32,
     t_dht: bool,
@@ -214,6 +215,8 @@ pub struct App {
     rx: Receiver<Msg>,
     notice: Option<(String, Instant)>,
     update: UpdState,
+    /// Started by Windows at logon: go straight to the tray (only if a tray icon exists).
+    pub start_hidden: bool,
 }
 
 impl App {
@@ -238,7 +241,7 @@ impl App {
             last_refresh: Instant::now() - Duration::from_secs(10), live: HashMap::new(), torrent: None, torrent_poll: Instant::now() - Duration::from_secs(10), grab: GrabState::default(), search: SearchState::default(), clip_rx, clip_enabled, events,
             selected: None, checked: HashSet::new(), filter: Filter::All, sort: (SortKey::None, true),
             screen: Screen::Downloads, dock_open: false, dock_height: DOCK_HEIGHT, add: None, settings: None,
-            log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None, update: UpdState::None,
+            log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None, update: UpdState::None, start_hidden: false,
         };
         app.refresh();
         // FR-060: look for a newer signed release (setting is on by default; tests/demos can skip it).
@@ -518,6 +521,27 @@ pub fn browser_status(paths: &AppPaths) -> Vec<(native::Browser, native::Status)
 }
 
 /// Idempotent per-user registration; repairs stale entries when the folder moved (FR-034).
+/// Select the file (or folder) in Explorer. If it is gone, open the nearest folder that exists.
+/// The path is passed with `raw_arg`: Rust would otherwise wrap the whole `/select,<path>` in
+/// quotes when the path has spaces, and Explorer then ignores it and opens Documents.
+#[cfg(windows)]
+fn reveal_in_explorer(target: &str) {
+    use std::os::windows::process::CommandExt;
+    let path = std::path::PathBuf::from(target.replace('/', "\\"));
+    let mut cmd = std::process::Command::new("explorer");
+    if path.exists() {
+        cmd.raw_arg(format!("/select,\"{}\"", path.display()));
+    } else if let Some(dir) = path.ancestors().skip(1).find(|p| p.is_dir()) {
+        cmd.raw_arg(format!("\"{}\"", dir.display()));
+    } else {
+        return;
+    }
+    let _ = cmd.spawn();
+}
+
+#[cfg(not(windows))]
+fn reveal_in_explorer(_: &str) {}
+
 pub fn register_host(paths: &AppPaths) -> unduhkilat_core::Result<Vec<(native::Browser, native::Status)>> {
     native::ensure_registered(&native::Target::default(), &paths.data_dir, &host_exe())
 }
@@ -834,6 +858,12 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
+        if self.start_hidden {
+            self.start_hidden = false;
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
         if !self.sized {
             // Default 1280x800 (§5), but never larger than the primary monitor, e.g. a 1536x864
             // laptop at 125% scaling would otherwise clip the dock and the status strip.
@@ -1105,6 +1135,7 @@ impl App {
             new_cat: (String::new(), String::new(), String::new()),
             clip: get(keys::CLIPBOARD_MONITOR).is_some_and(|v| v == "1"),
             upd: get(keys::UPDATE_CHECK).map(|v| v != "0").unwrap_or(true),
+            autostart: unduhkilat_core::autostart::is_enabled(),
             t_seeding: get(keys::TORRENT_SEEDING).map(|v| v != "0").unwrap_or(true),
             t_ratio: get(keys::TORRENT_SEED_RATIO).and_then(|v| v.parse().ok()).unwrap_or(1.0),
             t_dht: get(keys::TORRENT_DHT).map(|v| v != "0").unwrap_or(true),
@@ -1165,37 +1196,42 @@ impl App {
             ui.add_space(12.0);
             ui.label(RichText::new(t).font(theme::bold(11.0)).color(FG_SECONDARY));
         };
-        ui.spacing_mut().item_spacing.y = 2.0;
-        if nav(ui, self.filter == Filter::All && self.screen == Screen::Downloads, "Semua paket", None, Some(self.count(|_| true))) {
-            self.filter = Filter::All;
-            self.screen = Screen::Downloads;
-        }
-        section(ui, "KATEGORI");
-        for c in self.categories.clone() {
-            let n = self.count(|d| d.category_id.as_deref() == Some(&c.id));
-            if nav(ui, self.filter == Filter::Category(c.id.clone()) && self.screen == Screen::Downloads, &c.name, Some(theme::category_color(&c.name)), Some(n)) {
-                self.filter = Filter::Category(c.id);
+        let total = ui.available_height();
+        // Scrolls when the window is too short for every entry (otherwise the bottom block overlapped the tools).
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            if nav(ui, self.filter == Filter::All && self.screen == Screen::Downloads, "Semua paket", None, Some(self.count(|_| true))) {
+                self.filter = Filter::All;
                 self.screen = Screen::Downloads;
             }
-        }
-        section(ui, "ALAT");
-        if nav(ui, self.screen == Screen::Grabber, "Site Grabber", None, None) {
-            self.screen = if self.screen == Screen::Grabber { Screen::Downloads } else { Screen::Grabber };
-        }
-        if nav(ui, self.screen == Screen::Search, "Cari berkas", None, None) {
-            self.screen = if self.screen == Screen::Search { Screen::Downloads } else { Screen::Search };
-        }
-        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            if ui.add(egui::Button::new(RichText::new("Keluar dari UnduhKilat").size(12.5).color(FG_SECONDARY)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked() {
-                let (rt, m) = (self.rt.clone(), self.manager.clone());
-                std::thread::spawn(move || crate::boot::exit_flow(rt, m));
+            section(ui, "KATEGORI");
+            for c in self.categories.clone() {
+                let n = self.count(|d| d.category_id.as_deref() == Some(&c.id));
+                if nav(ui, self.filter == Filter::Category(c.id.clone()) && self.screen == Screen::Downloads, &c.name, Some(theme::category_color(&c.name)), Some(n)) {
+                    self.filter = Filter::Category(c.id);
+                    self.screen = Screen::Downloads;
+                }
+            }
+            section(ui, "ALAT");
+            if nav(ui, self.screen == Screen::Grabber, "Site Grabber", None, None) {
+                self.screen = if self.screen == Screen::Grabber { Screen::Downloads } else { Screen::Grabber };
+            }
+            if nav(ui, self.screen == Screen::Search, "Cari berkas", None, None) {
+                self.screen = if self.screen == Screen::Search { Screen::Downloads } else { Screen::Search };
+            }
+            // Pin the bottom block to the foot of the panel only when there is room for it.
+            const BOTTOM_H: f32 = 120.0;
+            let free = total - ui.min_rect().height();
+            ui.add_space((free - BOTTOM_H).max(12.0));
+            if nav(ui, self.screen == Screen::Settings, "Pengaturan", None, None) {
+                self.open_settings_screen();
             }
             if nav(ui, self.screen == Screen::Diagnostics, "Diagnostik", None, None) {
                 self.screen = if self.screen == Screen::Diagnostics { Screen::Downloads } else { Screen::Diagnostics };
             }
-            if nav(ui, self.screen == Screen::Settings, "Pengaturan", None, None) {
-                self.open_settings_screen();
+            if ui.add(egui::Button::new(RichText::new("Keluar dari UnduhKilat").size(12.5).color(FG_SECONDARY)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked() {
+                let (rt, m) = (self.rt.clone(), self.manager.clone());
+                std::thread::spawn(move || crate::boot::exit_flow(rt, m));
             }
         });
     }
@@ -1303,7 +1339,7 @@ impl App {
             Action::Delete(f) => self.run(async move { m.delete(&id, f).await }),
             Action::Reveal => {
                 if let Ok(d) = self.manager.get(&id) {
-                    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", d.target_path.replace('/', "\\"))).spawn();
+                    reveal_in_explorer(&d.target_path);
                 }
             }
         }
@@ -1771,6 +1807,7 @@ impl App {
                         ui.checkbox(&mut s.close_to_tray, "Tutup jendela ke tray (unduhan tetap berjalan)");
                         ui.checkbox(&mut s.toast, "Tampilkan notifikasi saat unduhan selesai");
                         ui.checkbox(&mut s.clip, "Pantau clipboard: tawarkan tautan HTTP/HTTPS/FTP yang disalin");
+                        ui.checkbox(&mut s.autostart, "Jalankan UnduhKilat saat Windows dinyalakan (langsung ke tray)");
                         ui.checkbox(&mut s.upd, "Cek versi baru saat aplikasi dibuka (menghubungi github.com)");
                         if ui.button("Periksa pembaruan sekarang").clicked() {
                             check_now = true;
@@ -1829,6 +1866,14 @@ impl App {
             self.clip_enabled.store(s.clip, Ordering::Relaxed);
             let clip = s.clip;
             let upd = s.upd;
+            // The registry is the source of truth, so write it only when the box actually changed.
+            if s.autostart != unduhkilat_core::autostart::is_enabled() {
+                let r = std::env::current_exe().map_err(|e| unduhkilat_core::AppError::internal(e.to_string())).and_then(|exe| unduhkilat_core::autostart::set_enabled(s.autostart, &exe));
+                if let Err(e) = r {
+                    self.notice = Some((format!("{}: {}", e.code, e.message), Instant::now()));
+                    s.autostart = unduhkilat_core::autostart::is_enabled();
+                }
+            }
             let (t_seed, t_ratio, t_dht, t_upnp, t_port) = (s.t_seeding, s.t_ratio.max(0.0), s.t_dht, s.t_upnp, s.t_port.min(65535));
             let net_changed = (t_dht, t_upnp, t_port) != s.t_net_orig;
             s.t_net_orig = (t_dht, t_upnp, t_port);
@@ -2069,8 +2114,13 @@ impl App {
                     open_in_browser(&format!("https://www.google.com/search?q={}", percent_encode(&q)));
                 }
             });
-            ui.label(RichText::new("Salin tautan Drive yang ketemu, lalu tempel di Tambah unduhan (atau aktifkan pemantau clipboard di Pengaturan).").size(11.5).color(FG_SECONDARY));
+            ui.add_enabled_ui(ok, |ui| {
+                if ui.button("Cari di 1337x (browser)").on_hover_text("Membuka 1337x.to di browser Anda (situs itu memakai perlindungan Cloudflare, jadi tidak bisa dicari dari dalam aplikasi). Klik Magnet Download di sana dan UnduhKilat akan terbuka bila sudah dipilih sebagai aplikasi magnet.").clicked() {
+                    open_in_browser(&format!("https://1337x.to/search/{}/1/", percent_encode(self.search.query.trim())));
+                }
+            });
         });
+        ui.label(RichText::new("Drive: salin tautan yang ketemu lalu tempel di Tambah unduhan (atau aktifkan pemantau clipboard di Pengaturan). 1337x: klik Magnet Download, UnduhKilat terbuka bila sudah jadi aplikasi magnet default.").size(11.5).color(FG_SECONDARY));
         ui.label(RichText::new("Indeks umum dapat memuat materi berhak cipta; pastikan Anda berhak mengunduh apa pun yang dipilih. Academic Torrents hanya mencari entri terbarunya.").color(FG_SECONDARY).size(11.0));
         if let Some(e) = &self.search.err { ui.label(RichText::new(e).color(DANGER)); }
         ui.separator();
