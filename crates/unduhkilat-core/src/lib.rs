@@ -19,6 +19,7 @@ pub mod native;
 pub mod paths;
 pub mod protocol;
 pub mod repo;
+pub mod server;
 pub mod update;
 
 pub use error::{AppError, ErrorCode, Result};
