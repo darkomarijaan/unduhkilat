@@ -26,6 +26,10 @@ use unduhkilat_core::paths::AppPaths;
 use unduhkilat_core::update::{self, UpdateInfo};
 use unduhkilat_core::{category, repo};
 
+// The Server screen shares App's private fields, so it is a child module of this one.
+#[path = "servers.rs"]
+mod servers;
+
 const DOCK_HEIGHT: f32 = 200.0;
 /// Fixed height of one package card (DESIGN.md).
 const CARD_H: f32 = 92.0;
@@ -64,6 +68,7 @@ enum Screen {
     Diagnostics,
     Grabber,
     Search,
+    Servers,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -164,6 +169,7 @@ enum Msg {
     UpdateFound(std::result::Result<Option<UpdateInfo>, String>, bool),
     /// The update was downloaded, verified and unpacked (or why not).
     UpdateStaged(std::result::Result<(), String>),
+    Servers(servers::ServersMsg),
 }
 
 #[derive(Clone)]
@@ -215,6 +221,7 @@ pub struct App {
     rx: Receiver<Msg>,
     notice: Option<(String, Instant)>,
     update: UpdState,
+    servers: servers::ServersState,
     /// Started by Windows at logon: go straight to the tray (only if a tray icon exists).
     pub start_hidden: bool,
 }
@@ -241,9 +248,10 @@ impl App {
             last_refresh: Instant::now() - Duration::from_secs(10), live: HashMap::new(), torrent: None, torrent_poll: Instant::now() - Duration::from_secs(10), grab: GrabState::default(), search: SearchState::default(), clip_rx, clip_enabled, events,
             selected: None, checked: HashSet::new(), filter: Filter::All, sort: (SortKey::None, true),
             screen: Screen::Downloads, dock_open: false, dock_height: DOCK_HEIGHT, add: None, settings: None,
-            log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None, update: UpdState::None, start_hidden: false,
+            log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None, update: UpdState::None, servers: servers::ServersState::default(), start_hidden: false,
         };
         app.refresh();
+        app.servers_reload(); // local database only: fills the sidebar count, connects to nothing
         // FR-060: look for a newer signed release (setting is on by default; tests/demos can skip it).
         let check_on = app.manager.db().read(|c| repo::get_setting(c, keys::UPDATE_CHECK)).ok().flatten().map(|v| v != "0").unwrap_or(true);
         if check_on && std::env::var_os("UNDUHKILAT_NO_UPDATE_CHECK").is_none() {
@@ -253,6 +261,11 @@ impl App {
         match std::env::var("UNDUHKILAT_START_SCREEN").ok().as_deref() {
             Some("settings") => app.open_settings_screen(),
             Some("search") => app.screen = Screen::Search,
+            Some("servers") => app.screen = Screen::Servers,
+            Some("servers-new") => {
+                app.screen = Screen::Servers;
+                app.servers_open_new_dialog();
+            }
             Some("grabber") => app.screen = Screen::Grabber,
             Some("diagnostics") => app.screen = Screen::Diagnostics,
             Some("add") => app.open_add_dialog("https://releases.ubuntu.com/24.04.1/ubuntu-24.04.1-desktop-amd64.iso"),
@@ -409,6 +422,7 @@ impl App {
                     Err(e) if manual => self.notice = Some((e, Instant::now())),
                     Err(e) => tracing::info!(error = %e, "update check failed"),
                 },
+                Msg::Servers(m) => self.servers_msg(m),
                 Msg::UpdateStaged(r) => match r {
                     Ok(()) => self.apply_update(),
                     Err(e) => {
@@ -945,9 +959,11 @@ impl eframe::App for App {
             Screen::Diagnostics => self.diagnostics(ui),
             Screen::Grabber => self.grabber(ui),
             Screen::Search => self.search_screen(ui),
+            Screen::Servers => self.servers_screen(ui),
         });
 
         self.add_dialog(ctx);
+        self.servers_dialogs(ctx);
         self.resize_edges(ctx);
     }
 }
@@ -1218,6 +1234,9 @@ impl App {
             }
             if nav(ui, self.screen == Screen::Search, "Cari berkas", None, None) {
                 self.screen = if self.screen == Screen::Search { Screen::Downloads } else { Screen::Search };
+            }
+            if nav(ui, self.screen == Screen::Servers, "Server", None, Some(self.servers.servers.len())) {
+                self.screen = if self.screen == Screen::Servers { Screen::Downloads } else { Screen::Servers };
             }
             // Pin the bottom block to the foot of the panel only when there is room for it.
             const BOTTOM_H: f32 = 120.0;

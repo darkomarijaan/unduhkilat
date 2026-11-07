@@ -9,7 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 unduhkilat-core = { path = "../unduhkilat-core" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio-util = "0.7"
+futures-util = "0.3"
 tracing = "0.1"
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts"] }
 egui_extras = "0.37.0"
