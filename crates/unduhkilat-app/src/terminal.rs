@@ -1467,4 +1467,13 @@ mod tests {
         assert_eq!(bytes(tr(&[ev], NONE)), "\u{4F60}\u{597D}".as_bytes());
         assert!(tr(&[Event::Ime(egui::ImeEvent::Preedit { text: "ni".into(), active_range_chars: None })], NONE).is_empty(), "composition in progress sends nothing");
     }
+
+    #[test]
+    fn eframe_is_built_with_the_system_clipboard() {
+        // Without eframe's "clipboard" feature egui-winit keeps copy/paste inside the process:
+        // Ctrl+V never sees text copied elsewhere and Ctrl+C never reaches Windows.
+        let manifest = include_str!("../Cargo.toml");
+        let eframe_line = manifest.lines().find(|l| l.trim_start().starts_with("eframe")).expect("eframe dependency");
+        assert!(eframe_line.contains("\"clipboard\""), "eframe features must include clipboard: {eframe_line}");
+    }
 }

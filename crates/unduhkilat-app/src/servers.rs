@@ -638,7 +638,11 @@ impl App {
             ui.add_space(8.0);
             egui::Grid::new("server-form").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
                 ui.label("Nama:");
-                ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(f32::INFINITY));
+                let name_edit = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(f32::INFINITY));
+                // With nothing focused, Ctrl+V reaches no widget: start in the first field so paste works at once.
+                if !prompt_open && ctx.memory(|m| m.focused().is_none()) {
+                    name_edit.request_focus();
+                }
                 ui.end_row();
 
                 ui.label("Protokol:");

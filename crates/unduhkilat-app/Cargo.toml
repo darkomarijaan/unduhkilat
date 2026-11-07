@@ -14,7 +14,7 @@ tokio-util = "0.7"
 futures-util = "0.3"
 serde_json = "1"
 tracing = "0.1"
-eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "clipboard"] }
 egui_extras = "0.37.0"
 tray-icon = "0.26.1"
 rfd = "0.17.2"
