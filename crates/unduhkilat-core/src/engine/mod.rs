@@ -5,6 +5,7 @@ pub mod grabber;
 pub mod http;
 pub mod manager;
 pub mod proxy;
+pub mod remote;
 pub mod search;
 pub mod segments;
 pub mod throttle;

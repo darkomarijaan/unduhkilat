@@ -477,6 +477,89 @@ impl Manager {
         self.get(&dl.id)
     }
 
+    // ---- transfers with saved servers ----------------------------------------
+
+    /// Queue a download of `remote_path` from a saved server into `local_dir`. The local name is the
+    /// remote name made safe. An existing local file is refused unless `overwrite` (the caller asked
+    /// the user first).
+    pub async fn enqueue_remote_download(&self, server_id: &str, remote_path: &str, local_dir: &std::path::Path, overwrite: bool) -> Result<Download> {
+        let remote_name = remote_path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        let name = crate::server::fs::safe_local_name(remote_name).ok_or_else(|| AppError::new(ErrorCode::ErrInvalidPath, "Nama berkas dari server kosong atau tidak aman untuk dibuat di komputer ini."))?;
+        let target = local_dir.join(&name);
+        if !target.is_absolute() {
+            return Err(AppError::new(ErrorCode::ErrInvalidPath, format!("{} bukan jalur absolut.", target.display())));
+        }
+        if target.exists() {
+            if !overwrite {
+                return Err(AppError::new(ErrorCode::ErrNameCollision, format!("{} sudah ada.", target.display())));
+            }
+            std::fs::remove_file(&target).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, format!("{}: {e}", target.display())))?;
+        }
+        let url = super::remote::make_url(super::remote::Direction::Download, server_id, remote_path, false);
+        self.insert_remote(url, target, name, true).await
+    }
+
+    /// Queue an upload of `local_file` into `remote_dir` on a saved server. Replacing an existing
+    /// server file needs `overwrite` (the caller asked the user first); otherwise the item stops with
+    /// `ERR_NAME_COLLISION`.
+    pub async fn enqueue_remote_upload(&self, server_id: &str, local_file: &std::path::Path, remote_dir: &str, overwrite: bool) -> Result<Download> {
+        if !local_file.is_file() {
+            return Err(AppError::new(ErrorCode::ErrFileNotFound, format!("{} bukan berkas.", local_file.display())));
+        }
+        let name = local_file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if name.is_empty() || name.contains('/') {
+            return Err(AppError::new(ErrorCode::ErrInvalidPath, "Nama berkas sumber tidak valid."));
+        }
+        let url = super::remote::make_url(super::remote::Direction::Upload, server_id, &crate::server::fs::join_remote(remote_dir, &name), overwrite);
+        self.insert_remote(url, local_file.to_path_buf(), name, false).await
+    }
+
+    async fn insert_remote(&self, url: String, local: PathBuf, file_name: String, check_target_clash: bool) -> Result<Download> {
+        let ts = repo::now();
+        let dl = Download {
+            id: uuid::Uuid::new_v4().to_string(),
+            original_url: url.clone(),
+            effective_url: url,
+            target_path: local.to_string_lossy().into_owned(),
+            file_name,
+            total_bytes: -1,
+            downloaded_bytes: 0,
+            state: DownloadState::Queued,
+            segmentation_supported: false,
+            connection_count: 1,
+            speed_limit_kbps: 0,
+            category_id: None,
+            mime_type: None,
+            referer: None,
+            user_agent: None,
+            cookies: None,
+            error_code: None,
+            error_message: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            completed_at: None,
+        };
+        let d2 = dl.clone();
+        self.db()
+            .write(move |c| {
+                if check_target_clash {
+                    let clash: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM downloads WHERE target_path=?1 AND state IN ('queued','running','paused'))", [&d2.target_path], |r| r.get(0))?;
+                    if clash {
+                        return Err(AppError::new(ErrorCode::ErrNameCollision, format!("{} adalah tujuan unduhan aktif lain.", d2.target_path)));
+                    }
+                }
+                let tx = c.transaction()?;
+                repo::insert_download(&tx, &d2)?;
+                repo::enqueue(&tx, &d2.id, 0)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+        self.emit_state(&dl.id, dl.state, None);
+        self.dispatch().await?;
+        self.get(&dl.id)
+    }
+
     pub fn get(&self, id: &str) -> Result<Download> {
         self.db().read(|c| repo::get_download(c, id))
     }
@@ -666,7 +749,8 @@ impl Manager {
         // (UI, tests, a crash-restart) must never find the file still on disk.
         if torrent::is_magnet(&dl.original_url) {
             self.inner.ctx.torrent.forget(id, delete_file).await?;
-        } else if delete_file {
+        } else if delete_file && !super::remote::is_upload(&dl.original_url) {
+            // For an upload `target_path` is the user's own source file: it is never deleted.
             let _ = std::fs::remove_file(&dl.target_path);
         }
         let id2 = id.to_string();
@@ -699,7 +783,7 @@ impl Manager {
         }
         let id2 = id.to_string();
         self.db().write(move |c| Ok(c.execute("DELETE FROM downloads WHERE id=?1", [&id2])?)).await?;
-        if delete_file && !is_torrent {
+        if delete_file && !is_torrent && !super::remote::is_upload(&dl.original_url) {
             let _ = std::fs::remove_file(&dl.target_path);
         }
         Ok(())

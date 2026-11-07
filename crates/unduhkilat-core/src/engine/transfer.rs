@@ -133,6 +133,9 @@ async fn run_inner(ctx: &TransferCtx, id: &str, cancel: &CancellationToken, item
     if super::torrent::is_magnet(&dl.original_url) {
         return super::torrent::run_torrent(ctx, id, cancel, item_bucket).await;
     }
+    if super::remote::is_remote(&dl.original_url) {
+        return super::remote::run_remote(ctx, id, cancel, item_bucket).await;
+    }
     let scheme = url::Url::parse(&dl.original_url).map(|u| u.scheme().to_string()).unwrap_or_default();
     let is_ftp = match scheme.as_str() {
         "http" | "https" => false,
