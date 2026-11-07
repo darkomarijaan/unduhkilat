@@ -107,6 +107,9 @@ pub async fn open_shell(session: SshSession, cols: u16, rows: u16) -> Result<Sou
                 },
             }
         }
+        // Refuse further input before announcing the end: a write after `Closed` must fail, not queue.
+        ctl_rx.close();
+        drop(ctl_rx);
         let _ = tx.send(SourceEvent::Closed(exit));
         session.close().await;
     });
