@@ -344,6 +344,14 @@ impl TermEngine {
         self.term.selection_to_string().filter(|s| !s.is_empty())
     }
 
+    /// The selection as ((row, col), (row, col)) from first to last cell, in viewport rows (may be off
+    /// screen when scrolled; clamp when drawing).
+    pub fn selection_viewport(&self) -> Option<((i32, u16), (i32, u16))> {
+        let range = self.term.selection.as_ref().and_then(|s| s.to_range(&self.term))?;
+        let off = self.term.grid().display_offset() as i32;
+        Some(((range.start.line.0 + off, range.start.column.0 as u16), (range.end.line.0 + off, range.end.column.0 as u16)))
+    }
+
     pub fn clear_screen_and_history(&mut self) {
         self.feed(b"\x1b[H\x1b[2J\x1b[3J");
     }
@@ -492,6 +500,22 @@ mod tests {
         e.select_all();
         let all = e.selected_text().unwrap();
         assert!(all.contains("halo dunia") && all.contains("baris dua"), "{all:?}");
+    }
+
+    #[test]
+    fn selection_viewport_reports_the_selected_cells() {
+        let mut e = TermEngine::new(80, 5, 100);
+        e.feed(b"halo dunia
+baris dua");
+        assert_eq!(e.selection_viewport(), None);
+        e.select_start(SelectKind::Simple, 0, 0);
+        e.select_update(0, 3);
+        assert_eq!(e.selection_viewport(), Some(((0, 0), (0, 3))));
+        e.feed("
+x".repeat(10).as_bytes());
+        e.scroll(2);
+        let ((r0, _), (r1, _)) = e.selection_viewport().expect("still selected while scrolled");
+        assert!(r0 != 0 && r0 == r1, "rows are reported relative to the scrolled viewport: {r0}");
     }
 
     #[test]

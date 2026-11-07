@@ -29,6 +29,8 @@ use unduhkilat_core::{category, repo};
 // The Server screen shares App's private fields, so it is a child module of this one.
 #[path = "servers.rs"]
 mod servers;
+#[path = "terminal.rs"]
+mod terminal;
 
 const DOCK_HEIGHT: f32 = 200.0;
 /// Fixed height of one package card (DESIGN.md).
