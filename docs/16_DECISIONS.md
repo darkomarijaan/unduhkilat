@@ -59,3 +59,11 @@ Dokumen ini mencatat jawaban pengguna sesuai pilihan dan teks yang diberikan. La
 **Jawaban pengguna:** Internet Archive, Academic Torrents, dan indeks torrent umum (apibay/Nyaa); hanya saat tombol Cari diklik, tanpa saran otomatis saat mengetik.
 
 **Catatan implementasi:** Kata kunci hanya dikirim ke sumber yang dicentang dan hanya saat Cari ditekan (lewat klien HTTP aplikasi, jadi proxy berlaku). Dua katalog legal aktif secara bawaan; apibay dan Nyaa dimatikan sampai dicentang (nilai bawaan PROVISIONAL). Academic Torrents tidak punya API pencarian, jadi feed `rss.xml` resminya (entri terbaru) disaring secara lokal.
+
+## DEC-010 — Bagaimana mencari file Google Drive yang dibagikan publik?
+
+**Status:** Dijawab
+
+**Jawaban pengguna:** Tambahkan pencarian `site:drive.google.com` agar file Drive yang memang dibagikan publik bisa dicari.
+
+**Catatan implementasi:** Mesin pencari menolak permintaan otomatis (DuckDuckGo dan Yandex menampilkan captcha, Brave membalas 429, Bing mengabaikan `site:`), dan men-scrape-nya melanggar syarat layanannya. Maka tombol "Cari file Drive publik di browser" di layar Cari membuka Google dengan `site:drive.google.com <kata kunci>` di browser pengguna; UnduhKilat sendiri tidak mengirim apa pun. Tautan Drive file (`/file/d/ID`, `open?id=`, `uc?id=`) otomatis diubah menjadi URL unduhan langsung `drive.usercontent.google.com/download?id=ID&export=download&confirm=t`; folder ditolak. Belum diuji terhadap file Drive publik nyata. Jalur alternatif di dalam aplikasi (Google Programmable Search API) butuh kunci API dari pengguna dan belum dibuat.

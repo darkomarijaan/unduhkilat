@@ -1350,6 +1350,15 @@ impl App {
                         let (client, proxy) = (self.manager.client(), self.manager.proxy_config());
                         a.probe = "Menghubungi server dan memeriksa Range...".into();
                         self.rt.spawn(async move {
+                            let url = match http::normalize_drive_url(&url) {
+                                Ok(Some(direct)) => direct,
+                                Ok(None) => url,
+                                Err(e) => {
+                                    let _ = tx.send(Msg::Probe(format!("{}: {}", e.code, e.message), None));
+                                    ctx2.request_repaint();
+                                    return;
+                                }
+                            };
                             let probed = if url.to_ascii_lowercase().starts_with("ftp://") {
                                 let cfg = EngineConfig::default();
                                 let t = ftp::Timeouts { connect: cfg.connect_timeout, read: cfg.read_timeout };
@@ -1939,6 +1948,16 @@ impl App {
                 self.run(async move { m.set_search_provider(p, on).await });
             }
         });
+        ui.horizontal(|ui| {
+            let ok = self.search.query.trim().chars().count() >= 2;
+            ui.add_enabled_ui(ok, |ui| {
+                if ui.button("Cari file Drive publik di browser").on_hover_text("Membuka Google dengan site:drive.google.com di browser Anda. UnduhKilat sendiri tidak mengirim apa pun.").clicked() {
+                    let q = format!("site:drive.google.com {}", self.search.query.trim());
+                    open_in_browser(&format!("https://www.google.com/search?q={}", percent_encode(&q)));
+                }
+            });
+            ui.label(RichText::new("Salin tautan Drive yang ketemu, lalu tempel di Tambah unduhan (atau aktifkan pemantau clipboard di Pengaturan).").size(11.5).color(FG_SECONDARY));
+        });
         ui.label(RichText::new("Indeks umum dapat memuat materi berhak cipta; pastikan Anda berhak mengunduh apa pun yang dipilih. Academic Torrents hanya mencari entri terbarunya.").color(FG_SECONDARY).size(11.0));
         if let Some(e) = &self.search.err { ui.label(RichText::new(e).color(DANGER)); }
         ui.separator();
@@ -2005,5 +2024,18 @@ impl App {
                 self.screen = Screen::Downloads;
             }
         }
+    }
+}
+
+
+/// Percent-encode everything but unreserved characters (RFC 3986), for a query value.
+fn percent_encode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// Open an https URL in the default browser. No shell parsing: the URL is one argument.
+fn open_in_browser(url: &str) {
+    if url.starts_with("https://") {
+        let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
     }
 }

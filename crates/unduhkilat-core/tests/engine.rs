@@ -503,3 +503,24 @@ async fn shutdown_checkpoints_running_downloads_as_paused() {
     assert!(d.downloaded_bytes >= 100_000);
     let _ = pattern(1);
 }
+
+#[tokio::test]
+async fn google_drive_share_links_are_queued_as_direct_downloads() {
+    use unduhkilat_core::error::ErrorCode;
+    let env = Env::new().await;
+    let id = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+    // start_immediately=false: nothing touches the network.
+    let d = env
+        .manager
+        .create(NewDownload { url: format!("https://drive.google.com/file/d/{id}/view?usp=sharing"), target_path: Some(env.path("drive.bin")), start_immediately: false, ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(d.original_url, format!("https://drive.usercontent.google.com/download?id={id}&export=download&confirm=t"));
+    let folder = env
+        .manager
+        .create(NewDownload { url: "https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQ".into(), target_path: Some(env.path("f.bin")), start_immediately: false, ..Default::default() })
+        .await
+        .unwrap_err();
+    assert_eq!(folder.code, ErrorCode::ErrInvalidUrlScheme);
+    assert!(folder.message.contains("folder"));
+}

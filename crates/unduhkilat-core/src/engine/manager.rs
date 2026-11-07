@@ -336,7 +336,13 @@ impl Manager {
         self.create_torrent_file(body, req).await
     }
 
-    async fn create_inner(&self, req: NewDownload, torrent: Option<(torrent::TorrentMeta, Option<Vec<u8>>)>) -> Result<Download> {
+    async fn create_inner(&self, mut req: NewDownload, torrent: Option<(torrent::TorrentMeta, Option<Vec<u8>>)>) -> Result<Download> {
+        if torrent.is_none() {
+            // A Drive share link is a preview page; download the file behind it.
+            if let Some(direct) = http::normalize_drive_url(&req.url)? {
+                req.url = direct;
+            }
+        }
         if let Some((m, _)) = &torrent {
             // Report "already in the list" before any file-name check can mask it.
             let hash = m.info_hash.clone();

@@ -161,6 +161,38 @@ pub(crate) fn percent_decode(s: &str) -> String {
 }
 
 /// Strip path separators and characters Windows forbids in file names.
+/// Google Drive share links are preview pages, not files. For a public *file* link
+/// (`/file/d/ID/view`, `/open?id=ID`, `/uc?id=ID`) return the direct-download URL; the
+/// `confirm=t` form skips the "cannot scan for viruses" interstitial that would otherwise
+/// be saved as an HTML file. Folders cannot be downloaded as one file and are refused.
+/// `Ok(None)` means "not a Drive link, leave it alone".
+pub fn normalize_drive_url(url: &str) -> Result<Option<String>> {
+    let Ok(u) = url::Url::parse(url) else { return Ok(None) };
+    if u.host_str() != Some("drive.google.com") || !matches!(u.scheme(), "http" | "https") {
+        return Ok(None);
+    }
+    let segs: Vec<&str> = u.path_segments().map(|s| s.collect()).unwrap_or_default();
+    if segs.contains(&"folders") || segs.get(..2) == Some(&["drive", "folders"][..]) {
+        return Err(AppError::new(ErrorCode::ErrInvalidUrlScheme, "a Google Drive folder cannot be downloaded as one file; open a single file's link instead"));
+    }
+    let query = |k: &str| u.query_pairs().find(|(a, _)| a == k).map(|(_, v)| v.into_owned());
+    let id = match segs.as_slice() {
+        // /file/d/ID/view and /file/u/0/d/ID/view
+        ["file", rest @ ..] => rest.iter().position(|s| *s == "d").and_then(|i| rest.get(i + 1)).map(|s| (*s).to_string()),
+        ["open"] | ["uc"] => query("id"),
+        _ => None,
+    };
+    let Some(id) = id else { return Ok(None) };
+    if id.len() < 10 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(AppError::new(ErrorCode::ErrInvalidUrlScheme, "that does not look like a valid Google Drive file link"));
+    }
+    let mut out = format!("https://drive.usercontent.google.com/download?id={id}&export=download&confirm=t");
+    if let Some(rk) = query("resourcekey").filter(|r| r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
+        out.push_str(&format!("&resourcekey={rk}"));
+    }
+    Ok(Some(out))
+}
+
 pub fn sanitize_file_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let cleaned: String = base.chars().map(|c| if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || c.is_control() { '_' } else { c }).collect();
@@ -227,3 +259,35 @@ mod tests {
         assert_eq!(sanitize_file_name("../x"), "x");
     }
 }
+
+#[cfg(test)]
+mod drive_tests {
+    use super::normalize_drive_url as n;
+
+    const ID: &str = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+
+    #[test]
+    fn file_links_become_direct_downloads() {
+        let want = format!("https://drive.usercontent.google.com/download?id={ID}&export=download&confirm=t");
+        for u in [format!("https://drive.google.com/file/d/{ID}/view?usp=sharing"), format!("https://drive.google.com/file/d/{ID}/edit"), format!("https://drive.google.com/open?id={ID}"), format!("https://drive.google.com/uc?id={ID}&export=download"), format!("https://drive.google.com/file/u/0/d/{ID}/view")] {
+            assert_eq!(n(&u).unwrap().as_deref(), Some(want.as_str()), "{u}");
+        }
+        let rk = n(&format!("https://drive.google.com/file/d/{ID}/view?resourcekey=0-abc_DEF")).unwrap().unwrap();
+        assert!(rk.ends_with("&resourcekey=0-abc_DEF"));
+    }
+
+    #[test]
+    fn folders_ids_and_other_hosts() {
+        assert!(n("https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOp").is_err());
+        assert!(n("https://drive.google.com/drive/u/0/folders/1AbCdEfGhIjKlMnOp").is_err());
+        assert!(n("https://drive.google.com/file/d/short/view").is_err());
+        assert!(n("https://drive.google.com/file/d/..%2F..%2Fetc/view").is_err());
+        assert_eq!(n("https://example.com/file/d/1AbCdEfGhIjKlMnOp/view").unwrap(), None);
+        assert_eq!(n("https://drive.google.com/").unwrap(), None);
+        assert_eq!(n("not a url").unwrap(), None);
+        // The rewrite never leaves Google's download host, whatever the input claims.
+        let out = n(&format!("https://drive.google.com/uc?id={ID}&export=download&evil=https://x.test")).unwrap().unwrap();
+        assert!(out.starts_with("https://drive.usercontent.google.com/download?id=") && !out.contains("x.test"));
+    }
+}
+
