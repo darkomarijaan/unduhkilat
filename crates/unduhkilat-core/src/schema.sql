@@ -111,3 +111,47 @@ CREATE TABLE IF NOT EXISTS torrents (
     FOREIGN KEY (download_id) REFERENCES downloads (id) ON DELETE CASCADE ON UPDATE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_torrents_info_hash ON torrents (info_hash);
+
+-- 0003_servers: saved SSH/SFTP/FTP/FTPS servers, jump chains, encrypted secrets and pinned host keys.
+-- Additive only: no existing table or column is changed, so an older build ignores these tables.
+CREATE TABLE IF NOT EXISTS servers (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    protocol TEXT NOT NULL CHECK (protocol IN ('ssh', 'sftp', 'ftp', 'ftps')),
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL CHECK (port >= 1 AND port <= 65535),
+    username TEXT NOT NULL,
+    auth TEXT NOT NULL CHECK (auth IN ('password', 'key', 'agent')),
+    key_path TEXT NULL,
+    save_secret INTEGER NOT NULL DEFAULT 0 CHECK (save_secret IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Jump chain of a server: position 0 is the outermost hop (reached first).
+CREATE TABLE IF NOT EXISTS server_hops (
+    server_id TEXT NOT NULL,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    hop_id TEXT NOT NULL,
+    PRIMARY KEY (server_id, position),
+    FOREIGN KEY (server_id) REFERENCES servers (id) ON DELETE CASCADE,
+    FOREIGN KEY (hop_id) REFERENCES servers (id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_server_hops_hop ON server_hops (hop_id);
+
+CREATE TABLE IF NOT EXISTS server_secrets (
+    server_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('password', 'passphrase')),
+    ciphertext TEXT NOT NULL,
+    PRIMARY KEY (server_id, kind),
+    FOREIGN KEY (server_id) REFERENCES servers (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS host_keys (
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    key_type TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    trusted_at TEXT NOT NULL,
+    PRIMARY KEY (host, port, key_type)
+);

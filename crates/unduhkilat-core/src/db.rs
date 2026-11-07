@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
@@ -222,6 +222,76 @@ mod tests {
         .unwrap();
         let v: String = db.read(|c| Ok(c.query_row("SELECT value FROM settings WHERE key='k'", [], |r| r.get(0))?)).unwrap();
         assert_eq!(v, "v");
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The v2 schema is the current schema text minus the server section (marker comment), so this
+    /// test cannot drift from what v2 databases really contain.
+    fn v2_schema() -> &'static str {
+        SCHEMA.split("-- 0003_servers").next().unwrap()
+    }
+
+    #[test]
+    fn v2_database_migrates_to_v3_without_losing_data() {
+        assert!(SCHEMA.contains("-- 0003_servers"), "schema must carry the 0003_servers section marker");
+        let dir = std::env::temp_dir().join(format!("uk-db-v2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unduhkilat.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(v2_schema()).unwrap();
+            conn.execute("INSERT INTO settings(key,value,updated_at) VALUES('old','kept','t')", []).unwrap();
+            conn.execute(
+                "INSERT INTO credentials(id,host,username,password_encrypted,port,protocol,created_at,updated_at) VALUES('c1','h','u','x',21,'ftp','t','t')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let v: i64 = db.read(|c| Ok(c.pragma_query_value(None, "user_version", |r| r.get(0))?)).unwrap();
+        assert_eq!(v, 3);
+        let kept: String = db.read(|c| Ok(c.query_row("SELECT value FROM settings WHERE key='old'", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(kept, "kept");
+        let creds: i64 = db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(creds, 1);
+        for t in ["servers", "server_hops", "server_secrets", "host_keys"] {
+            let n: i64 = db
+                .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [t], |r| r.get(0))?))
+                .unwrap();
+            assert_eq!(n, 1, "missing table {t}");
+        }
+        drop(db);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn server_tables_enforce_constraints() {
+        let (db, dir) = temp_db();
+        let add = |c: &Connection, id: &str, name: &str, port: i64| {
+            c.execute(
+                "INSERT INTO servers(id,name,protocol,host,port,username,auth,created_at,updated_at) VALUES(?1,?2,'ssh','h',?3,'u','password','t','t')",
+                rusqlite::params![id, name, port],
+            )
+        };
+        db.write_blocking(move |c| {
+            add(c, "a", "Alpha", 22).unwrap();
+            assert!(add(c, "a2", "alpha", 22).is_err(), "names are unique ignoring case");
+            assert!(add(c, "z0", "Zero", 0).is_err(), "port 0 rejected");
+            assert!(add(c, "z1", "Big", 65536).is_err(), "port 65536 rejected");
+            add(c, "b", "Bravo", 22).unwrap();
+            c.execute("INSERT INTO server_hops(server_id,position,hop_id) VALUES('a',0,'b')", []).unwrap();
+            c.execute("INSERT INTO server_secrets(server_id,kind,ciphertext) VALUES('a','password','x')", []).unwrap();
+            assert!(c.execute("DELETE FROM servers WHERE id='b'", []).is_err(), "a server used as a hop cannot be deleted");
+            c.execute("DELETE FROM servers WHERE id='a'", []).unwrap();
+            let hops: i64 = c.query_row("SELECT COUNT(*) FROM server_hops", [], |r| r.get(0)).unwrap();
+            let secrets: i64 = c.query_row("SELECT COUNT(*) FROM server_secrets", [], |r| r.get(0)).unwrap();
+            assert_eq!((hops, secrets), (0, 0), "deleting a server removes its hops and secrets");
+            c.execute("DELETE FROM servers WHERE id='b'", []).unwrap();
+            Ok(())
+        })
+        .unwrap();
         drop(db);
         std::fs::remove_dir_all(dir).ok();
     }
