@@ -1,0 +1,68 @@
+<style>
+  .uk{--orange:#FF5A1F;--ink:#1B1918;--paper:#F3F1EE;--line:#E2DDD6;--mute:#5B554E;font-family:"Segoe UI",sans-serif;color:var(--ink);font-size:13px}
+  .uk *{box-sizing:border-box}
+  .win{border:1px solid #cfc9c0;border-radius:8px;overflow:hidden;background:var(--paper)}
+  .stabs{display:flex;gap:4px;padding:8px 12px 0;border-bottom:1px solid var(--line)}
+  .stab{padding:6px 12px;border:1px solid var(--line);border-bottom:none;border-radius:6px 6px 0 0;background:#EDE8E1;font-size:12px}
+  .stab.on{background:#14120F;color:#fff;font-weight:700}
+  .cols{display:flex;gap:8px;padding:10px;min-height:340px}
+  .pane{background:#fff;border:1px solid var(--line);border-radius:6px;font-size:12px;overflow:hidden}
+  .pane h5{margin:0;padding:6px 10px;background:var(--paper);border-bottom:1px solid var(--line);font-size:11.5px;display:flex;justify-content:space-between}
+  .f{padding:5px 10px;display:flex;justify-content:space-between;gap:8px}
+  .f.sel{background:#FFE9DF}
+  .mono{font-family:Consolas,monospace;font-size:11.5px;color:var(--mute)}
+  .btn{background:#fff;border:1px solid var(--line);border-radius:6px;padding:4px 10px;font-size:12px;display:inline-block}
+  .btn-ink{background:var(--ink);color:#fff;border-radius:6px;padding:4px 10px;font-size:12px;font-weight:700;display:inline-block}
+  .doc{padding:14px 18px;line-height:1.55}
+  .doc h6{margin:0 0 6px;font-size:15px}
+  table.x{border-collapse:collapse;width:100%;font-size:11.5px}
+  table.x td,table.x th{border:1px solid var(--line);padding:3px 7px;text-align:left}
+  table.x th{background:var(--paper)}
+  .tag{font-size:10.5px;font-weight:700;border-radius:4px;padding:2px 6px;color:#fff}
+  .t1{background:#127A48}.t2{background:#C77D0A}.t3{background:#0E7AE6}.t4{background:#6B7280}
+  .cap{font-size:12px;color:#5B554E;margin:6px 0 18px}
+</style>
+
+<h2>Pratinjau berkas di server</h2>
+<p class="subtitle">Klik sebuah berkas di penjelajah, isinya muncul di panel kanan tanpa menyimpannya ke komputer Anda lebih dulu.</p>
+
+<div class="uk"><div class="win">
+  <div class="stabs"><span class="stab on">● web-prod</span><span class="stab">● backup-nas</span><span class="stab">+</span></div>
+  <div class="cols">
+    <div class="pane" style="flex:.8">
+      <h5><span>/home/deploy/laporan</span><span class="mono">↻</span></h5>
+      <div class="f"><span>📄 catatan.txt</span><span class="mono">3 KB</span></div>
+      <div class="f"><span>📝 README.md</span><span class="mono">5 KB</span></div>
+      <div class="f"><span>🖼 denah.png</span><span class="mono">840 KB</span></div>
+      <div class="f sel"><span>📑 laporan-q3.docx</span><span class="mono">212 KB</span></div>
+      <div class="f"><span>📊 anggaran.xlsx</span><span class="mono">96 KB</span></div>
+      <div class="f"><span>📕 kontrak.pdf</span><span class="mono">2.4 MB</span></div>
+      <div class="f"><span>📦 backup.tar.gz</span><span class="mono">412 MB</span></div>
+    </div>
+    <div class="pane" style="flex:1.2">
+      <h5><span>Pratinjau · laporan-q3.docx</span><span><span class="btn">Buka di Word</span> <span class="btn-ink">Unduh</span></span></h5>
+      <div class="doc">
+        <h6>Laporan Kinerja Kuartal 3</h6>
+        <div style="color:#5B554E;font-size:11.5px;margin-bottom:8px">Teks dan tabel diambil dari dokumen. Tata letak persis (font, gambar, header) tidak ditampilkan.</div>
+        Penjualan naik 12% dibanding kuartal sebelumnya, terutama dari wilayah Jawa Timur. Biaya operasional turun setelah migrasi server…
+        <table class="x" style="margin-top:10px"><tr><th>Wilayah</th><th>Target</th><th>Capaian</th></tr><tr><td>Jawa Timur</td><td>400</td><td>452</td></tr><tr><td>Jawa Barat</td><td>350</td><td>331</td></tr></table>
+      </div>
+    </div>
+  </div>
+</div></div>
+
+<h3 style="margin-top:26px">Seberapa jauh tiap format bisa dibaca</h3>
+<p class="cap">Kemampuan berbeda-beda. Saya sebut apa adanya supaya tidak ada yang terasa dijanjikan terlalu tinggi.</p>
+<div class="uk">
+<table class="x" style="background:#fff">
+  <tr><th>Format</th><th>Tampilan di dalam aplikasi</th><th>Tingkat</th></tr>
+  <tr><td>txt, md, log, json, xml, kode</td><td>Teks dengan penomoran baris; Markdown dirender (judul, daftar, tabel)</td><td><span class="tag t1">Penuh</span></td></tr>
+  <tr><td>jpg, png, gif, webp, bmp</td><td>Gambar dengan zoom dan geser</td><td><span class="tag t1">Penuh</span></td></tr>
+  <tr><td>pdf</td><td>Halaman dirender sebagai gambar, bisa gulir dan zoom. Butuh menambah komponen perender PDF (±10 MB)</td><td><span class="tag t3">Hampir penuh</span></td></tr>
+  <tr><td>docx, odt</td><td>Teks, judul, dan tabel saja. Tanpa font asli, gambar sebaris, atau tata letak halaman</td><td><span class="tag t2">Teks saja</span></td></tr>
+  <tr><td>xlsx, ods</td><td>Sel dan lembar sebagai tabel (nilai, bukan rumus atau grafik)</td><td><span class="tag t2">Tabel saja</span></td></tr>
+  <tr><td>doc, xls, ppt, pptx, lainnya</td><td>Tombol "Buka di aplikasi Windows": berkas diunduh ke folder sementara lalu dibuka dengan Word/Excel/PDF reader Anda</td><td><span class="tag t4">Buka eksternal</span></td></tr>
+</table>
+</div>
+
+<p class="cap" style="margin-top:12px">Berkas besar tidak diunduh penuh untuk pratinjau: teks dan PDF diambil sebagian dulu, dan ada batas ukuran (misalnya 25 MB) sebelum aplikasi menawarkan "Unduh" atau "Buka di aplikasi".</p>
