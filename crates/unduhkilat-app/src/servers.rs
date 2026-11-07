@@ -101,6 +101,8 @@ pub struct ServersState {
     confirm_forget: Option<ChangedKey>,
     /// Run a connection test right after the dialog's save succeeds.
     test_after_save: bool,
+    /// Terminal tabs that are connecting: they wait for host-key and password answers too.
+    pub shell_waiters: std::collections::HashSet<u64>,
 }
 
 /// The one pinned host key that changed (taken from the error's details), so "forget" touches only it.
@@ -126,17 +128,30 @@ fn changed_key_from(e: &unduhkilat_core::AppError) -> Option<ChangedKey> {
 }
 
 impl ServersState {
+    /// A running test or a connecting terminal tab is waiting for answers.
+    fn someone_waits(&self) -> bool {
+        self.testing.is_some() || !self.shell_waiters.is_empty()
+    }
+
+    /// Drop pending questions once nobody is waiting for them any more.
+    pub(super) fn clear_prompts_if_idle(&mut self) {
+        if !self.someone_waits() {
+            self.host_prompt = None;
+            self.secret_prompt = None;
+        }
+    }
+
     /// A host-key question from a connection. Only a running test is waiting for an answer: a question
     /// that arrives without one (the test was cancelled or timed out) is dropped, which the connection
     /// side reads as "no", so a stale dialog can never pin a key.
     fn offer_host_key(&mut self, host: String, port: u16, key_type: String, fingerprint: String, reply: oneshot::Sender<bool>) {
-        if self.testing.is_some() {
+        if self.someone_waits() {
             self.host_prompt = Some(HostPrompt { host, port, key_type, fingerprint, reply: Some(reply) });
         }
     }
 
     fn offer_secret(&mut self, server_name: String, kind: SecretKind, reply: oneshot::Sender<Option<String>>) {
-        if self.testing.is_some() {
+        if self.someone_waits() {
             self.secret_prompt = Some(SecretPrompt { server_name, kind, value: String::new(), reply: Some(reply) });
         }
     }
@@ -314,8 +329,7 @@ impl App {
             ServersMsg::Forgotten(Err(e)) => self.servers.result = Some((e, true)),
             ServersMsg::TestDone { result } => {
                 self.servers.testing = None;
-                self.servers.host_prompt = None;
-                self.servers.secret_prompt = None;
+                self.servers.clear_prompts_if_idle();
                 match result {
                     Ok(r) => self.servers.result = Some((format!("Terhubung lewat {} dalam {} ms.", r.hop_names.join(" → "), r.rtt_ms), false)),
                     Err(e) => {
@@ -325,8 +339,8 @@ impl App {
                 }
             }
             ServersMsg::ShellReady { tab_id, result } => {
-                self.servers.host_prompt = None;
-                self.servers.secret_prompt = None;
+                self.servers.shell_waiters.remove(&tab_id);
+                self.servers.clear_prompts_if_idle();
                 self.terminal_ssh_ready(tab_id, result);
             }
             ServersMsg::HostKey { host, port, key_type, fingerprint, reply } => self.servers.offer_host_key(host, port, key_type, fingerprint, reply),
@@ -900,5 +914,22 @@ mod tests {
         d.auth = AuthMethod::Password;
         let (new, _) = d.build().unwrap();
         assert!(new.hops.is_empty(), "FTP never carries a jump route");
+    }
+
+    #[test]
+    fn a_terminal_tab_that_is_connecting_gets_its_prompts_shown() {
+        let mut st = ServersState::default();
+        st.shell_waiters.insert(7);
+        let (reply, _rx) = oneshot::channel();
+        st.offer_host_key("h".into(), 22, "ssh-ed25519".into(), "SHA256:x".into(), reply);
+        assert!(st.host_prompt.is_some(), "no test running, but a connecting tab waits for the answer");
+        let (reply, _rx) = oneshot::channel();
+        st.offer_secret("web".into(), SecretKind::Password, reply);
+        assert!(st.secret_prompt.is_some());
+        st.shell_waiters.clear();
+        st.host_prompt = None;
+        let (reply, mut rx) = oneshot::channel();
+        st.offer_host_key("h".into(), 22, "ssh-ed25519".into(), "SHA256:x".into(), reply);
+        assert!(st.host_prompt.is_none() && rx.try_recv().is_err(), "nobody waiting: dropped, read as no");
     }
 }
