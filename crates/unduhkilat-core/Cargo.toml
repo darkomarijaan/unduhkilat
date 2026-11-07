@@ -21,6 +21,7 @@ tracing-appender = "0.2"
 zeroize = "1"
 base64 = "0.22"
 sha2 = "0.10"
+russh = "0.65"
 ed25519-dalek = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 url = "2"
@@ -30,3 +31,6 @@ librqbit = { version = "9.1", default-features = false, features = ["rust-tls"] 
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_Ole", "Win32_Security", "Win32_System_Threading"] }
 winreg = "0.56.0"
 
+
+[dev-dependencies]
+rand = "0.10"
