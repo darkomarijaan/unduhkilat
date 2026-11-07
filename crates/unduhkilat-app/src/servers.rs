@@ -44,7 +44,7 @@ pub enum ServersMsg {
     Loaded(Result<Vec<Server>, String>),
     Saved(Result<Server, String>),
     Deleted(Result<(), String>),
-    TestDone { server_id: String, result: Result<TestReport, (ErrorCode, String)> },
+    TestDone { result: Result<TestReport, unduhkilat_core::AppError> },
     Forgotten(Result<(), String>),
     HostKey { host: String, port: u16, key_type: String, fingerprint: String, reply: oneshot::Sender<bool> },
     Secret { server_name: String, kind: SecretKind, reply: oneshot::Sender<Option<String>> },
@@ -96,10 +96,49 @@ pub struct ServersState {
     secret_prompt: Option<SecretPrompt>,
     confirm_delete: Option<(String, String)>,
     /// Server whose route had a changed host key: offers the explicit "forget keys" action.
-    changed_key: Option<String>,
-    confirm_forget: Option<String>,
+    changed_key: Option<ChangedKey>,
+    confirm_forget: Option<ChangedKey>,
     /// Run a connection test right after the dialog's save succeeds.
     test_after_save: bool,
+}
+
+/// The one pinned host key that changed (taken from the error's details), so "forget" touches only it.
+#[derive(Clone, Debug, PartialEq)]
+struct ChangedKey {
+    host: String,
+    port: u16,
+    known: String,
+    presented: String,
+}
+
+fn changed_key_from(e: &unduhkilat_core::AppError) -> Option<ChangedKey> {
+    if e.code != ErrorCode::ErrHostKeyChanged {
+        return None;
+    }
+    let d = e.details.as_ref()?;
+    Some(ChangedKey {
+        host: d.get("host")?.as_str()?.to_string(),
+        port: u16::try_from(d.get("port")?.as_u64()?).ok()?,
+        known: d.get("known")?.as_str()?.to_string(),
+        presented: d.get("presented")?.as_str()?.to_string(),
+    })
+}
+
+impl ServersState {
+    /// A host-key question from a connection. Only a running test is waiting for an answer: a question
+    /// that arrives without one (the test was cancelled or timed out) is dropped, which the connection
+    /// side reads as "no", so a stale dialog can never pin a key.
+    fn offer_host_key(&mut self, host: String, port: u16, key_type: String, fingerprint: String, reply: oneshot::Sender<bool>) {
+        if self.testing.is_some() {
+            self.host_prompt = Some(HostPrompt { host, port, key_type, fingerprint, reply: Some(reply) });
+        }
+    }
+
+    fn offer_secret(&mut self, server_name: String, kind: SecretKind, reply: oneshot::Sender<Option<String>>) {
+        if self.testing.is_some() {
+            self.secret_prompt = Some(SecretPrompt { server_name, kind, value: String::new(), reply: Some(reply) });
+        }
+    }
 }
 
 struct Testing {
@@ -231,8 +270,8 @@ impl App {
         let (svc, tx, ctx) = (self.svc(), self.tx.clone(), self.ctx.clone());
         let interact = Arc::new(UiInteract { tx: tx.clone(), ctx: ctx.clone() });
         self.rt.spawn(async move {
-            let result = svc.test_connection(&server.id, interact, cancel).await.map_err(|e| (e.code, e.message));
-            let _ = tx.send(Msg::Servers(ServersMsg::TestDone { server_id: server.id, result }));
+            let result = svc.test_connection(&server.id, interact, cancel).await;
+            let _ = tx.send(Msg::Servers(ServersMsg::TestDone { result }));
             ctx.request_repaint();
         });
     }
@@ -272,26 +311,20 @@ impl App {
                 self.servers.result = Some(("Kunci host dilupakan. Ujilah lagi untuk mengonfirmasi kunci yang baru.".into(), false));
             }
             ServersMsg::Forgotten(Err(e)) => self.servers.result = Some((e, true)),
-            ServersMsg::TestDone { server_id, result } => {
+            ServersMsg::TestDone { result } => {
                 self.servers.testing = None;
                 self.servers.host_prompt = None;
                 self.servers.secret_prompt = None;
                 match result {
                     Ok(r) => self.servers.result = Some((format!("Terhubung lewat {} dalam {} ms.", r.hop_names.join(" → "), r.rtt_ms), false)),
-                    Err((code, msg)) => {
-                        if code == ErrorCode::ErrHostKeyChanged {
-                            self.servers.changed_key = Some(server_id);
-                        }
-                        self.servers.result = Some((msg, true));
+                    Err(e) => {
+                        self.servers.changed_key = changed_key_from(&e);
+                        self.servers.result = Some((e.message, true));
                     }
                 }
             }
-            ServersMsg::HostKey { host, port, key_type, fingerprint, reply } => {
-                self.servers.host_prompt = Some(HostPrompt { host, port, key_type, fingerprint, reply: Some(reply) });
-            }
-            ServersMsg::Secret { server_name, kind, reply } => {
-                self.servers.secret_prompt = Some(SecretPrompt { server_name, kind, value: String::new(), reply: Some(reply) });
-            }
+            ServersMsg::HostKey { host, port, key_type, fingerprint, reply } => self.servers.offer_host_key(host, port, key_type, fingerprint, reply),
+            ServersMsg::Secret { server_name, kind, reply } => self.servers.offer_secret(server_name, kind, reply),
         }
     }
 
@@ -527,11 +560,15 @@ impl App {
                 None => {}
             }
         }
-        if let Some(id) = self.servers.confirm_forget.clone() {
+        if let Some(k) = self.servers.confirm_forget.clone() {
             let mut done: Option<bool> = None;
             Self::window("Ganti kunci host", 520.0).frame(Self::frame(ctx)).show(ctx, |ui| {
                 ui.label(RichText::new("Kunci host berubah").font(theme::bold(16.0)).color(DANGER));
-                ui.label("Server di rute ini memakai kunci yang berbeda dari yang tersimpan. Itu normal bila server baru dipasang ulang, tetapi juga tanda sambungan yang disadap.");
+                ui.label(format!("Server {}:{} memakai kunci yang berbeda dari yang tersimpan. Itu normal bila server baru dipasang ulang, tetapi juga tanda sambungan yang disadap.", k.host, k.port));
+                ui.label("Tersimpan:");
+                ui.label(RichText::new(&k.known).font(theme::mono(12.0)));
+                ui.label("Sekarang:");
+                ui.label(RichText::new(&k.presented).font(theme::mono(12.0)));
                 ui.label(RichText::new("Melupakan kunci akan membuat sambungan berikutnya meminta konfirmasi sidik jari yang baru. Lanjutkan hanya bila Anda yakin.").color(FG_SECONDARY));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -549,23 +586,10 @@ impl App {
             match done {
                 Some(true) => {
                     self.servers.confirm_forget = None;
-                    let hosts: Vec<(String, u16)> = {
-                        let all = &self.servers.servers;
-                        let target = all.iter().find(|s| s.id == id);
-                        let mut v: Vec<(String, u16)> = target.map(|t| t.hops.iter().filter_map(|h| all.iter().find(|s| &s.id == h)).map(|s| (s.host.clone(), s.port)).collect()).unwrap_or_default();
-                        if let Some(t) = target {
-                            v.push((t.host.clone(), t.port));
-                        }
-                        v
-                    };
+                    // Only the hop whose key changed: the other pins on the route stay.
                     let (svc, tx, ctx2) = (self.svc(), self.tx.clone(), self.ctx.clone());
                     self.rt.spawn(async move {
-                        let mut r = Ok(());
-                        for (h, p) in hosts {
-                            if let Err(e) = svc.forget_host_key(&h, p).await {
-                                r = Err(e.message);
-                            }
-                        }
+                        let r = svc.forget_host_key(&k.host, k.port).await.map_err(|e| e.message);
                         let _ = tx.send(Msg::Servers(ServersMsg::Forgotten(r)));
                         ctx2.request_repaint();
                     });
@@ -810,6 +834,32 @@ mod tests {
         assert_eq!((server_name.as_str(), kind), ("web", SecretKind::Passphrase));
         reply.send(Some("frasa".into())).unwrap();
         assert_eq!(ask.await.unwrap().as_deref(), Some("frasa"));
+    }
+
+    #[test]
+    fn a_prompt_arriving_without_a_running_test_is_answered_no() {
+        let mut st = ServersState::default(); // no connection test is running
+        let (reply, mut rx) = oneshot::channel();
+        st.offer_host_key("h".into(), 22, "ssh-ed25519".into(), "SHA256:x".into(), reply);
+        assert!(st.host_prompt.is_none(), "no window for a question nobody is waiting on");
+        assert!(rx.try_recv().is_err(), "the reply was dropped, which the connection side reads as 'no'");
+        let (reply, mut rx) = oneshot::channel();
+        st.offer_secret("web".into(), SecretKind::Password, reply);
+        assert!(st.secret_prompt.is_none());
+        assert!(rx.try_recv().is_err());
+        st.testing = Some(Testing { server_name: "web".into(), cancel: CancellationToken::new() });
+        let (reply, _rx) = oneshot::channel();
+        st.offer_host_key("h".into(), 22, "ssh-ed25519".into(), "SHA256:x".into(), reply);
+        assert!(st.host_prompt.is_some(), "while a test runs the question is shown");
+    }
+
+    #[test]
+    fn changed_key_details_name_only_the_hop_that_changed() {
+        let mut e = unduhkilat_core::AppError::new(ErrorCode::ErrHostKeyChanged, "berubah");
+        assert!(changed_key_from(&e).is_none(), "no details, nothing to forget");
+        e.details = Some(serde_json::json!({ "host": "bastion.example.com", "port": 2222, "key_type": "ssh-ed25519", "known": "SHA256:old", "presented": "SHA256:new" }));
+        let c = changed_key_from(&e).expect("parsed");
+        assert_eq!((c.host.as_str(), c.port, c.known.as_str(), c.presented.as_str()), ("bastion.example.com", 2222, "SHA256:old", "SHA256:new"));
     }
 
     #[test]

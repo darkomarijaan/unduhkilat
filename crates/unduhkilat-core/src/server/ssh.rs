@@ -17,7 +17,9 @@ use crate::server::store::{self, MAX_HOPS};
 use futures_util::future::BoxFuture;
 use russh::client::{self, Handle};
 use russh::keys::{decode_secret_key, Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use serde_json::json;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -95,6 +97,26 @@ async fn guard<F: Future>(cancel: &CancellationToken, limit: Duration, fut: F) -
     }
 }
 
+/// Like `guard`, but the clock stands still while the user is being asked something (`prompting`):
+/// reading a host-key fingerprint must not count against the handshake timeout.
+async fn guard_handshake<F: Future>(cancel: &CancellationToken, limit: Duration, prompting: &AtomicBool, fut: F) -> Guard<F::Output> {
+    tokio::pin!(fut);
+    let mut deadline = tokio::time::Instant::now() + limit;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Guard::Cancelled,
+            r = &mut fut => return Guard::Done(r),
+            _ = tokio::time::sleep_until(deadline) => {
+                if prompting.load(Ordering::SeqCst) {
+                    deadline = tokio::time::Instant::now() + limit;
+                } else {
+                    return Guard::TimedOut;
+                }
+            }
+        }
+    }
+}
+
 fn timed_out(name: &str, limit: Duration) -> AppError {
     AppError::new(ErrorCode::ErrConnectionDropped, format!("Server \"{name}\" tidak menjawab dalam {} detik.", limit.as_secs().max(1)))
 }
@@ -108,6 +130,11 @@ pub struct HostKeyHandler {
     name: String,
     interact: Arc<dyn Interact>,
     verdict: Arc<Mutex<Option<AppError>>>,
+    /// Cancelled by `connect` when it gives up on this handshake. The library keeps running the
+    /// key exchange in its own task, so a late host-key check must be refused, not prompted.
+    abort: CancellationToken,
+    /// True while the user is being asked (pauses the handshake timeout).
+    prompting: Arc<AtomicBool>,
 }
 
 impl HostKeyHandler {
@@ -121,6 +148,9 @@ impl client::Handler for HostKeyHandler {
     type Error = russh::Error;
 
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> std::result::Result<bool, Self::Error> {
+        if self.abort.is_cancelled() {
+            return Ok(false);
+        }
         let PublicKeyOrCertificate::PublicKey { key, .. } = key else {
             return self.reject(AppError::new(ErrorCode::ErrHostKeyUnknown, format!("Server \"{}\" memakai sertifikat host, yang belum didukung.", self.name)));
         };
@@ -133,15 +163,26 @@ impl client::Handler for HostKeyHandler {
         };
         match status {
             HostKeyStatus::Trusted => Ok(true),
-            HostKeyStatus::Changed { known } => self.reject(AppError::new(
-                ErrorCode::ErrHostKeyChanged,
-                format!(
-                    "Kunci host server \"{}\" ({}:{}) BERUBAH. Tersimpan {known}, sekarang {fingerprint}. Sambungan diblokir karena bisa jadi disadap; ganti kunci hanya bila Anda yakin server memang diganti.",
-                    self.name, self.host, self.port
-                ),
-            )),
+            HostKeyStatus::Changed { known } => {
+                let mut e = AppError::new(
+                    ErrorCode::ErrHostKeyChanged,
+                    format!(
+                        "Kunci host server \"{}\" ({}:{}) BERUBAH. Tersimpan {known}, sekarang {fingerprint}. Sambungan diblokir karena bisa jadi disadap; ganti kunci hanya bila Anda yakin server memang diganti.",
+                        self.name, self.host, self.port
+                    ),
+                );
+                // Machine-readable: lets the UI forget exactly this pin, not every server on the route.
+                e.details = Some(json!({ "host": self.host, "port": self.port, "key_type": key_type, "known": known, "presented": fingerprint }));
+                self.reject(e)
+            }
             HostKeyStatus::Unknown => {
-                if !self.interact.confirm_host_key(&self.host, self.port, &key_type, &fingerprint).await {
+                self.prompting.store(true, Ordering::SeqCst);
+                let confirmed = tokio::select! {
+                    _ = self.abort.cancelled() => false,
+                    yes = self.interact.confirm_host_key(&self.host, self.port, &key_type, &fingerprint) => yes,
+                };
+                self.prompting.store(false, Ordering::SeqCst);
+                if !confirmed || self.abort.is_cancelled() {
                     return self.reject(AppError::new(ErrorCode::ErrHostKeyUnknown, format!("Kunci host server \"{}\" belum dikonfirmasi.", self.name)));
                 }
                 let (host, port, kt, fp) = (self.host.clone(), self.port, key_type, fingerprint);
@@ -211,7 +252,18 @@ async fn open_hop(
     cancel: &CancellationToken,
 ) -> Result<Handle<HostKeyHandler>> {
     let verdict = Arc::new(Mutex::new(None));
-    let handler = HostKeyHandler { db: db.clone(), host: server.host.clone(), port: server.port, name: server.name.clone(), interact: interact.clone(), verdict: verdict.clone() };
+    let abort = CancellationToken::new();
+    let prompting = Arc::new(AtomicBool::new(false));
+    let handler = HostKeyHandler {
+        db: db.clone(),
+        host: server.host.clone(),
+        port: server.port,
+        name: server.name.clone(),
+        interact: interact.clone(),
+        verdict: verdict.clone(),
+        abort: abort.clone(),
+        prompting: prompting.clone(),
+    };
     let config = Arc::new(client::Config { keepalive_interval: Some(Duration::from_secs(30)), keepalive_max: 3, ..Default::default() });
 
     let result = match prev {
@@ -223,7 +275,7 @@ async fn open_hop(
                 Guard::TimedOut => return Err(timed_out(&server.name, opts.connect_timeout)),
                 Guard::Cancelled => return Err(cancelled()),
             };
-            guard(cancel, opts.connect_timeout, client::connect_stream(config, stream, handler)).await
+            guard_handshake(cancel, opts.connect_timeout, &prompting, client::connect_stream(config, stream, handler)).await
         }
         Some(p) => {
             let ch = match guard(cancel, opts.connect_timeout, p.channel_open_direct_tcpip(server.host.clone(), server.port as u32, "127.0.0.1", 0)).await {
@@ -232,20 +284,27 @@ async fn open_hop(
                 Guard::TimedOut => return Err(timed_out(&server.name, opts.connect_timeout)),
                 Guard::Cancelled => return Err(cancelled()),
             };
-            guard(cancel, opts.connect_timeout, client::connect_stream(config, ch.into_stream(), handler)).await
+            guard_handshake(cancel, opts.connect_timeout, &prompting, client::connect_stream(config, ch.into_stream(), handler)).await
         }
     };
     let mut handle = match result {
         Guard::Done(Ok(h)) => h,
         Guard::Done(Err(e)) => {
+            abort.cancel();
             // A host key rejection surfaces from the library as a generic error: report the real reason.
             if let Some(v) = verdict.lock().unwrap().take() {
                 return Err(v);
             }
             return Err(AppError::new(ErrorCode::ErrConnectionDropped, format!("Jabat tangan SSH dengan \"{}\" gagal: {e}", server.name)));
         }
-        Guard::TimedOut => return Err(timed_out(&server.name, opts.connect_timeout)),
-        Guard::Cancelled => return Err(cancelled()),
+        Guard::TimedOut => {
+            abort.cancel(); // the key exchange may still be running in the library's task: refuse anything it asks later
+            return Err(timed_out(&server.name, opts.connect_timeout));
+        }
+        Guard::Cancelled => {
+            abort.cancel();
+            return Err(cancelled());
+        }
     };
     authenticate(db, server, &mut handle, interact, opts, cancel).await?;
     Ok(handle)
@@ -256,7 +315,7 @@ fn auth_failed(server: &Server, what: &str) -> AppError {
 }
 
 /// The saved secret if there is a readable one, otherwise ask. The `bool` says it was asked for.
-async fn obtain_secret(db: &Db, server: &Server, kind: SecretKind, interact: &Arc<dyn Interact>) -> Result<(Zeroizing<String>, bool)> {
+async fn obtain_secret(db: &Db, server: &Server, kind: SecretKind, interact: &Arc<dyn Interact>, cancel: &CancellationToken) -> Result<(Zeroizing<String>, bool)> {
     let id = server.id.clone();
     match db.read(|c| secrets::load_secret(c, &id, kind)) {
         Ok(Some(s)) => return Ok((s, false)),
@@ -265,8 +324,13 @@ async fn obtain_secret(db: &Db, server: &Server, kind: SecretKind, interact: &Ar
         Err(e) if e.code == ErrorCode::ErrCredentialUnreadable => {}
         Err(e) => return Err(e),
     }
-    match interact.secret(&server.name, kind).await {
+    let answer = tokio::select! {
+        _ = cancel.cancelled() => return Err(cancelled()),
+        a = interact.secret(&server.name, kind) => a,
+    };
+    match answer {
         Some(s) => Ok((Zeroizing::new(s.expose().to_string()), true)),
+        None if cancel.is_cancelled() => Err(cancelled()),
         None => Err(auth_failed(server, "kredensial tidak diberikan")),
     }
 }
@@ -291,7 +355,7 @@ async fn authenticate(db: &Db, server: &Server, handle: &mut Handle<HostKeyHandl
     };
     match server.auth {
         AuthMethod::Password => {
-            let (password, asked) = obtain_secret(db, server, SecretKind::Password, interact).await?;
+            let (password, asked) = obtain_secret(db, server, SecretKind::Password, interact, cancel).await?;
             let r = guard(cancel, opts.auth_timeout, handle.authenticate_password(server.username.clone(), password.as_str())).await;
             if !accepted(r)? {
                 return Err(auth_failed(server, "nama pengguna atau password salah"));
@@ -306,14 +370,22 @@ async fn authenticate(db: &Db, server: &Server, handle: &mut Handle<HostKeyHandl
             let key = match decode_secret_key(&pem, None) {
                 Ok(k) => k,
                 Err(russh::keys::Error::KeyIsEncrypted) => {
-                    let (phrase, asked) = obtain_secret(db, server, SecretKind::Passphrase, interact).await?;
+                    let (phrase, asked) = obtain_secret(db, server, SecretKind::Passphrase, interact, cancel).await?;
                     let k = decode_secret_key(&pem, Some(phrase.as_str())).map_err(|_| auth_failed(server, "frasa sandi kunci salah"))?;
                     asked_phrase = Some((phrase, asked));
                     k
                 }
                 Err(_) => return Err(AppError::invalid(format!("Berkas kunci tidak bisa dibaca (format tidak dikenali): {path}"))),
             };
-            let hash = if matches!(key.algorithm(), Algorithm::Rsa { .. }) { handle.best_supported_rsa_hash().await.ok().flatten().flatten() } else { None };
+            let hash = if matches!(key.algorithm(), Algorithm::Rsa { .. }) {
+                match guard(cancel, opts.auth_timeout, handle.best_supported_rsa_hash()).await {
+                    Guard::Done(r) => r.ok().flatten().flatten(),
+                    Guard::TimedOut => return Err(timed_out(&server.name, opts.auth_timeout)),
+                    Guard::Cancelled => return Err(cancelled()),
+                }
+            } else {
+                None
+            };
             let r = guard(cancel, opts.auth_timeout, handle.authenticate_publickey(server.username.clone(), PrivateKeyWithHashAlg::new(Arc::new(key), hash))).await;
             if !accepted(r)? {
                 return Err(auth_failed(server, "kunci ditolak server"));

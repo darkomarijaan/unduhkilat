@@ -11,7 +11,7 @@ use russh::client;
 use russh::keys::PublicKeyOrCertificate;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -68,11 +68,13 @@ struct Fake {
     key_asks: AtomicUsize,
     secret_asks: AtomicUsize,
     secrets: Mutex<HashMap<String, String>>,
+    key_delay_ms: AtomicU64,
+    secret_delay_ms: AtomicU64,
 }
 
 impl Fake {
     fn new(accept_keys: bool) -> Arc<Fake> {
-        Arc::new(Fake { accept_keys: AtomicBool::new(accept_keys), key_asks: AtomicUsize::new(0), secret_asks: AtomicUsize::new(0), secrets: Mutex::new(HashMap::new()) })
+        Arc::new(Fake { accept_keys: AtomicBool::new(accept_keys), key_asks: AtomicUsize::new(0), secret_asks: AtomicUsize::new(0), secrets: Mutex::new(HashMap::new()), key_delay_ms: AtomicU64::new(0), secret_delay_ms: AtomicU64::new(0) })
     }
     fn answer(self: &Arc<Self>, server: &str, kind: SecretKind, value: &str) -> Arc<Self> {
         self.secrets.lock().unwrap().insert(format!("{server}|{}", kind.as_str()), value.to_string());
@@ -84,12 +86,20 @@ impl Interact for Fake {
     fn confirm_host_key<'a>(&'a self, _host: &'a str, _port: u16, _key_type: &'a str, _fingerprint: &'a str) -> BoxFuture<'a, bool> {
         Box::pin(async move {
             self.key_asks.fetch_add(1, Ordering::SeqCst);
+            let d = self.key_delay_ms.load(Ordering::SeqCst);
+            if d > 0 {
+                tokio::time::sleep(Duration::from_millis(d)).await; // a user reading the fingerprint
+            }
             self.accept_keys.load(Ordering::SeqCst)
         })
     }
     fn secret<'a>(&'a self, server_name: &'a str, kind: SecretKind) -> BoxFuture<'a, Option<SecretString>> {
         Box::pin(async move {
             self.secret_asks.fetch_add(1, Ordering::SeqCst);
+            let d = self.secret_delay_ms.load(Ordering::SeqCst);
+            if d > 0 {
+                tokio::time::sleep(Duration::from_millis(d)).await;
+            }
             self.secrets.lock().unwrap().get(&format!("{server_name}|{}", kind.as_str())).map(|v| SecretString::from(v.as_str()))
         })
     }
@@ -357,6 +367,93 @@ async fn cancel_aborts_a_pending_connect() {
     let e = connect(&env.db, &web.id, Fake::new(true), o, cancel).await.unwrap_err();
     assert!(t.elapsed() < Duration::from_secs(1), "returned after {:?}", t.elapsed());
     assert!(e.message.contains("dibatalkan"), "{e}");
+}
+
+// ---- review fixes: prompts versus timeouts and cancellation ----------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_key_prompt_is_not_cut_short_by_the_handshake_timeout() {
+    let (env, ssh, fake) = (env(), TestSsh::start(pw_server("eko", "pw", false)).await, Fake::new(true));
+    fake.key_delay_ms.store(1500, Ordering::SeqCst); // the user takes longer than connect_timeout to compare fingerprints
+    let web = env.add("web", &ssh, "eko", AuthMethod::Password, None, true, vec![]);
+    env.save_secret(&web, SecretKind::Password, "pw");
+    let o = ConnectOptions { connect_timeout: Duration::from_secs(1), ..opts() };
+    let session = go(&env, &web.id, &fake, o).await.expect("waiting for the user must not count against the handshake timeout");
+    assert_eq!(env.host_key_rows(), vec![ssh.host_key_fingerprint()]);
+    session.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timed_out_connect_leaves_no_orphan_prompt_or_pin() {
+    let env = env();
+    let slow = TestSsh::start(TestSshConfig { accept_delay: Some(Duration::from_millis(1500)), ..pw_server("eko", "pw", false) }).await;
+    let web = env.add("web", &slow, "eko", AuthMethod::Password, None, true, vec![]);
+    env.save_secret(&web, SecretKind::Password, "pw");
+    let fake = Fake::new(true);
+    let o = ConnectOptions { connect_timeout: Duration::from_secs(1), ..opts() };
+    let e = go(&env, &web.id, &fake, o).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::ErrConnectionDropped, "{e}");
+    tokio::time::sleep(Duration::from_millis(2500)).await; // the server finally speaks, long after we gave up
+    assert_eq!(fake.key_asks.load(Ordering::SeqCst), 0, "an abandoned handshake must not open a prompt");
+    assert!(env.host_key_rows().is_empty(), "an abandoned handshake must not pin a key");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_while_the_host_key_prompt_is_open_pins_nothing() {
+    let (env, ssh, fake) = (env(), TestSsh::start(pw_server("eko", "pw", false)).await, Fake::new(true));
+    fake.key_delay_ms.store(2000, Ordering::SeqCst);
+    let web = env.add("web", &ssh, "eko", AuthMethod::Password, None, true, vec![]);
+    env.save_secret(&web, SecretKind::Password, "pw");
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        c2.cancel();
+    });
+    let t = Instant::now();
+    let e = connect(&env.db, &web.id, fake.clone(), opts(), cancel).await.unwrap_err();
+    assert!(t.elapsed() < Duration::from_secs(1), "returned after {:?}", t.elapsed());
+    assert!(e.message.contains("dibatalkan"), "{e}");
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert!(env.host_key_rows().is_empty(), "the late 'yes' of an abandoned prompt must not pin the key");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_while_asked_for_a_secret_reports_cancelled() {
+    let (env, ssh, fake) = (env(), TestSsh::start(pw_server("eko", "pw", false)).await, Fake::new(true).answer("web", SecretKind::Password, "pw"));
+    fake.secret_delay_ms.store(10_000, Ordering::SeqCst); // an Interact that is slow to answer
+    let web = env.add("web", &ssh, "eko", AuthMethod::Password, None, false, vec![]);
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        c2.cancel();
+    });
+    let t = Instant::now();
+    let e = connect(&env.db, &web.id, fake.clone(), opts(), cancel).await.unwrap_err();
+    assert!(t.elapsed() < Duration::from_secs(2), "returned after {:?}", t.elapsed());
+    assert!(e.message.contains("dibatalkan"), "cancel is reported as cancel, not as a missing credential: {e}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changed_host_key_error_carries_the_hop_and_both_fingerprints() {
+    let env = env();
+    let b = TestSsh::start(pw_server("eko", "pb", true)).await;
+    let a = TestSsh::start(pw_server("eko", "pa", false)).await;
+    let bastion = env.add("Bastion", &b, "eko", AuthMethod::Password, None, true, vec![]);
+    let prod = env.add("Prod", &a, "eko", AuthMethod::Password, None, true, vec![bastion.id.clone()]);
+    env.save_secret(&bastion, SecretKind::Password, "pb");
+    env.save_secret(&prod, SecretKind::Password, "pa");
+    go(&env, &prod.id, &Fake::new(true), opts()).await.unwrap().close().await;
+    let old = b.host_key_fingerprint();
+    b.rotate_host_key();
+    let e = go(&env, &prod.id, &Fake::new(true), opts()).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::ErrHostKeyChanged);
+    let d = e.details.expect("details name the hop that changed");
+    assert_eq!(d["host"], "127.0.0.1");
+    assert_eq!(d["port"], b.addr.port());
+    assert_eq!(d["known"], old);
+    assert_eq!(d["presented"], b.host_key_fingerprint());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
