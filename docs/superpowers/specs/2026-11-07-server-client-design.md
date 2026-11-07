@@ -150,3 +150,15 @@ Semua butir di bagian ini adalah **keputusan pembuat** (belum disetujui Eko) kec
 ## 13. Belum diputuskan oleh Eko
 
 - Apakah rilis ditahan sampai **setiap** butir terkirim, atau butir tambahan boleh dilepas bila terbukti tidak layak? Usulan pembuat: butir inti (bagian 2 nomor 1-8) wajib; butir tambahan (SSH agent, impor `ssh_config`) boleh dilepas dengan pemberitahuan. Tata letak A dan B termasuk butir wajib (keputusan Eko). Dukungan mouse dan papan klip di terminal **bukan** butir tambahan; keduanya wajib (keputusan Eko).
+
+## 14. Tambahan: terminal lokal yang dibuka dari folder (permintaan Eko, 2026-11-07)
+
+Eko ingin juga bisa membuka **terminal komputer ini** dari sebuah folder di Windows, dan memilih bentuknya: **tab terminal lokal di dalam UnduhKilat**, memakai emulator yang sama dengan terminal SSH (bukan Windows Terminal terpisah dan bukan menu klik-kanan Explorer).
+
+Keputusan Eko: tab terminal lokal di dalam aplikasi. Hal-hal berikut adalah **dugaan pembuat** (belum disetujui Eko):
+- **Satu terminal, dua sumber.** Tampilan terminal (emulator, mouse, papan klip, tab) dibangun sekali di Rencana 3. Sumber byte-nya ada dua: kanal SSH (server) atau pseudo-console Windows (ConPTY) yang menjalankan shell lokal. Dengan begitu semua syarat §8a dan §8b (mouse, `Ctrl+V`, OSC 52, kitty keyboard, Claude Code berjalan baik) berlaku juga untuk terminal lokal.
+- **Dari folder:** kartu unduhan dan penjelajah berkas mendapat aksi "Terminal" di samping "Folder"; klik membukanya sebagai tab terminal lokal yang direktori awalnya folder itu. Ada juga tombol "Terminal baru" (folder Unduhan) di bagian Server/Terminal.
+- **Shell:** PowerShell bawaan Windows; pilihan lain (CMD, Git Bash, WSL) dapat dipilih di Pengaturan. Tidak ada admin/elevasi.
+- **Keamanan:** shell berjalan dengan hak pengguna yang membuka aplikasi, tidak lebih. Isi sesi tidak masuk log. Tidak ada terminal yang terbuka sendiri.
+- **ConPTY** butuh Windows 10 versi 1809 atau lebih baru; spec menargetkan Windows 10/11 x64, jadi cukup. Jika ConPTY tidak tersedia, tampilkan pesan jelas.
+- Tab lokal dan tab SSH boleh bercampur dan memakai tata letak A/B yang sama (bagian 5); "Berkas" untuk tab lokal membuka penjelajah lokal.

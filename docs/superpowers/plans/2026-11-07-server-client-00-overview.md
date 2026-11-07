@@ -8,7 +8,7 @@ Spec ini terlalu besar untuk satu rencana yang masih bisa dipercaya. Rencana dip
 |---|---|---|---|
 | 1 | `…-01-spikes-and-foundation.md` | Tiga purwarupa pembuang (terminal, PDF, rantai jump) dengan catatan keputusan; penyimpanan server, kredensial, kunci host; sambungan SSH dengan jump; layar Server + "Uji sambungan" | spec |
 | 2 | `…-02-files-and-queue.md` | SFTP, FTP, FTPS: daftar direktori, operasi berkas, unduh dan **unggah** lewat antrean | 1 |
-| 3 | `…-03-terminal.md` | Terminal (emulasi, tab, mouse, papan klip, Claude Code, `Alt+V` tempel gambar, tata letak A/B) | 1, 2 (untuk `Alt+V`) |
+| 3 | `…-03-terminal.md` | Terminal (emulasi, tab, mouse, papan klip, Claude Code, `Alt+V` tempel gambar, tata letak A/B) **dengan dua sumber: SSH dan shell lokal (ConPTY) yang dibuka dari folder (spec §14)** | 1; 2 hanya untuk `Alt+V` |
 | 4 | `…-04-preview.md` | Pratinjau teks, Markdown, gambar, PDF, Office (teks/tabel), buka di aplikasi | 2 |
 | 5 | `…-05-ui-and-release.md` | Penjelajah dua panel, pengaturan, dokumentasi, pembaruan otomatis untuk berkas tambahan bila perlu, rilis | 1-4 |
 
