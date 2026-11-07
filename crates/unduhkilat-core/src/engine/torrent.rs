@@ -34,7 +34,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -79,6 +79,27 @@ pub fn parse_torrent_bytes(bytes: &[u8]) -> Result<TorrentMeta> {
         _ => None,
     };
     Ok(TorrentMeta { info_hash: t.info_hash.as_string(), name, total_bytes: total })
+}
+
+/// The folder librqbit must be given as `output_folder`.
+///
+/// For a single-file torrent that is the folder holding the file (`target`'s parent). For a
+/// multi-file torrent librqbit writes the files *directly* into `output_folder` (it only adds
+/// the torrent-name folder when no folder is given), so passing the category folder would
+/// scatter the contents there. Such torrents get their own folder: `target` itself, which is
+/// `<category folder>/<torrent name>`.
+///
+/// A multi-file torrent this app started before that rule existed has its files in the old,
+/// shared place; it keeps the old folder unless the torrent's own folder already exists, so a
+/// resume never starts a second copy elsewhere.
+pub fn output_folder(metainfo: &[u8], target: &Path, started: bool) -> PathBuf {
+    let parent = target.parent().map(Path::to_path_buf).unwrap_or_default();
+    let multi = librqbit::torrent_from_bytes(metainfo).map(|t| t.info.data.files.is_some()).unwrap_or(false);
+    if multi && (!started || target.is_dir()) {
+        target.to_path_buf()
+    } else {
+        parent
+    }
 }
 
 /// BEP 9 `x.pe=host:port` peer hints in a magnet link. Invalid entries are ignored.
@@ -341,7 +362,7 @@ impl TorrentEngine {
             return Err(AppError::new(ErrorCode::ErrFileNotFound, format!("{} is missing; nothing to seed", dl.target_path)));
         }
         let session = self.session(proxy).await?;
-        let out = PathBuf::from(&dl.target_path).parent().map(|p| p.to_string_lossy().into_owned());
+        let out = Some(output_folder(&meta, Path::new(&dl.target_path), true).to_string_lossy().into_owned());
         let opts = AddTorrentOptions { overwrite: true, output_folder: out, ..Default::default() };
         let resp = session.add_torrent(AddTorrent::from_bytes(meta), Some(opts)).await.map_err(|e| AppError::internal(format!("{e:#}")))?;
         let handle = resp.into_handle().ok_or_else(|| AppError::internal("torrent was not added"))?;
@@ -498,14 +519,16 @@ pub async fn run_torrent(ctx: &TransferCtx, id: &str, cancel: &CancellationToken
     }
 
     // 3. Real add (from stored metadata, so no swarm lookup is needed again).
+    let meta = row.metainfo.clone().expect("metadata set above");
+    let add_out = output_folder(&meta, Path::new(&dl.target_path), row.started);
+    std::fs::create_dir_all(&add_out).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
     let opts = AddTorrentOptions {
         overwrite: row.started,
-        output_folder: Some(out_s),
+        output_folder: Some(add_out.to_string_lossy().into_owned()),
         ratelimits: LimitsConfig { download_bps: bps(dl.speed_limit_kbps as u64), upload_bps: None },
         initial_peers: (!peers.is_empty()).then(|| peers.clone()),
         ..Default::default()
     };
-    let meta = row.metainfo.clone().expect("metadata set above");
     let resp = session.add_torrent(AddTorrent::from_bytes(meta), Some(opts)).await.map_err(|e| add_error(e.into()))?;
     let handle = resp.into_handle().ok_or_else(|| AppError::internal("torrent was not added"))?;
     if handle.is_paused() {

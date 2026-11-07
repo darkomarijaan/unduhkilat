@@ -48,6 +48,7 @@ mod imp {
         }
     }
 
+    #[allow(dead_code)] // used by the tests
     pub fn delete_key(key: &str) {
         let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(key);
     }

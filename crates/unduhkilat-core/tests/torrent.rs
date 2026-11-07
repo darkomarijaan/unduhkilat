@@ -69,6 +69,42 @@ async fn seeder(name: &str, size: usize, upload_kbps: Option<u32>) -> Seeder {
     Seeder { session, addr, torrent_bytes, info_hash: created.info_hash().as_string(), _dir: dir }
 }
 
+/// Seed a multi-file torrent: a folder `name` holding `a.txt`, `Setup/b.bin` and `Crack/c.bin`.
+async fn seeder_pack(name: &str) -> Seeder {
+    let base = std::env::temp_dir().join(format!("uk-pack-{}", uuid::Uuid::new_v4()));
+    let root = base.join(name);
+    std::fs::create_dir_all(root.join("Setup")).unwrap();
+    std::fs::create_dir_all(root.join("Crack")).unwrap();
+    std::fs::write(root.join("a.txt"), pattern(1_000)).unwrap();
+    std::fs::write(root.join("Setup").join("b.bin"), pattern(120_000)).unwrap();
+    std::fs::write(root.join("Crack").join("c.bin"), pattern(80_000)).unwrap();
+    let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+    let created = librqbit::create_torrent(&root, CreateTorrentOptions { name: Some(name), trackers: vec![], piece_length: Some(32 * 1024) }, &spawner).await.unwrap();
+    let torrent_bytes = created.as_bytes().unwrap().to_vec();
+    let session = Session::new_with_opts(
+        base.clone(),
+        SessionOptions {
+            dht: None,
+            persistence: None,
+            disable_local_service_discovery: true,
+            ipv4_only: true,
+            listen: Some(ListenerOptions { mode: ListenerMode::TcpOnly, listen_addr: (Ipv4Addr::LOCALHOST, 0).into(), ipv4_only: true, ..Default::default() }),
+            connect: Some(ConnectionOptions::default()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // For a multi-file torrent librqbit writes straight into `output_folder`: the folder itself.
+    session
+        .add_torrent(AddTorrent::from_bytes(torrent_bytes.clone()), Some(AddTorrentOptions { output_folder: Some(root.to_string_lossy().into_owned()), overwrite: true, ..Default::default() }))
+        .await
+        .unwrap();
+    let addr = session.listen_addr().expect("seeder listens");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()));
+    Seeder { session, addr, torrent_bytes, info_hash: created.info_hash().as_string(), _dir: base }
+}
+
 async fn env() -> Env {
     let env = Env::new().await;
     env.manager
@@ -275,4 +311,46 @@ async fn seeding_resumes_after_restart() {
     assert!(info.live || env.manager.torrent_info(&dl.id).await.unwrap().is_some());
     env.manager.shutdown(Duration::from_secs(5)).await.unwrap();
     drop(s.session.clone());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_file_torrent_lands_in_its_own_folder() {
+    let s = seeder_pack("Cool Pack 1.0").await;
+    let env = env().await;
+    let dl = env.manager.create(NewDownload { url: magnet(&s, "Cool%20Pack%201.0"), start_immediately: true, ..Default::default() }).await.unwrap();
+    wait(&env, &dl.id, DownloadState::Completed, 60).await;
+    let folder = out_file(&env, "Cool Pack 1.0");
+    assert!(same(&folder.join("a.txt"), 1_000), "files must be inside the torrent-named folder");
+    assert!(same(&folder.join("Setup").join("b.bin"), 120_000));
+    assert!(same(&folder.join("Crack").join("c.bin"), 80_000));
+    let shared = folder.parent().unwrap();
+    assert!(!shared.join("a.txt").exists() && !shared.join("Setup").exists() && !shared.join("Crack").exists(), "nothing may be scattered into the category folder");
+    env.manager.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_folder_rules() {
+    use std::path::Path;
+    let single = {
+        let d = std::env::temp_dir().join(format!("uk-of-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.bin"), pattern(40_000)).unwrap();
+        d
+    };
+    let sp = librqbit::spawn_utils::BlockingSpawner::new(1);
+    let one = librqbit::create_torrent(&single.join("f.bin"), CreateTorrentOptions { name: Some("f.bin"), trackers: vec![], piece_length: Some(32 * 1024) }, &sp).await.unwrap();
+    let one = one.as_bytes().unwrap().to_vec();
+    let root = single.join("pack");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("x.bin"), pattern(40_000)).unwrap();
+    std::fs::write(root.join("y.bin"), pattern(40_000)).unwrap();
+    let many = librqbit::create_torrent(&root, CreateTorrentOptions { name: Some("pack"), trackers: vec![], piece_length: Some(32 * 1024) }, &sp).await.unwrap().as_bytes().unwrap().to_vec();
+    let (cat, target) = (Path::new("C:/dl/General"), Path::new("C:/dl/General/pack"));
+    assert_eq!(torrent::output_folder(&one, Path::new("C:/dl/General/f.bin"), false), cat, "single file: the category folder");
+    assert_eq!(torrent::output_folder(&many, target, false), target, "multi-file: its own folder");
+    assert_eq!(torrent::output_folder(&many, target, true), cat, "started before the rule and no own folder yet: old place, no second copy");
+    assert_eq!(torrent::output_folder(b"garbage", target, false), cat);
+    let own = single.join("pack");
+    assert_eq!(torrent::output_folder(&many, &own, true), own, "started and its own folder exists: use it");
+    std::fs::remove_dir_all(single).ok();
 }
