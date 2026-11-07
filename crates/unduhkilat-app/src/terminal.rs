@@ -212,6 +212,11 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
+    /// Whether the terminal had keyboard focus in the last frame.
+    pub fn has_focus(&self) -> bool {
+        self.was_focused
+    }
+
     /// Draw the terminal into the available space and handle its input. Returns text that still needs
     /// the user's confirmation before being pasted (several lines into a program without bracketed paste).
     pub fn show(&mut self, ui: &mut Ui, session: &TermSession, font_size: f32, ctrl_v_pastes: bool) -> Option<String> {
@@ -503,6 +508,580 @@ fn text_format(font: &FontId, cell: &CellView) -> TextFormat {
     f
 }
 
+use super::{App, Screen};
+use crate::theme::{self, *};
+use eframe::egui::{Align, Layout, RichText};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+use unduhkilat_core::config::keys;
+use unduhkilat_core::repo;
+use unduhkilat_core::term::local::{detect_shells, spawn_local, ShellKind, ShellOptions};
+use unduhkilat_core::term::session::SessionStatus;
+
+// ---- pure helpers (unit tested) ---------------------------------------------------------------
+
+pub const DEFAULT_FONT_SIZE: f32 = 13.0;
+const SCROLLBACK: usize = 10_000;
+const MAX_FILES: usize = 2000;
+
+pub fn font_size_from_setting(v: Option<&str>) -> f32 {
+    v.and_then(|s| s.trim().parse::<f32>().ok()).filter(|x| x.is_finite()).map(|x| x.clamp(8.0, 32.0)).unwrap_or(DEFAULT_FONT_SIZE)
+}
+
+/// Where a new terminal starts: the folder setting if it exists, else Downloads, else the home folder,
+/// else the working folder.
+pub fn start_dir(setting: Option<&str>, home: Option<&Path>) -> PathBuf {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(s) = setting.map(str::trim).filter(|s| !s.is_empty()) {
+        candidates.push(PathBuf::from(s));
+    }
+    if let Some(h) = home {
+        candidates.push(h.join("Downloads"));
+        candidates.push(h.to_path_buf());
+    }
+    candidates.into_iter().find(|p| p.is_dir()).unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// The program's own title (OSC 0/2) when it set one, cut to a tab-sized length.
+pub fn tab_title(base: &str, program_title: Option<&str>) -> String {
+    let t = program_title.map(str::trim).filter(|t| !t.is_empty()).unwrap_or(base);
+    if t.chars().count() > 24 {
+        let cut: String = t.chars().take(23).collect();
+        format!("{cut}\u{2026}")
+    } else {
+        t.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalLayout {
+    /// Terminal and files take turns (a switch above them).
+    A,
+    /// Terminal and files side by side.
+    B,
+}
+
+impl TerminalLayout {
+    pub fn from_setting(v: Option<&str>) -> Self {
+        if v.map(|s| s.trim().eq_ignore_ascii_case("b")).unwrap_or(false) {
+            TerminalLayout::B
+        } else {
+            TerminalLayout::A
+        }
+    }
+    pub fn as_setting(&self) -> &'static str {
+        match self {
+            TerminalLayout::A => "a",
+            TerminalLayout::B => "b",
+        }
+    }
+}
+
+/// App-wide shortcuts (Ctrl+N, Delete) must not take keys the program in the terminal is meant to get.
+pub fn shortcuts_enabled(screen_is_terminal: bool, terminal_focused: bool) -> bool {
+    !(screen_is_terminal && terminal_focused)
+}
+
+// ---- state --------------------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct TermSettings {
+    pub shell: ShellKind,
+    pub start_dir: PathBuf,
+    pub font_size: f32,
+    pub ctrl_v_pastes: bool,
+    pub layout: TerminalLayout,
+}
+
+impl TermSettings {
+    pub fn load(get: impl Fn(&str) -> Option<String>) -> TermSettings {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        TermSettings {
+            shell: ShellKind::from_setting(get(keys::TERMINAL_SHELL).as_deref()),
+            start_dir: start_dir(get(keys::TERMINAL_START_DIR).as_deref(), home.as_deref()),
+            font_size: font_size_from_setting(get(keys::TERMINAL_FONT_SIZE).as_deref()),
+            ctrl_v_pastes: get(keys::TERMINAL_CTRL_V_PASTES).map(|v| v != "0").unwrap_or(true),
+            layout: TerminalLayout::from_setting(get(keys::TERMINAL_LAYOUT).as_deref()),
+        }
+    }
+}
+
+impl TermSettings {
+    pub fn save(&self, mut set: impl FnMut(&str, &str) -> unduhkilat_core::Result<()>) -> unduhkilat_core::Result<()> {
+        set(keys::TERMINAL_SHELL, self.shell.as_setting())?;
+        set(keys::TERMINAL_START_DIR, &self.start_dir.display().to_string())?;
+        set(keys::TERMINAL_FONT_SIZE, &self.font_size.to_string())?;
+        set(keys::TERMINAL_CTRL_V_PASTES, if self.ctrl_v_pastes { "1" } else { "0" })?;
+        set(keys::TERMINAL_LAYOUT, self.layout.as_setting())
+    }
+}
+
+/// The "Terminal" tab of Settings.
+pub fn settings_ui(ui: &mut egui::Ui, s: &mut TermSettings) {
+    ui.label(RichText::new("Shell bawaan").font(theme::bold(13.0)));
+    egui::ComboBox::from_id_salt("term-shell").selected_text(s.shell.label()).show_ui(ui, |ui| {
+        for k in detect_shells() {
+            ui.selectable_value(&mut s.shell, k, k.label());
+        }
+    });
+    ui.add_space(8.0);
+    ui.label(RichText::new("Folder awal").font(theme::bold(13.0)));
+    let mut dir = s.start_dir.display().to_string();
+    if ui.add(egui::TextEdit::singleline(&mut dir).desired_width(420.0)).changed() {
+        s.start_dir = PathBuf::from(dir);
+    }
+    ui.label(RichText::new("Dipakai untuk terminal baru yang tidak dibuka dari sebuah folder. Bila folder tidak ada, dipakai folder Unduhan.").color(FG_SECONDARY));
+    ui.add_space(8.0);
+    ui.label(RichText::new("Ukuran huruf").font(theme::bold(13.0)));
+    ui.add(egui::Slider::new(&mut s.font_size, 8.0..=32.0).step_by(0.5));
+    ui.add_space(8.0);
+    ui.checkbox(&mut s.ctrl_v_pastes, "Ctrl+V menempel teks (Ctrl+C menyalin bila ada teks terpilih)");
+    ui.add_space(8.0);
+    ui.label(RichText::new("Tata letak").font(theme::bold(13.0)));
+    ui.radio_value(&mut s.layout, TerminalLayout::A, "A: Terminal dan Berkas bergantian");
+    ui.radio_value(&mut s.layout, TerminalLayout::B, "B: Terminal dan Berkas berdampingan");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabKind {
+    Local(ShellKind),
+    Ssh { server_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabStatus {
+    Connecting,
+    Running,
+    Ended(Option<i32>),
+    Failed(String),
+}
+
+pub struct TermTab {
+    pub id: u64,
+    pub base_title: String,
+    pub subtitle: String,
+    pub kind: TabKind,
+    pub session: Option<TermSession>,
+    pub status: TabStatus,
+    view: TerminalView,
+    show_files: bool,
+    cwd: PathBuf,
+    files_dir: PathBuf,
+    selected_file: Option<PathBuf>,
+}
+
+#[derive(Default)]
+pub struct TerminalState {
+    pub tabs: Vec<TermTab>,
+    pub active: usize,
+    next_id: u64,
+    confirm_close: Option<u64>,
+    confirm_paste: Option<(u64, String)>,
+    /// The terminal had keyboard focus in the last frame.
+    pub captured: bool,
+    settings: Option<TermSettings>,
+}
+
+impl TerminalState {
+    pub fn apply_settings(&mut self, s: TermSettings) {
+        self.settings = Some(s);
+    }
+}
+
+fn dialog_window(title: &str, width: f32) -> egui::Window<'static> {
+    egui::Window::new(title.to_string()).title_bar(false).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).fixed_size([width, 0.0])
+}
+
+fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
+    egui::Frame::window(&ctx.global_style()).fill(SURFACE).inner_margin(egui::Margin::same(22)).shadow(egui::epaint::Shadow { offset: [0, 8], blur: 24, spread: 0, color: egui::Color32::from_black_alpha(150) })
+}
+
+fn badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32) {
+    ui.label(RichText::new(format!(" {text} ")).font(theme::mono(10.0)).color(egui::Color32::WHITE).background_color(fill));
+}
+
+impl App {
+    fn term_settings(&mut self) -> TermSettings {
+        if self.terminal.settings.is_none() {
+            self.terminal_reload_settings();
+        }
+        self.terminal.settings.clone().expect("loaded above")
+    }
+
+    /// Re-read the terminal settings (after the Settings screen saved them).
+    pub(super) fn terminal_reload_settings(&mut self) {
+        let db = self.manager.db();
+        let get = |k: &str| db.read(|c| repo::get_setting(c, k)).ok().flatten();
+        self.terminal.settings = Some(TermSettings::load(get));
+    }
+
+    /// Whether the terminal currently holds the keyboard (app shortcuts must stay out of the way).
+    pub(super) fn terminal_captures_keyboard(&self) -> bool {
+        !shortcuts_enabled(self.screen == Screen::Terminal, self.terminal.captured)
+    }
+
+    fn start_local_session(&self, kind: ShellKind, cwd: &Path) -> unduhkilat_core::Result<TermSession> {
+        let io = spawn_local(ShellOptions { kind, cwd: cwd.to_path_buf(), cols: 100, rows: 30 })?;
+        let ctx = self.ctx.clone();
+        Ok(TermSession::start(io, 100, 30, SCROLLBACK, Arc::new(move || ctx.request_repaint()), &self.rt))
+    }
+
+    /// Open a tab with a local shell in `cwd`. `kind = None` uses the shell from Settings.
+    pub fn open_local_terminal(&mut self, cwd: PathBuf, kind: Option<ShellKind>) {
+        let settings = self.term_settings();
+        let mut kind = kind.unwrap_or(settings.shell);
+        if !detect_shells().contains(&kind) {
+            kind = ShellKind::PowerShell;
+        }
+        match self.start_local_session(kind, &cwd) {
+            Ok(session) => {
+                let id = self.terminal.next_id;
+                self.terminal.next_id += 1;
+                let leaf = cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| cwd.display().to_string());
+                self.terminal.tabs.push(TermTab {
+                    id,
+                    base_title: leaf,
+                    subtitle: cwd.display().to_string(),
+                    kind: TabKind::Local(kind),
+                    session: Some(session),
+                    status: TabStatus::Running,
+                    view: TerminalView::default(),
+                    show_files: false,
+                    files_dir: cwd.clone(),
+                    cwd,
+                    selected_file: None,
+                });
+                self.terminal.active = self.terminal.tabs.len() - 1;
+                self.screen = Screen::Terminal;
+            }
+            Err(e) => self.notice = Some((e.message, Instant::now())),
+        }
+    }
+
+    /// Per-frame housekeeping that must run even while another screen is showing: clipboard requests
+    /// from programs (OSC 52) and session status.
+    pub(super) fn terminal_sync(&mut self, ctx: &egui::Context) {
+        for tab in &mut self.terminal.tabs {
+            let Some(s) = &tab.session else { continue };
+            for text in s.take_clipboard() {
+                ctx.copy_text(text);
+            }
+            if let SessionStatus::Ended(code) = s.status() {
+                tab.status = TabStatus::Ended(code);
+            }
+        }
+    }
+
+    fn request_close_tab(&mut self, id: u64) {
+        let running = self.terminal.tabs.iter().find(|t| t.id == id).map(|t| matches!(t.status, TabStatus::Running | TabStatus::Connecting)).unwrap_or(false);
+        if running {
+            self.terminal.confirm_close = Some(id);
+        } else {
+            self.close_tab(id);
+        }
+    }
+
+    fn close_tab(&mut self, id: u64) {
+        if let Some(i) = self.terminal.tabs.iter().position(|t| t.id == id) {
+            if let Some(s) = &self.terminal.tabs[i].session {
+                s.close();
+            }
+            self.terminal.tabs.remove(i);
+            if self.terminal.active >= self.terminal.tabs.len() {
+                self.terminal.active = self.terminal.tabs.len().saturating_sub(1);
+            }
+        }
+    }
+
+    pub(super) fn terminal_screen(&mut self, ui: &mut egui::Ui) {
+        self.terminal.captured = false;
+        let settings = self.term_settings();
+        let mut select: Option<usize> = None;
+        let mut close: Option<u64> = None;
+        let mut new_tab: Option<ShellKind> = None;
+
+        ui.horizontal_wrapped(|ui| {
+            for (i, tab) in self.terminal.tabs.iter().enumerate() {
+                let active = i == self.terminal.active;
+                let label = tab_title(&tab.base_title, tab.session.as_ref().and_then(|s| s.title()).filter(|t| !t.to_ascii_lowercase().ends_with(".exe")).as_deref());
+                egui::Frame::new().fill(if active { FG } else { SURFACE_RAISED }).stroke(egui::Stroke::new(1.0, BORDER)).corner_radius(6).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        match &tab.kind {
+                            TabKind::Local(_) => badge(ui, "LOKAL", egui::Color32::from_rgb(0x3A, 0x36, 0x32)),
+                            TabKind::Ssh { .. } => badge(ui, "SSH", egui::Color32::from_rgb(0x6D, 0x4A, 0xFF)),
+                        }
+                        let r = ui.add(egui::Label::new(RichText::new(label).color(if active { egui::Color32::WHITE } else { FG })).sense(egui::Sense::click()));
+                        if r.clicked() {
+                            select = Some(i);
+                        }
+                        let dot = match tab.status {
+                            TabStatus::Running => SUCCESS,
+                            TabStatus::Connecting => WARNING,
+                            _ => DANGER,
+                        };
+                        ui.label(RichText::new("\u{25CF}").size(9.0).color(dot));
+                        if ui.small_button("\u{00D7}").on_hover_text("Tutup tab").clicked() {
+                            close = Some(tab.id);
+                        }
+                    });
+                });
+            }
+            ui.menu_button("+ Baru", |ui| {
+                for k in detect_shells() {
+                    if ui.button(format!("Terminal baru: {}", k.label())).clicked() {
+                        new_tab = Some(k);
+                        ui.close();
+                    }
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        if let Some(i) = select {
+            self.terminal.active = i;
+        }
+        if let Some(id) = close {
+            self.request_close_tab(id);
+        }
+        if let Some(k) = new_tab {
+            let dir = settings.start_dir.clone();
+            self.open_local_terminal(dir, Some(k));
+        }
+
+        if self.terminal.tabs.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Belum ada terminal").font(theme::bold(16.0)));
+                ui.label(RichText::new("Buka terminal di komputer ini, atau tekan Terminal pada kartu unduhan untuk membukanya di folder itu.").color(FG_SECONDARY));
+                ui.add_space(8.0);
+                if ui.add(primary_button("Terminal baru")).clicked() {
+                    new_tab = Some(settings.shell);
+                }
+            });
+            if let Some(k) = new_tab {
+                self.open_local_terminal(settings.start_dir.clone(), Some(k));
+            }
+            return;
+        }
+
+        let idx = self.terminal.active.min(self.terminal.tabs.len() - 1);
+        let mut outcome = TabOutcome::default();
+        draw_tab(ui, &mut self.terminal.tabs[idx], &settings, &mut outcome);
+        self.terminal.captured = self.terminal.tabs[idx].view.has_focus();
+        let id = self.terminal.tabs[idx].id;
+        if let Some(text) = outcome.paste_confirm {
+            self.terminal.confirm_paste = Some((id, text));
+        }
+        if outcome.restart {
+            let (kind, cwd) = match &self.terminal.tabs[idx].kind {
+                TabKind::Local(k) => (*k, self.terminal.tabs[idx].cwd.clone()),
+                TabKind::Ssh { .. } => return,
+            };
+            match self.start_local_session(kind, &cwd) {
+                Ok(s) => {
+                    let tab = &mut self.terminal.tabs[idx];
+                    tab.session = Some(s);
+                    tab.status = TabStatus::Running;
+                    tab.view = TerminalView::default();
+                }
+                Err(e) => self.notice = Some((e.message, Instant::now())),
+            }
+        }
+        if outcome.close {
+            self.close_tab(id);
+        }
+    }
+
+    /// Confirmation windows of the Terminal screen.
+    pub(super) fn terminal_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some((tab_id, text)) = self.terminal.confirm_paste.clone() {
+            let lines = text.lines().count();
+            let mut answer: Option<bool> = None;
+            dialog_window("Tempel teks", 520.0).frame(dialog_frame(ctx)).show(ctx, |ui| {
+                ui.label(RichText::new(format!("Tempel {lines} baris?")).font(theme::bold(16.0)));
+                ui.label(RichText::new("Program ini tidak meminta mode tempel aman, jadi setiap baris bisa langsung dijalankan sebagai perintah.").color(FG_SECONDARY));
+                ui.add_space(6.0);
+                let preview: String = text.lines().take(6).collect::<Vec<_>>().join("\n");
+                ui.add(egui::TextEdit::multiline(&mut preview.clone()).font(theme::mono(11.5)).desired_rows(4).desired_width(f32::INFINITY));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add(primary_button("Tempel")).clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Batal").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                answer = Some(false);
+            }
+            if let Some(yes) = answer {
+                self.terminal.confirm_paste = None;
+                if yes {
+                    if let Some(s) = self.terminal.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.session.clone()) {
+                        s.paste(text);
+                    }
+                }
+            }
+        }
+        if let Some(id) = self.terminal.confirm_close {
+            let mut answer: Option<bool> = None;
+            dialog_window("Tutup tab", 440.0).frame(dialog_frame(ctx)).show(ctx, |ui| {
+                ui.label(RichText::new("Tutup tab terminal ini?").font(theme::bold(16.0)));
+                ui.label(RichText::new("Program yang masih berjalan di dalamnya akan dihentikan.").color(FG_SECONDARY));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(RichText::new("Tutup").color(egui::Color32::WHITE).font(theme::bold(13.5))).fill(DANGER).stroke(egui::Stroke::NONE)).clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Batal").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                answer = Some(false);
+            }
+            if let Some(yes) = answer {
+                self.terminal.confirm_close = None;
+                if yes {
+                    self.close_tab(id);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct TabOutcome {
+    paste_confirm: Option<String>,
+    restart: bool,
+    close: bool,
+}
+
+/// One tab's toolbar, banner, terminal, and files pane, in the chosen layout.
+fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, out: &mut TabOutcome) {
+    let local = matches!(tab.kind, TabKind::Local(_));
+    ui.horizontal(|ui| {
+        if settings.layout == TerminalLayout::A {
+            ui.selectable_value(&mut tab.show_files, false, "Terminal");
+            ui.selectable_value(&mut tab.show_files, true, "Berkas");
+            ui.add_space(8.0);
+        }
+        if let TabKind::Local(k) = &tab.kind {
+            ui.label(RichText::new(k.label()).font(theme::mono(11.5)).color(FG_SECONDARY));
+        }
+        ui.label(RichText::new(&tab.subtitle).font(theme::mono(11.5)).color(FG_SECONDARY));
+    });
+    match &tab.status {
+        TabStatus::Ended(code) => {
+            ui.horizontal(|ui| {
+                let text = match code {
+                    Some(c) => format!("Berakhir (kode {c})."),
+                    None => "Berakhir.".to_string(),
+                };
+                ui.label(RichText::new(text).color(DANGER));
+                if local && ui.button("Mulai ulang").clicked() {
+                    out.restart = true;
+                }
+                if ui.button("Tutup").clicked() {
+                    out.close = true;
+                }
+            });
+        }
+        TabStatus::Failed(msg) => {
+            ui.label(RichText::new(msg).color(DANGER));
+        }
+        TabStatus::Connecting => {
+            ui.label(RichText::new("Menghubungkan...").color(FG_SECONDARY));
+        }
+        TabStatus::Running => {}
+    }
+    ui.add_space(4.0);
+
+    let Some(session) = tab.session.clone() else { return };
+    let (font, ctrl_v) = (settings.font_size, settings.ctrl_v_pastes);
+    let show_terminal = |ui: &mut egui::Ui, tab: &mut TermTab, out: &mut TabOutcome| {
+        if let Some(text) = tab.view.show(ui, &session, font, ctrl_v) {
+            out.paste_confirm = Some(text);
+        }
+    };
+    match settings.layout {
+        TerminalLayout::A => {
+            if tab.show_files {
+                files_pane(ui, tab, &session, local);
+            } else {
+                show_terminal(ui, tab, out);
+            }
+        }
+        TerminalLayout::B => {
+            let total = ui.available_size();
+            let left = (total.x * 0.64).floor();
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(Vec2::new(left, total.y), Layout::top_down(Align::Min), |ui| show_terminal(ui, tab, out));
+                ui.separator();
+                ui.allocate_ui_with_layout(Vec2::new((total.x - left - 16.0).max(120.0), total.y), Layout::top_down(Align::Min), |ui| files_pane(ui, tab, &session, local));
+            });
+        }
+    }
+}
+
+/// Local folder listing next to (or instead of) the terminal. Servers get theirs with SFTP (a later part).
+fn files_pane(ui: &mut egui::Ui, tab: &mut TermTab, session: &TermSession, local: bool) {
+    if !local {
+        ui.add_space(20.0);
+        ui.label(RichText::new("Segera hadir").font(theme::bold(14.0)));
+        ui.label(RichText::new("Penjelajah berkas server menunggu dukungan SFTP.").color(FG_SECONDARY));
+        return;
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button("\u{2191}").on_hover_text("Folder induk").clicked() {
+            if let Some(p) = tab.files_dir.parent() {
+                tab.files_dir = p.to_path_buf();
+                tab.selected_file = None;
+            }
+        }
+        ui.label(RichText::new(tab.files_dir.display().to_string()).font(theme::mono(11.5)).color(FG_SECONDARY));
+    });
+    ui.add_space(4.0);
+    let mut entries: Vec<(PathBuf, bool)> = std::fs::read_dir(&tab.files_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).take(MAX_FILES).map(|e| (e.path(), e.file_type().map(|t| t.is_dir()).unwrap_or(false))).collect())
+        .unwrap_or_default();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.file_name().map(|n| n.to_ascii_lowercase()).cmp(&b.0.file_name().map(|n| n.to_ascii_lowercase()))));
+    let list_h = (ui.available_height() - 40.0).max(80.0);
+    egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+        if entries.is_empty() {
+            ui.label(RichText::new("Folder kosong.").color(FG_SECONDARY));
+        }
+        for (path, is_dir) in &entries {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let selected = tab.selected_file.as_ref() == Some(path);
+            let icon = if *is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
+            if ui.selectable_label(selected, format!("{icon} {name}")).clicked() {
+                if *is_dir {
+                    tab.files_dir = path.clone();
+                    tab.selected_file = None;
+                } else {
+                    tab.selected_file = Some(path.clone());
+                }
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        let can_cd = matches!(tab.kind, TabKind::Local(ShellKind::PowerShell | ShellKind::Cmd)) && session.status() == SessionStatus::Running;
+        if ui.add_enabled(can_cd, egui::Button::new("Buka di terminal")).on_disabled_hover_text("Tersedia untuk PowerShell dan CMD yang sedang berjalan").clicked() {
+            let dir = tab.files_dir.display().to_string().replace('"', "");
+            session.send(format!("cd \"{dir}\"\r").into_bytes());
+            session.with_engine(|e| e.scroll_to_bottom());
+        }
+        if ui.button("Folder Windows").clicked() {
+            super::reveal_in_explorer(&tab.files_dir.display().to_string());
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +1191,10 @@ mod tests {
         assert!(tr(&[up], NONE).is_empty());
     }
 
+    fn unique() -> String {
+        format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())
+    }
+
     #[test]
     fn layout_setting_parses_and_defaults_to_a() {
         assert_eq!(TerminalLayout::from_setting(None), TerminalLayout::A);
@@ -640,9 +1223,9 @@ mod tests {
 
     #[test]
     fn start_folder_falls_back_to_downloads() {
-        let home = std::env::temp_dir().join(format!("uk-home-{}", uuid::Uuid::new_v4().simple()));
+        let home = std::env::temp_dir().join(format!("uk-home-{}", unique()));
         std::fs::create_dir_all(home.join("Downloads")).unwrap();
-        let real = std::env::temp_dir().join(format!("uk-start-{}", uuid::Uuid::new_v4().simple()));
+        let real = std::env::temp_dir().join(format!("uk-start-{}", unique()));
         std::fs::create_dir_all(&real).unwrap();
         assert_eq!(start_dir(Some(real.to_str().unwrap()), Some(&home)), real, "an existing folder setting is used");
         assert_eq!(start_dir(Some("C:\\folder\\yang\\tidak\\ada"), Some(&home)), home.join("Downloads"), "a missing folder falls back");

@@ -71,6 +71,7 @@ enum Screen {
     Grabber,
     Search,
     Servers,
+    Terminal,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -82,6 +83,7 @@ enum SettingsTab {
     Browser,
     Network,
     Torrent,
+    Terminal,
 }
 
 struct AddDialog {
@@ -153,6 +155,7 @@ struct SettingsState {
     clip: bool,
     upd: bool,
     autostart: bool,
+    term: terminal::TermSettings,
     t_seeding: bool,
     t_ratio: f32,
     t_dht: bool,
@@ -224,6 +227,7 @@ pub struct App {
     notice: Option<(String, Instant)>,
     update: UpdState,
     servers: servers::ServersState,
+    terminal: terminal::TerminalState,
     /// Started by Windows at logon: go straight to the tray (only if a tray icon exists).
     pub start_hidden: bool,
 }
@@ -250,7 +254,7 @@ impl App {
             last_refresh: Instant::now() - Duration::from_secs(10), live: HashMap::new(), torrent: None, torrent_poll: Instant::now() - Duration::from_secs(10), grab: GrabState::default(), search: SearchState::default(), clip_rx, clip_enabled, events,
             selected: None, checked: HashSet::new(), filter: Filter::All, sort: (SortKey::None, true),
             screen: Screen::Downloads, dock_open: false, dock_height: DOCK_HEIGHT, add: None, settings: None,
-            log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None, update: UpdState::None, servers: servers::ServersState::default(), start_hidden: false,
+            log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None, update: UpdState::None, servers: servers::ServersState::default(), terminal: terminal::TerminalState::default(), start_hidden: false,
         };
         app.refresh();
         app.servers_reload(); // local database only: fills the sidebar count, connects to nothing
@@ -264,6 +268,10 @@ impl App {
             Some("settings") => app.open_settings_screen(),
             Some("search") => app.screen = Screen::Search,
             Some("servers") => app.screen = Screen::Servers,
+            Some("terminal") => {
+                let dir = std::env::current_dir().unwrap_or_default();
+                app.open_local_terminal(dir, None);
+            }
             Some("servers-new") => {
                 app.screen = Screen::Servers;
                 app.servers_open_new_dialog();
@@ -321,6 +329,7 @@ impl App {
             self.notice = Some((format!("{}: {}", e.code, e.message), Instant::now()));
             return;
         }
+        unduhkilat_core::term::local::kill_all_local();
         let _ = self.rt.block_on(self.manager.shutdown(Duration::from_secs(15)));
         std::process::exit(0);
     }
@@ -842,6 +851,7 @@ impl eframe::App for App {
     /// Runs even while the window is hidden in the tray (DEC-004), so state keeps updating.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
+        self.terminal_sync(ctx);
         // Browser proposals queue up and are shown one at a time (FR-039).
         if let Some(rx) = &self.proposals_rx {
             while let Ok(p) = rx.try_recv() {
@@ -897,10 +907,10 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
+        if !self.terminal_captures_keyboard() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
             self.open_add_dialog("");
         }
-        if !ctx.egui_wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() && !self.terminal_captures_keyboard() {
             if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
                 let ids: Vec<String> = if self.checked.is_empty() { self.selected.iter().cloned().collect() } else { self.checked.iter().cloned().collect() };
                 for id in ids {
@@ -962,10 +972,12 @@ impl eframe::App for App {
             Screen::Grabber => self.grabber(ui),
             Screen::Search => self.search_screen(ui),
             Screen::Servers => self.servers_screen(ui),
+            Screen::Terminal => self.terminal_screen(ui),
         });
 
         self.add_dialog(ctx);
         self.servers_dialogs(ctx);
+        self.terminal_dialogs(ctx);
         self.resize_edges(ctx);
     }
 }
@@ -1154,6 +1166,7 @@ impl App {
             clip: get(keys::CLIPBOARD_MONITOR).is_some_and(|v| v == "1"),
             upd: get(keys::UPDATE_CHECK).map(|v| v != "0").unwrap_or(true),
             autostart: unduhkilat_core::autostart::is_enabled(),
+            term: terminal::TermSettings::load(&get),
             t_seeding: get(keys::TORRENT_SEEDING).map(|v| v != "0").unwrap_or(true),
             t_ratio: get(keys::TORRENT_SEED_RATIO).and_then(|v| v.parse().ok()).unwrap_or(1.0),
             t_dht: get(keys::TORRENT_DHT).map(|v| v != "0").unwrap_or(true),
@@ -1239,6 +1252,9 @@ impl App {
             }
             if nav(ui, self.screen == Screen::Servers, "Server", None, Some(self.servers.servers.len())) {
                 self.screen = if self.screen == Screen::Servers { Screen::Downloads } else { Screen::Servers };
+            }
+            if nav(ui, self.screen == Screen::Terminal, "Terminal", None, Some(self.terminal.tabs.len())) {
+                self.screen = if self.screen == Screen::Terminal { Screen::Downloads } else { Screen::Terminal };
             }
             // Pin the bottom block to the foot of the panel only when there is room for it.
             const BOTTOM_H: f32 = 120.0;
@@ -1686,7 +1702,7 @@ impl App {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(180.0);
-                for (t, name) in [(SettingsTab::Engine, "Mesin Unduhan"), (SettingsTab::Categories, "Kategori & Folder"), (SettingsTab::Speed, "Batas Kecepatan"), (SettingsTab::Behaviour, "Jendela & Notifikasi"), (SettingsTab::Network, "Jaringan & Proxy"), (SettingsTab::Torrent, "Torrent"), (SettingsTab::Browser, "Integrasi Browser")] {
+                for (t, name) in [(SettingsTab::Engine, "Mesin Unduhan"), (SettingsTab::Categories, "Kategori & Folder"), (SettingsTab::Speed, "Batas Kecepatan"), (SettingsTab::Behaviour, "Jendela & Notifikasi"), (SettingsTab::Network, "Jaringan & Proxy"), (SettingsTab::Torrent, "Torrent"), (SettingsTab::Terminal, "Terminal"), (SettingsTab::Browser, "Integrasi Browser")] {
                     if ui.selectable_label(s.tab == t, name).clicked() { s.tab = t; }
                 }
             });
@@ -1835,6 +1851,7 @@ impl App {
                         }
                         ui.label(RichText::new("Hanya teks yang seluruhnya satu tautan yang ditawarkan, dan tidak ada yang diunduh sebelum Anda mengonfirmasi.").color(FG_SECONDARY));
                     }
+                    SettingsTab::Terminal => terminal::settings_ui(ui, &mut s.term),
                     SettingsTab::Categories => {
                         let mut del: Option<String> = None;
                         let mut upd: Option<Category> = None;
@@ -1895,6 +1912,8 @@ impl App {
                     s.autostart = unduhkilat_core::autostart::is_enabled();
                 }
             }
+            let term = s.term.clone();
+            self.terminal.apply_settings(term.clone());
             let (t_seed, t_ratio, t_dht, t_upnp, t_port) = (s.t_seeding, s.t_ratio.max(0.0), s.t_dht, s.t_upnp, s.t_port.min(65535));
             let net_changed = (t_dht, t_upnp, t_port) != s.t_net_orig;
             s.t_net_orig = (t_dht, t_upnp, t_port);
@@ -1902,6 +1921,7 @@ impl App {
                 m.set_global_speed_limit(g).await?;
                 m.db().write(move |conn| {
                     repo::set_setting(conn, keys::DEFAULT_CONNECTIONS, &n.to_string())?;
+                    term.save(|k, v| repo::set_setting(conn, k, v))?;
                     repo::set_setting(conn, keys::CLOSE_TO_TRAY, if tray { "1" } else { "0" })?;
                     repo::set_setting(conn, keys::CLIPBOARD_MONITOR, if clip { "1" } else { "0" })?;
                     repo::set_setting(conn, keys::UPDATE_CHECK, if upd { "1" } else { "0" })?;

@@ -81,6 +81,7 @@ pub fn exit_flow(rt: Handle, manager: Manager) {
             return;
         }
     }
+    unduhkilat_core::term::local::kill_all_local();
     if let Err(e) = rt.block_on(manager.shutdown(Duration::from_secs(15))) {
         tracing::error!(error = %e, "shutdown did not finish cleanly");
     }
