@@ -37,6 +37,18 @@ pub enum ErrorCode {
     ErrStorageWriteFailed,
     /// Referenced by ARCHITECTURE.md §7.4 (DPAPI decryption failure); absent from API.md.
     ErrAuthChallengeFailed,
+    /// Server (SSH/FTPS) host key or certificate not seen before and not confirmed by the user.
+    ErrHostKeyUnknown,
+    /// A pinned host key changed: the connection is blocked (possible interception).
+    ErrHostKeyChanged,
+    ErrSshAuthFailed,
+    /// A jump host in a chain could not be reached or authenticated; the message names it.
+    ErrJumpFailed,
+    /// A stored credential cannot be decrypted (e.g. data folder moved to another Windows account).
+    ErrCredentialUnreadable,
+    ErrTooManyHops,
+    /// The server is referenced by another (as a jump host) and cannot be deleted.
+    ErrServerInUse,
 }
 
 impl ErrorCode {
@@ -71,6 +83,13 @@ impl ErrorCode {
             ErrInternal => "ERR_INTERNAL",
             ErrStorageWriteFailed => "ERR_STORAGE_WRITE_FAILED",
             ErrAuthChallengeFailed => "ERR_AUTH_CHALLENGE_FAILED",
+            ErrHostKeyUnknown => "ERR_HOST_KEY_UNKNOWN",
+            ErrHostKeyChanged => "ERR_HOST_KEY_CHANGED",
+            ErrSshAuthFailed => "ERR_SSH_AUTH_FAILED",
+            ErrJumpFailed => "ERR_JUMP_FAILED",
+            ErrCredentialUnreadable => "ERR_CREDENTIAL_UNREADABLE",
+            ErrTooManyHops => "ERR_TOO_MANY_HOPS",
+            ErrServerInUse => "ERR_SERVER_IN_USE",
         }
     }
 }
@@ -148,5 +167,27 @@ impl From<reqwest::Error> for AppError {
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
         Self::new(ErrorCode::ErrPayloadCorrupt, e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ErrorCode::*;
+
+    #[test]
+    fn new_server_codes_serialize_screaming_snake() {
+        let cases = [
+            (ErrHostKeyUnknown, "ERR_HOST_KEY_UNKNOWN"),
+            (ErrHostKeyChanged, "ERR_HOST_KEY_CHANGED"),
+            (ErrSshAuthFailed, "ERR_SSH_AUTH_FAILED"),
+            (ErrJumpFailed, "ERR_JUMP_FAILED"),
+            (ErrCredentialUnreadable, "ERR_CREDENTIAL_UNREADABLE"),
+            (ErrTooManyHops, "ERR_TOO_MANY_HOPS"),
+            (ErrServerInUse, "ERR_SERVER_IN_USE"),
+        ];
+        for (code, text) in cases {
+            assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{text}\""));
+            assert_eq!(code.as_str(), text);
+        }
     }
 }
