@@ -36,7 +36,7 @@ impl client::Handler for AnyKey {
 }
 
 fn pw_server(user: &str, pw: &str, forwarding: bool) -> TestSshConfig {
-    TestSshConfig { users: vec![(user.into(), TestCred::Password(pw.into()))], allow_forwarding: forwarding, accept_delay: None }
+    TestSshConfig { users: vec![(user.into(), TestCred::Password(pw.into()))], allow_forwarding: forwarding, accept_delay: None, shell: false }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

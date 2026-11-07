@@ -26,6 +26,9 @@ pub struct TestSshConfig {
     pub allow_forwarding: bool,
     /// Sleep this long after accepting a TCP connection before speaking SSH (a slow or dead hop).
     pub accept_delay: Option<Duration>,
+    /// Accept PTY and shell requests and echo input back (a toy shell). `exit` ends the session with status 0.
+    /// When false, PTY and shell requests are refused.
+    pub shell: bool,
 }
 
 #[derive(Clone)]
@@ -33,6 +36,10 @@ struct Shared {
     cfg: TestSshConfig,
     logins: Arc<AtomicUsize>,
     forwards: Arc<AtomicUsize>,
+    pty: Arc<Mutex<Option<(u16, u16)>>>,
+    resizes: Arc<AtomicUsize>,
+    open_shells: Arc<AtomicUsize>,
+    shell_channels: Arc<Mutex<Vec<(ChannelId, server::Handle)>>>,
 }
 
 #[derive(Clone)]
@@ -97,7 +104,53 @@ impl server::Handler for Conn {
         Ok(())
     }
 
-    async fn data(&mut self, _c: ChannelId, _d: &[u8], _s: &mut Session) -> Result<(), Self::Error> {
+    async fn pty_request(&mut self, channel: ChannelId, _term: &str, cols: u32, rows: u32, _pw: u32, _ph: u32, _modes: &[(russh::Pty, u32)], session: &mut Session) -> Result<(), Self::Error> {
+        if self.0.cfg.shell {
+            *self.0.pty.lock().unwrap() = Some((cols as u16, rows as u16));
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
+        Ok(())
+    }
+
+    async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
+        if self.0.cfg.shell {
+            self.0.open_shells.fetch_add(1, Ordering::SeqCst);
+            self.0.shell_channels.lock().unwrap().push((channel, session.handle()));
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
+        Ok(())
+    }
+
+    async fn window_change_request(&mut self, _channel: ChannelId, cols: u32, rows: u32, _pw: u32, _ph: u32, _session: &mut Session) -> Result<(), Self::Error> {
+        *self.0.pty.lock().unwrap() = Some((cols as u16, rows as u16));
+        self.0.resizes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn data(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+        if !self.0.cfg.shell {
+            return Ok(());
+        }
+        if data.starts_with(b"exit") {
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+        } else {
+            session.data(channel, data.to_vec())?;
+        }
+        Ok(())
+    }
+
+    async fn channel_close(&mut self, channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
+        let mut chans = self.0.shell_channels.lock().unwrap();
+        if let Some(i) = chans.iter().position(|(c, _)| *c == channel) {
+            chans.remove(i);
+            self.0.open_shells.fetch_sub(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 }
@@ -124,7 +177,15 @@ fn new_config() -> (Arc<server::Config>, String) {
 
 impl TestSsh {
     pub async fn start(cfg: TestSshConfig) -> TestSsh {
-        let shared = Shared { cfg: cfg.clone(), logins: Arc::new(AtomicUsize::new(0)), forwards: Arc::new(AtomicUsize::new(0)) };
+        let shared = Shared {
+            cfg: cfg.clone(),
+            logins: Arc::new(AtomicUsize::new(0)),
+            forwards: Arc::new(AtomicUsize::new(0)),
+            pty: Arc::new(Mutex::new(None)),
+            resizes: Arc::new(AtomicUsize::new(0)),
+            open_shells: Arc::new(AtomicUsize::new(0)),
+            shell_channels: Arc::new(Mutex::new(Vec::new())),
+        };
         let (sc, fp) = new_config();
         let config = Arc::new(Mutex::new(sc));
         let fingerprint = Arc::new(Mutex::new(fp));
@@ -170,6 +231,29 @@ impl TestSsh {
     /// `direct-tcpip` channels this server accepted (traffic that really went through it).
     pub fn forward_count(&self) -> usize {
         self.shared.forwards.load(Ordering::SeqCst)
+    }
+
+    /// Size of the PTY as last requested (initial request or window change).
+    pub fn pty_size(&self) -> Option<(u16, u16)> {
+        *self.shared.pty.lock().unwrap()
+    }
+
+    /// `window-change` requests received.
+    pub fn resize_count(&self) -> usize {
+        self.shared.resizes.load(Ordering::SeqCst)
+    }
+
+    /// Shell channels currently open.
+    pub fn open_shells(&self) -> usize {
+        self.shared.open_shells.load(Ordering::SeqCst)
+    }
+
+    /// Close every shell channel from the server side (a dropped session).
+    pub async fn close_shells(&self) {
+        let chans: Vec<(ChannelId, server::Handle)> = self.shared.shell_channels.lock().unwrap().clone();
+        for (c, h) in chans {
+            let _ = h.close(c).await;
+        }
     }
 
     pub fn stop(self) {

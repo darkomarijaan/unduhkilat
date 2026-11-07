@@ -6,3 +6,4 @@ pub mod secrets;
 pub mod hostkeys;
 pub mod ssh;
 pub mod service;
+pub mod shell;
