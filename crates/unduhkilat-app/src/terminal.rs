@@ -738,6 +738,8 @@ pub struct TerminalState {
     confirm_paste: Option<(u64, String)>,
     /// The terminal had keyboard focus in the last frame.
     pub captured: bool,
+    /// Terminal fills the window (no header, sidebar, or status bar).
+    pub maximized: bool,
     settings: Option<TermSettings>,
 }
 
@@ -920,6 +922,9 @@ impl App {
 
     pub(super) fn terminal_screen(&mut self, ui: &mut egui::Ui) {
         self.terminal.captured = false;
+        if self.terminal.tabs.is_empty() {
+            self.terminal.maximized = false;
+        }
         let settings = self.term_settings();
         let mut select: Option<usize> = None;
         let mut close: Option<u64> = None;
@@ -991,11 +996,14 @@ impl App {
 
         let idx = self.terminal.active.min(self.terminal.tabs.len() - 1);
         let mut outcome = TabOutcome::default();
-        draw_tab(ui, &mut self.terminal.tabs[idx], &settings, &mut outcome);
+        draw_tab(ui, &mut self.terminal.tabs[idx], &settings, self.terminal.maximized, &mut outcome);
         self.terminal.captured = self.terminal.tabs[idx].view.has_focus();
         let id = self.terminal.tabs[idx].id;
         if let Some(text) = outcome.paste_confirm {
             self.terminal.confirm_paste = Some((id, text));
+        }
+        if outcome.toggle_max {
+            self.terminal.maximized = !self.terminal.maximized;
         }
         if let Some(n) = outcome.notice.take() {
             self.notice = Some((n, Instant::now()));
@@ -1090,12 +1098,13 @@ struct TabOutcome {
     paste_confirm: Option<String>,
     restart: bool,
     reconnect: bool,
+    toggle_max: bool,
     notice: Option<String>,
     close: bool,
 }
 
 /// One tab's toolbar, banner, terminal, and files pane, in the chosen layout.
-fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, out: &mut TabOutcome) {
+fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, maximized: bool, out: &mut TabOutcome) {
     let local = matches!(tab.kind, TabKind::Local(_));
     ui.horizontal(|ui| {
         if settings.layout == TerminalLayout::A {
@@ -1107,6 +1116,12 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, out: 
             ui.label(RichText::new(k.label()).font(theme::mono(11.5)).color(FG_SECONDARY));
         }
         ui.label(RichText::new(&tab.subtitle).font(theme::mono(11.5)).color(FG_SECONDARY));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let label = if maximized { "Keluar layar penuh" } else { "Layar penuh" };
+            if ui.button(label).on_hover_text("Sembunyikan menu dan bilah lain agar terminal memenuhi jendela").clicked() {
+                out.toggle_max = true;
+            }
+        });
     });
     match &tab.status {
         TabStatus::Ended(code) => {

@@ -268,6 +268,10 @@ impl App {
             Some("settings") => app.open_settings_screen(),
             Some("search") => app.screen = Screen::Search,
             Some("servers") => app.screen = Screen::Servers,
+            Some("terminal-max") => {
+                app.open_local_terminal(std::env::current_dir().unwrap_or_default(), None);
+                app.terminal.maximized = true;
+            }
             Some("terminal") => {
                 let dir = std::env::current_dir().unwrap_or_default();
                 app.open_local_terminal(dir, None);
@@ -927,7 +931,11 @@ impl eframe::App for App {
         let flat = |fill: Color32, m: egui::Margin| egui::Frame::new().fill(fill).inner_margin(m);
         let ruled = |fill: Color32, m: egui::Margin| egui::Frame::new().fill(fill).stroke(Stroke::new(1.0, BORDER)).inner_margin(m);
 
-        egui::Panel::top("head").exact_size(76.0).frame(flat(ACCENT, egui::Margin::symmetric(24, 8))).show(ui, |ui| self.header(ui, compact));
+        // Terminal "layar penuh": only the tabs and the terminal stay on screen.
+        let focus = self.screen == Screen::Terminal && self.terminal.maximized;
+        if !focus {
+            egui::Panel::top("head").exact_size(76.0).frame(flat(ACCENT, egui::Margin::symmetric(24, 8))).show(ui, |ui| self.header(ui, compact));
+        }
         if !matches!(self.update, UpdState::None) {
             let state = self.update.clone();
             egui::Panel::top("update").frame(flat(SURFACE, egui::Margin::symmetric(24, 8))).show(ui, |ui| {
@@ -949,9 +957,11 @@ impl eframe::App for App {
                 });
             });
         }
-        egui::Panel::bottom("status").exact_size(30.0).frame(ruled(SURFACE, egui::Margin::symmetric(20, 4))).show(ui, |ui| self.status_strip(ui));
+        if !focus {
+            egui::Panel::bottom("status").exact_size(30.0).frame(ruled(SURFACE, egui::Margin::symmetric(20, 4))).show(ui, |ui| self.status_strip(ui));
+        }
 
-        if !compact {
+        if !compact && !focus {
             egui::Panel::left("sidebar").exact_size(208.0).resizable(false).frame(ruled(BG, egui::Margin::same(10))).show(ui, |ui| self.sidebar(ui));
         }
 
@@ -966,7 +976,8 @@ impl eframe::App for App {
             });
         }
 
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(20, 14))).show(ui, |ui| match self.screen {
+        let central_margin = if focus { egui::Margin::symmetric(10, 8) } else { egui::Margin::symmetric(20, 14) };
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(central_margin)).show(ui, |ui| match self.screen {
             Screen::Downloads => self.table(ui, compact),
             Screen::Settings => self.settings_screen(ui),
             Screen::Diagnostics => self.diagnostics(ui),
