@@ -803,6 +803,7 @@ fn package_card(ui: &mut Ui, d: &Download, cat_name: &str, speed: u64, conns: u3
         let small = |t: &str| egui::Button::new(RichText::new(t.to_string()).size(12.0)).min_size(Vec2::new(0.0, 24.0));
         if c.add(small("Hapus")).on_hover_text("Hapus dari daftar (berkas tetap ada)").clicked() { acts.push((d.id.clone(), Action::Delete(false))); }
         if c.add(small("Folder")).clicked() { acts.push((d.id.clone(), Action::Reveal)); }
+        if c.add(small("Terminal")).on_hover_text("Buka terminal di folder ini").clicked() { acts.push((d.id.clone(), Action::Terminal)); }
         match d.state {
             DownloadState::Running | DownloadState::Queued => { if c.add(small("Jeda")).clicked() { acts.push((d.id.clone(), Action::Pause)); } }
             DownloadState::Paused | DownloadState::Failed => { if c.add(small("Lanjutkan")).clicked() { acts.push((d.id.clone(), Action::Resume)); } }
@@ -1350,6 +1351,7 @@ impl App {
                         }
                     });
                     if ui.button("Tampilkan di folder").clicked() { acts.push(Action::Reveal); ui.close(); }
+                    if ui.button("Buka terminal di folder").clicked() { acts.push(Action::Terminal); ui.close(); }
                     ui.separator();
                     if ui.button("Hapus dari daftar").clicked() { acts.push(Action::Delete(false)); ui.close(); }
                     if ui.add(egui::Button::new(RichText::new("Hapus berkas & data").color(DANGER)).stroke(Stroke::new(1.0, DANGER))).clicked() { acts.push(Action::Delete(true)); ui.close(); }
@@ -1377,6 +1379,11 @@ impl App {
             Action::Reveal => {
                 if let Ok(d) = self.manager.get(&id) {
                     reveal_in_explorer(&d.target_path);
+                }
+            }
+            Action::Terminal => {
+                if let Ok(d) = self.manager.get(&id) {
+                    self.open_local_terminal(terminal::terminal_dir_for(&d.target_path), None);
                 }
             }
         }
@@ -1478,6 +1485,7 @@ enum Action {
     Priority(i32),
     Delete(bool),
     Reveal,
+    Terminal,
 }
 
 // ---- add URL dialog (FR-039, FR-049) -----------------------------------------

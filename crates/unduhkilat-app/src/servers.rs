@@ -46,6 +46,7 @@ pub enum ServersMsg {
     Deleted(Result<(), String>),
     TestDone { result: Result<TestReport, unduhkilat_core::AppError> },
     Forgotten(Result<(), String>),
+    ShellReady { tab_id: u64, result: unduhkilat_core::Result<(unduhkilat_core::term::source::SourceIo, Vec<String>)> },
     HostKey { host: String, port: u16, key_type: String, fingerprint: String, reply: oneshot::Sender<bool> },
     Secret { server_name: String, kind: SecretKind, reply: oneshot::Sender<Option<String>> },
 }
@@ -323,6 +324,11 @@ impl App {
                     }
                 }
             }
+            ServersMsg::ShellReady { tab_id, result } => {
+                self.servers.host_prompt = None;
+                self.servers.secret_prompt = None;
+                self.terminal_ssh_ready(tab_id, result);
+            }
             ServersMsg::HostKey { host, port, key_type, fingerprint, reply } => self.servers.offer_host_key(host, port, key_type, fingerprint, reply),
             ServersMsg::Secret { server_name, kind, reply } => self.servers.offer_secret(server_name, kind, reply),
         }
@@ -370,6 +376,7 @@ impl App {
         let mut edit: Option<Server> = None;
         let mut delete: Option<(String, String)> = None;
         let mut cancel_test = false;
+        let mut open_term: Option<String> = None;
         let busy = self.servers.testing.is_some();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for s in &list {
@@ -405,8 +412,8 @@ impl App {
                                     test = Some(s.id.clone());
                                 }
                                 ui.add_enabled(false, egui::Button::new("Berkas")).on_disabled_hover_text("Segera hadir");
-                                if s.protocol.supports_jump() {
-                                    ui.add_enabled(false, egui::Button::new("Terminal")).on_disabled_hover_text("Segera hadir");
+                                if s.protocol.supports_jump() && ui.button("Terminal").on_hover_text("Buka shell SSH di server ini").clicked() {
+                                    open_term = Some(s.id.clone());
                                 }
                             });
                         });
@@ -423,6 +430,9 @@ impl App {
         });
         if let Some(id) = test {
             self.start_server_test(&id);
+        }
+        if let Some(id) = open_term {
+            self.open_ssh_terminal(&id);
         }
         if cancel_test {
             if let Some(t) = &self.servers.testing {

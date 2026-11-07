@@ -578,7 +578,30 @@ impl TerminalLayout {
     }
 }
 
-/// App-wide shortcuts (Ctrl+N, Delete) must not take keys the program in the terminal is meant to get.
+/// Where a terminal opens for a download: its folder, or the folder holding the file; when that is
+/// gone, the nearest folder above it that still exists.
+pub fn terminal_dir_for(target_path: &str) -> PathBuf {
+    let p = Path::new(target_path);
+    if p.is_dir() {
+        return p.to_path_buf();
+    }
+    let mut cur = p.parent();
+    while let Some(c) = cur {
+        if c.is_dir() {
+            return c.to_path_buf();
+        }
+        cur = c.parent();
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Tab title and subtitle of an SSH tab: the server, and the jump hosts it is reached through.
+pub fn ssh_tab_labels(target: &str, via: &[String]) -> (String, String) {
+    let sub = if via.is_empty() { "langsung".to_string() } else { format!("via {}", via.join(" \u{2192} ")) };
+    (target.to_string(), sub)
+}
+
+/// App-wide shortcuts (Ctrl+N, Delete)r must not take keys the program in the terminal is meant to get.
 pub fn shortcuts_enabled(screen_is_terminal: bool, terminal_focused: bool) -> bool {
     !(screen_is_terminal && terminal_focused)
 }
@@ -669,6 +692,8 @@ pub struct TermTab {
     cwd: PathBuf,
     files_dir: PathBuf,
     selected_file: Option<PathBuf>,
+    /// Cancels a connection attempt that is still in progress (SSH tabs).
+    cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Default)]
@@ -751,11 +776,72 @@ impl App {
                     files_dir: cwd.clone(),
                     cwd,
                     selected_file: None,
+                    cancel: None,
                 });
                 self.terminal.active = self.terminal.tabs.len() - 1;
                 self.screen = Screen::Terminal;
             }
             Err(e) => self.notice = Some((e.message, Instant::now())),
+        }
+    }
+
+    /// Open a tab with a shell on a saved server (SSH/SFTP), through its jump hosts. Nothing is
+    /// contacted until this is called.
+    pub fn open_ssh_terminal(&mut self, server_id: &str) {
+        let Some(server) = self.servers.servers.iter().find(|s| s.id == server_id).cloned() else { return };
+        let via: Vec<String> = server.hops.iter().map(|id| self.servers.servers.iter().find(|x| &x.id == id).map(|x| x.name.clone()).unwrap_or_else(|| "?".into())).collect();
+        let (title, sub) = ssh_tab_labels(&server.name, &via);
+        let id = self.terminal.next_id;
+        self.terminal.next_id += 1;
+        self.terminal.tabs.push(TermTab {
+            id,
+            base_title: title,
+            subtitle: sub,
+            kind: TabKind::Ssh { server_id: server.id.clone() },
+            session: None,
+            status: TabStatus::Connecting,
+            view: TerminalView::default(),
+            show_files: false,
+            cwd: PathBuf::new(),
+            files_dir: PathBuf::new(),
+            selected_file: None,
+            cancel: None,
+        });
+        self.terminal.active = self.terminal.tabs.len() - 1;
+        self.screen = Screen::Terminal;
+        self.connect_ssh_tab(id);
+    }
+
+    /// (Re)connect an SSH tab. Only ever called from a button press: no automatic reconnecting.
+    fn connect_ssh_tab(&mut self, tab_id: u64) {
+        let Some(tab) = self.terminal.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
+        let TabKind::Ssh { server_id } = tab.kind.clone() else { return };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        tab.cancel = Some(cancel.clone());
+        tab.status = TabStatus::Connecting;
+        tab.session = None;
+        let (svc, tx, ctx) = (self.manager.servers(), self.tx.clone(), self.ctx.clone());
+        let interact = Arc::new(super::servers::UiInteract { tx: tx.clone(), ctx: ctx.clone() });
+        self.rt.spawn(async move {
+            let result = svc.open_terminal(&server_id, interact, cancel, 100, 30).await;
+            let _ = tx.send(super::Msg::Servers(super::servers::ServersMsg::ShellReady { tab_id, result }));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The connection attempt of an SSH tab finished.
+    pub(super) fn terminal_ssh_ready(&mut self, tab_id: u64, result: unduhkilat_core::Result<(unduhkilat_core::term::source::SourceIo, Vec<String>)>) {
+        let Some(idx) = self.terminal.tabs.iter().position(|t| t.id == tab_id) else { return };
+        match result {
+            Ok((io, _names)) => {
+                let ctx = self.ctx.clone();
+                let session = TermSession::start(io, 100, 30, SCROLLBACK, Arc::new(move || ctx.request_repaint()), &self.rt);
+                let tab = &mut self.terminal.tabs[idx];
+                tab.session = Some(session);
+                tab.status = TabStatus::Running;
+                tab.view = TerminalView::default();
+            }
+            Err(e) => self.terminal.tabs[idx].status = TabStatus::Failed(e.message),
         }
     }
 
@@ -784,6 +870,9 @@ impl App {
 
     fn close_tab(&mut self, id: u64) {
         if let Some(i) = self.terminal.tabs.iter().position(|t| t.id == id) {
+            if let Some(c) = &self.terminal.tabs[i].cancel {
+                c.cancel();
+            }
             if let Some(s) = &self.terminal.tabs[i].session {
                 s.close();
             }
@@ -873,6 +962,10 @@ impl App {
         if let Some(text) = outcome.paste_confirm {
             self.terminal.confirm_paste = Some((id, text));
         }
+        if outcome.reconnect {
+            self.connect_ssh_tab(id);
+            return;
+        }
         if outcome.restart {
             let (kind, cwd) = match &self.terminal.tabs[idx].kind {
                 TabKind::Local(k) => (*k, self.terminal.tabs[idx].cwd.clone()),
@@ -958,6 +1051,7 @@ impl App {
 struct TabOutcome {
     paste_confirm: Option<String>,
     restart: bool,
+    reconnect: bool,
     close: bool,
 }
 
@@ -978,13 +1072,17 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, out: 
     match &tab.status {
         TabStatus::Ended(code) => {
             ui.horizontal(|ui| {
-                let text = match code {
-                    Some(c) => format!("Berakhir (kode {c})."),
-                    None => "Berakhir.".to_string(),
+                let text = match (local, code) {
+                    (false, _) => "Sambungan terputus.".to_string(),
+                    (true, Some(c)) => format!("Berakhir (kode {c})."),
+                    (true, None) => "Berakhir.".to_string(),
                 };
                 ui.label(RichText::new(text).color(DANGER));
                 if local && ui.button("Mulai ulang").clicked() {
                     out.restart = true;
+                }
+                if !local && ui.button("Sambung ulang").clicked() {
+                    out.reconnect = true;
                 }
                 if ui.button("Tutup").clicked() {
                     out.close = true;
@@ -992,10 +1090,23 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, out: 
             });
         }
         TabStatus::Failed(msg) => {
-            ui.label(RichText::new(msg).color(DANGER));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(msg).color(DANGER));
+                if ui.button("Coba lagi").clicked() {
+                    out.reconnect = true;
+                }
+                if ui.button("Tutup").clicked() {
+                    out.close = true;
+                }
+            });
         }
         TabStatus::Connecting => {
-            ui.label(RichText::new("Menghubungkan...").color(FG_SECONDARY));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Menghubungkan lewat {}...", tab.subtitle)).color(FG_SECONDARY));
+                if ui.button("Batal").clicked() {
+                    out.close = true;
+                }
+            });
         }
         TabStatus::Running => {}
     }
@@ -1245,5 +1356,26 @@ mod tests {
         let t = tab_title("Terminal", Some(&long));
         assert!(t.chars().count() <= 24 && t.ends_with('\u{2026}'), "{t}");
         assert_eq!(tab_title("T", Some("\u{4F60}\u{597D}")), "\u{4F60}\u{597D}", "multi-byte titles are cut on character boundaries");
+    }
+
+    #[test]
+    fn terminal_folder_for_a_download_is_its_parent_or_itself() {
+        let root = std::env::temp_dir().join(format!("uk-dl-{}", unique()));
+        let folder = root.join("Torrent Name");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = root.join("setup.exe");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(terminal_dir_for(file.to_str().unwrap()), root, "a single file opens its parent");
+        assert_eq!(terminal_dir_for(folder.to_str().unwrap()), folder, "a multi-file torrent folder opens itself");
+        let gone = root.join("hilang").join("a.bin");
+        assert_eq!(terminal_dir_for(gone.to_str().unwrap()), root, "a missing path falls back to the nearest folder that exists");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ssh_tab_title_names_the_route() {
+        assert_eq!(ssh_tab_labels("web-prod", &["bastion-b".to_string()]), ("web-prod".to_string(), "via bastion-b".to_string()));
+        assert_eq!(ssh_tab_labels("web-prod", &["a".to_string(), "b".to_string()]).1, "via a \u{2192} b");
+        assert_eq!(ssh_tab_labels("nas", &[]).1, "langsung");
     }
 }

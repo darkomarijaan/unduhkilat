@@ -66,6 +66,17 @@ impl ServerService {
         self.db.write(move |c| store::delete_server(c, &id)).await
     }
 
+    /// Connect through the whole chain and open an interactive shell on the target. Returns the
+    /// shell's I/O and the names of every server traversed (ending with the target).
+    pub async fn open_terminal(&self, id: &str, interact: Arc<dyn Interact>, cancel: CancellationToken, cols: u16, rows: u16) -> Result<(crate::term::source::SourceIo, Vec<String>)> {
+        let opts = ConnectOptions { proxy: (self.proxy)(), ..Default::default() };
+        let session = connect(&self.db, id, interact, opts, cancel).await?;
+        let target_id = session.target.id.clone();
+        let hop_names = self.db.read(|c| store::chain_for(c, &target_id))?.into_iter().map(|s| s.name).collect();
+        let io = crate::server::shell::open_shell(session, cols, rows).await?;
+        Ok((io, hop_names))
+    }
+
     /// Connect through the whole chain, report, and disconnect. Nothing else is done on the server.
     pub async fn test_connection(&self, id: &str, interact: Arc<dyn Interact>, cancel: CancellationToken) -> Result<TestReport> {
         let opts = ConnectOptions { proxy: (self.proxy)(), ..Default::default() };
