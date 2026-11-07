@@ -6474,7 +6474,7 @@ checksum = "214ca0b2191785cbc06209b9ca1861e048e39b5ba33574b3cedd58363d5bb5f6"
 
 [[package]]
 name = "unduhkilat-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "eframe",
  "egui_extras",
@@ -6493,7 +6493,7 @@ dependencies = [
 
 [[package]]
 name = "unduhkilat-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6524,7 +6524,7 @@ dependencies = [
 
 [[package]]
 name = "unduhkilat-host"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -6536,7 +6536,7 @@ dependencies = [
 
 [[package]]
 name = "unduhkilat-sign"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
