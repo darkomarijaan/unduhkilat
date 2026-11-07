@@ -20,6 +20,8 @@ pub enum SessionStatus {
 
 struct Inner {
     engine: Mutex<TermEngine>,
+    /// Held for the whole of one paste so pastes are sent one after another.
+    paste_gate: tokio::sync::Mutex<()>,
     control: Arc<dyn SourceControl>,
     status: Mutex<SessionStatus>,
     title: Mutex<Option<String>>,
@@ -40,6 +42,7 @@ impl TermSession {
         let SourceIo { mut rx, control } = io;
         let inner = Arc::new(Inner {
             engine: Mutex::new(TermEngine::new(cols, rows, scrollback)),
+            paste_gate: tokio::sync::Mutex::new(()),
             control,
             status: Mutex::new(SessionStatus::Running),
             title: Mutex::new(None),
@@ -101,8 +104,12 @@ impl TermSession {
     pub fn paste(&self, text: String) {
         let bracketed = self.with_engine(|e| e.modes().bracketed_paste);
         let plan = plan_paste(&text, bracketed);
-        let control = self.inner.control.clone();
+        let inner = self.inner.clone();
         self.rt.spawn(async move {
+            // One paste at a time: a second one waits, so its chunks never land inside the first's
+            // bracketed region (where its line breaks would run as commands).
+            let _turn = inner.paste_gate.lock().await;
+            let control = inner.control.clone();
             for chunk in plan.chunks {
                 if control.write(&chunk).is_err() {
                     return;
@@ -327,5 +334,17 @@ mod tests {
         assert!(r.control.closed.load(Ordering::SeqCst));
         r.tx.send(SourceEvent::Closed(None)).unwrap();
         eventually("ended", || r.session.status() == SessionStatus::Ended(None)).await;
+    }
+
+    #[tokio::test]
+    async fn two_pastes_never_interleave() {
+        let r = rig(80, 24, 100);
+        r.session.paste("a".repeat(20_000));
+        r.session.paste("b".repeat(20_000));
+        eventually("both pastes sent", || r.control.writes.lock().unwrap().len() >= 40_000).await;
+        let sent = r.control.writes.lock().unwrap().clone();
+        let last_a = sent.iter().rposition(|&c| c == b'a').unwrap();
+        let first_b = sent.iter().position(|&c| c == b'b').unwrap();
+        assert!(last_a < first_b, "the second paste waits for the first (a ends at {last_a}, b starts at {first_b})");
     }
 }

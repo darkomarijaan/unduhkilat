@@ -31,7 +31,9 @@ pub fn plan_paste(text: &str, bracketed: bool) -> PastePlan {
                 clean.push('\r');
             }
             '\n' => clean.push('\r'),
-            '\u{1b}' | '\u{80}'..='\u{9f}' => {}
+            // Escape, C1, and the other C0 controls: ^O or ^C inside pasted text would act on the
+            // program (accept a line, interrupt) even without a line break. Tab stays.
+            '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => {}
             other => clean.push(other),
         }
     }
@@ -128,5 +130,15 @@ mod tests {
     fn empty_text_plans_nothing() {
         assert!(plan_paste("", false).chunks.is_empty());
         assert!(plan_paste("", true).chunks.is_empty());
+    }
+
+    #[test]
+    fn control_characters_other_than_tab_and_newline_are_removed() {
+        // ^O accepts the line in bash, ^C interrupts, ^U kills the line, ^D ends input, BEL, BS, DEL.
+        let p = plan_paste("rm -rf ~\u{f}\u{3}\u{15}\u{4}\u{7}\u{8}\u{7f}ok\tx", false);
+        assert_eq!(joined(&p), b"rm -rf ~ok\tx");
+        assert!(!p.needs_confirm);
+        let p = plan_paste("a\u{f}\nb", true);
+        assert_eq!(joined(&p), b"\x1b[200~a\rb\x1b[201~");
     }
 }
