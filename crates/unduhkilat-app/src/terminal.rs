@@ -15,6 +15,8 @@ pub enum TermInput {
     Paste(String),
     /// Copy the selection to the clipboard.
     Copy,
+    /// Ask the system for the clipboard text; it comes back as a Paste event.
+    RequestPaste,
 }
 
 /// Keyboard state that the egui events alone do not carry.
@@ -139,6 +141,12 @@ pub fn translate_events(events: &[Event], modes: &TermModes, has_selection: bool
                 }
             }
             Event::Cut => out.push(TermInput::Bytes(vec![0x18])),
+            // Committed IME text (Chinese, Japanese, Vietnamese, the emoji panel).
+            Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_empty() => out.push(TermInput::Bytes(t.as_bytes().to_vec())),
+            // egui only turns Ctrl+C / Ctrl+V into Copy / Paste events when Shift is up; the
+            // Ctrl+Shift forms ("always copy / paste") arrive as plain keys and must not become ^C or ^V.
+            Event::Key { key: egui::Key::C, pressed: true, modifiers, .. } if modifiers.ctrl && modifiers.shift && !modifiers.alt => out.push(TermInput::Copy),
+            Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } if modifiers.ctrl && modifiers.shift && !modifiers.alt => out.push(TermInput::RequestPaste),
             Event::Key { key, pressed: true, modifiers, .. } => {
                 let Some(k) = map_key(*key, modifiers.shift) else { continue };
                 if is_text_key(&k) && !(modifiers.ctrl || modifiers.alt) {
@@ -369,6 +377,11 @@ impl TerminalView {
         if !focused {
             return None;
         }
+        // Tell Windows an IME may type here (otherwise it stays off for the whole window).
+        let area = ui.clip_rect();
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Terminal, rect: area, cursor_rect: egui::Rect::from_min_size(area.min, Vec2::new(1.0, 16.0)), should_interrupt_composition: false });
+        });
         let (events, mods, insert_down) = ui.input(|i| (i.events.clone(), i.modifiers, i.key_down(egui::Key::Insert)));
         let inputs = translate_events(&events, &snap.modes, snap.has_selection, ctrl_v_pastes, &KeyContext { mods, insert_down });
         if inputs.is_empty() {
@@ -376,7 +389,7 @@ impl TerminalView {
         }
         // These events are ours now: nothing else on screen may react to them.
         ui.input_mut(|i| {
-            i.events.retain(|e| !matches!(e, egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut | egui::Event::Key { pressed: true, .. }));
+            i.events.retain(|e| !matches!(e, egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut | egui::Event::Ime(_) | egui::Event::Key { pressed: true, .. }));
         });
         let mut confirm = None;
         for input in inputs {
@@ -398,6 +411,7 @@ impl TerminalView {
                         ui.ctx().copy_text(t);
                     }
                 }
+                TermInput::RequestPaste => ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste),
             }
         }
         confirm
@@ -419,12 +433,16 @@ impl TerminalView {
             egui::PointerButton::Secondary => Some(MouseButton::Right),
             _ => None,
         };
+        // A menu or dialog drawn over the terminal must not receive the terminal's clicks.
+        let layer = ui.layer_id();
+        let ctx = ui.ctx().clone();
+        let on_top = |p: Pos2| ctx.layer_id_at(p).map(|l| l == layer).unwrap_or(true);
         for ev in &events {
             match ev {
                 egui::Event::PointerButton { pos, button: b, pressed, .. } => {
                     let Some(mb) = button(*b) else { continue };
                     let (r, c) = cell_at(*pos);
-                    if *pressed && rect.contains(*pos) {
+                    if *pressed && rect.contains(*pos) && on_top(*pos) {
                         if report {
                             self.reporting_drag = Some(mb);
                             if let Some(bytes) = encode_mouse(&MouseEvent { kind: MouseKind::Press(mb), col: c, row: r, mods: m }, &snap.modes) {
@@ -458,7 +476,7 @@ impl TerminalView {
                 }
                 egui::Event::PointerMoved(pos) => {
                     let (r, c) = cell_at(*pos);
-                    if self.reporting_drag.is_some() || (report && rect.contains(*pos)) {
+                    if self.reporting_drag.is_some() || (report && rect.contains(*pos) && on_top(*pos)) {
                         if let Some(bytes) = encode_mouse(&MouseEvent { kind: MouseKind::Move { held: self.reporting_drag }, col: c, row: r, mods: m }, &snap.modes) {
                             session.send(bytes);
                         }
@@ -1417,5 +1435,21 @@ mod tests {
         assert!(cd_command(Cmd, r#"C:\a"&calc\x"#).is_none(), "a quote could end the argument: refuse");
         assert!(cd_command(PowerShell, "C:\\a\r\nb").is_none(), "line breaks are refused");
         assert!(cd_command(GitBash, r"C:\a").is_none() && cd_command(Wsl, r"C:\a").is_none(), "only PowerShell and CMD");
+    }
+
+    #[test]
+    fn ctrl_shift_c_and_v_arrive_as_key_events_and_never_interrupt() {
+        // egui-winit only makes Copy/Paste events for Ctrl+C/V without Shift; Ctrl+Shift+C/V are plain keys.
+        assert_eq!(tr(&[key(K::C, CTRL_SHIFT)], CTRL_SHIFT), vec![TermInput::Copy], "must not send ^C (0x03)");
+        assert_eq!(translate_events(&[key(K::C, CTRL_SHIFT)], &modes(), true, true, &ctx(CTRL_SHIFT)), vec![TermInput::Copy]);
+        assert_eq!(tr(&[key(K::V, CTRL_SHIFT)], CTRL_SHIFT), vec![TermInput::RequestPaste]);
+        assert_eq!(bytes(tr(&[key(K::C, CTRL)], CTRL)), b"\x03", "plain Ctrl+C is unchanged");
+    }
+
+    #[test]
+    fn ime_commit_becomes_text() {
+        let ev = Event::Ime(egui::ImeEvent::Commit("\u{4F60}\u{597D}".into()));
+        assert_eq!(bytes(tr(&[ev], NONE)), "\u{4F60}\u{597D}".as_bytes());
+        assert!(tr(&[Event::Ime(egui::ImeEvent::Preedit { text: "ni".into(), active_range_chars: None })], NONE).is_empty(), "composition in progress sends nothing");
     }
 }
