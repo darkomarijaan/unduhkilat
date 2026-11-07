@@ -19,6 +19,8 @@ use unduhkilat_core::engine::proxy::{ProxyConfig, ProxyMode};
 use unduhkilat_core::error::ErrorCode;
 use unduhkilat_core::server::model::{AuthMethod, NewServer, Protocol, Server};
 use unduhkilat_core::server::secrets::{self, SecretKind, SecretString};
+use unduhkilat_core::server::secrets::NewServerSecrets;
+use unduhkilat_core::server::service::ServerService;
 use unduhkilat_core::server::ssh::{connect, ConnectOptions, Interact};
 use unduhkilat_core::server::store;
 
@@ -397,4 +399,75 @@ async fn wrong_password_error_never_contains_the_password() {
     assert_eq!(e.code, ErrorCode::ErrSshAuthFailed, "{e}");
     let everything = format!("{e} {e:?} {}", String::from_utf8_lossy(&buf.0.lock().unwrap()));
     assert!(!everything.contains("s3cr3t-XYZ"), "the password leaked into the error or the log: {everything}");
+}
+
+// ---- ServerService ----------------------------------------------------------------------------
+
+fn service(env: &Env) -> ServerService {
+    ServerService::new(env.db.clone(), Arc::new(|| ProxyConfig { mode: ProxyMode::Direct, ..Default::default() }))
+}
+
+fn new_server(name: &str, ssh: &TestSsh, save_secret: bool, hops: Vec<String>) -> NewServer {
+    NewServer { name: name.into(), protocol: Protocol::Ssh, host: "127.0.0.1".into(), port: Some(ssh.addr.port()), username: "eko".into(), auth: AuthMethod::Password, key_path: None, save_secret, hops }
+}
+
+fn password(p: &str) -> NewServerSecrets {
+    NewServerSecrets { password: Some(SecretString::from(p)), passphrase: None }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn service_saves_lists_tests_and_deletes() {
+    let env = env();
+    let svc = service(&env);
+    let b = TestSsh::start(pw_server("eko", "pb", true)).await;
+    let a = TestSsh::start(pw_server("eko", "pa", false)).await;
+    let bastion = svc.save(None, new_server("B", &b, true, vec![]), password("pb")).await.unwrap();
+    let prod = svc.save(None, new_server("A", &a, true, vec![bastion.id.clone()]), password("pa")).await.unwrap();
+
+    let names: Vec<String> = svc.list().await.unwrap().into_iter().map(|s| s.name).collect();
+    assert_eq!(names, ["A", "B"]);
+
+    let report = svc.test_connection(&prod.id, Fake::new(true), CancellationToken::new()).await.expect("test connection works");
+    assert_eq!(report.hop_names, ["B", "A"]);
+    assert_eq!((b.login_count(), a.login_count()), (1, 1));
+
+    assert_eq!(svc.delete(&bastion.id).await.unwrap_err().code, ErrorCode::ErrServerInUse, "B is still a hop of A");
+    svc.delete(&prod.id).await.unwrap();
+    svc.delete(&bastion.id).await.unwrap();
+    assert!(svc.list().await.unwrap().is_empty());
+    assert_eq!(env.secret_rows(), 0, "deleting a server removes its saved secrets");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secrets_follow_the_save_secret_switch() {
+    let env = env();
+    let svc = service(&env);
+    let ssh = TestSsh::start(pw_server("eko", "pw", false)).await;
+
+    let s = svc.save(None, new_server("web", &ssh, false, vec![]), password("pw")).await.unwrap();
+    assert_eq!(env.secret_rows(), 0, "save_secret off: the typed password is not persisted");
+
+    let s = svc.save(Some(s.id.clone()), new_server("web", &ssh, true, vec![]), password("pw")).await.unwrap();
+    assert_eq!(env.secret_rows(), 1, "save_secret on: it is persisted");
+
+    svc.save(Some(s.id.clone()), new_server("web", &ssh, true, vec![]), NewServerSecrets::default()).await.unwrap();
+    assert_eq!(env.secret_rows(), 1, "no new secret typed: the saved one is kept");
+
+    svc.save(Some(s.id.clone()), new_server("web", &ssh, false, vec![]), NewServerSecrets::default()).await.unwrap();
+    assert_eq!(env.secret_rows(), 0, "turning save_secret off wipes the saved secrets");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forgetting_a_host_key_makes_the_next_connection_ask_again() {
+    let env = env();
+    let svc = service(&env);
+    let ssh = TestSsh::start(pw_server("eko", "pw", false)).await;
+    let s = svc.save(None, new_server("web", &ssh, true, vec![]), password("pw")).await.unwrap();
+    let fake = Fake::new(true);
+    svc.test_connection(&s.id, fake.clone(), CancellationToken::new()).await.unwrap();
+    svc.test_connection(&s.id, fake.clone(), CancellationToken::new()).await.unwrap();
+    assert_eq!(fake.key_asks.load(Ordering::SeqCst), 1);
+    svc.forget_host_key("127.0.0.1", ssh.addr.port()).await.unwrap();
+    svc.test_connection(&s.id, fake.clone(), CancellationToken::new()).await.unwrap();
+    assert_eq!(fake.key_asks.load(Ordering::SeqCst), 2, "asked again after forgetting");
 }

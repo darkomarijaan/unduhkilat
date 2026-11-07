@@ -5,3 +5,4 @@ pub mod store;
 pub mod secrets;
 pub mod hostkeys;
 pub mod ssh;
+pub mod service;

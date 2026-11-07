@@ -109,6 +109,12 @@ impl Manager {
         self.inner.ctx.proxy()
     }
 
+    /// Saved servers (SSH/SFTP/FTP/FTPS). Connections follow the proxy settings in force when they start.
+    pub fn servers(&self) -> crate::server::service::ServerService {
+        let m = self.clone();
+        crate::server::service::ServerService::new(self.db().clone(), std::sync::Arc::new(move || m.proxy_config()))
+    }
+
     /// Persist and apply new proxy settings. Transfers started afterwards use them;
     /// ones already running keep their connections.
     pub async fn set_proxy(&self, cfg: ProxyConfig) -> Result<()> {
