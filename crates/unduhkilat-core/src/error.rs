@@ -49,6 +49,12 @@ pub enum ErrorCode {
     ErrTooManyHops,
     /// The server is referenced by another (as a jump host) and cannot be deleted.
     ErrServerInUse,
+    /// A remote file operation (list, rename, delete, read, write) failed on the server.
+    ErrRemoteFs,
+    /// The file is larger than the preview limit.
+    ErrPreviewTooLarge,
+    /// The file type or content cannot be previewed.
+    ErrPreviewUnsupported,
 }
 
 impl ErrorCode {
@@ -90,6 +96,9 @@ impl ErrorCode {
             ErrCredentialUnreadable => "ERR_CREDENTIAL_UNREADABLE",
             ErrTooManyHops => "ERR_TOO_MANY_HOPS",
             ErrServerInUse => "ERR_SERVER_IN_USE",
+            ErrRemoteFs => "ERR_REMOTE_FS",
+            ErrPreviewTooLarge => "ERR_PREVIEW_TOO_LARGE",
+            ErrPreviewUnsupported => "ERR_PREVIEW_UNSUPPORTED",
         }
     }
 }
@@ -184,6 +193,9 @@ mod tests {
             (ErrCredentialUnreadable, "ERR_CREDENTIAL_UNREADABLE"),
             (ErrTooManyHops, "ERR_TOO_MANY_HOPS"),
             (ErrServerInUse, "ERR_SERVER_IN_USE"),
+            (ErrRemoteFs, "ERR_REMOTE_FS"),
+            (ErrPreviewTooLarge, "ERR_PREVIEW_TOO_LARGE"),
+            (ErrPreviewUnsupported, "ERR_PREVIEW_UNSUPPORTED"),
         ];
         for (code, text) in cases {
             assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{text}\""));

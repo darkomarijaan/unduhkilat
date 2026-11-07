@@ -1,0 +1,145 @@
+//! Remote file systems behind one interface: SFTP, FTP and FTPS (design: docs/superpowers/specs/2026-11-07-server-client-design.md).
+
+use crate::error::Result;
+use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// One item of a remote directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// Seconds since the Unix epoch, when the server reports it.
+    pub modified: Option<i64>,
+    pub is_link: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Size,
+    Modified,
+}
+
+pub type RemoteReader = Box<dyn AsyncRead + Send + Unpin>;
+pub type RemoteWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
+#[async_trait]
+pub trait RemoteFs: Send {
+    async fn list(&mut self, dir: &str) -> Result<Vec<Entry>>;
+    async fn stat(&mut self, path: &str) -> Result<Entry>;
+    async fn mkdir(&mut self, path: &str) -> Result<()>;
+    async fn rename(&mut self, from: &str, to: &str) -> Result<()>;
+    async fn remove(&mut self, path: &str, is_dir: bool) -> Result<()>;
+    /// Up to `len` bytes starting at `offset` (fewer at the end of the file).
+    async fn read_at(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>>;
+    /// Stream a file from `offset`.
+    async fn open_read(&mut self, path: &str, offset: u64) -> Result<RemoteReader>;
+    /// Write a file. `offset == 0 && !append` truncates; `append` continues at the end (resume).
+    async fn open_write(&mut self, path: &str, offset: u64, append: bool) -> Result<RemoteWriter>;
+    /// Home or starting directory of the login.
+    async fn home(&mut self) -> Result<String>;
+    async fn close(self: Box<Self>);
+}
+
+fn is_reserved_device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit() && stem.as_bytes()[3] != b'0')
+}
+
+/// A file name from a server made safe to create inside a local folder: no separators, no drive
+/// letters, no device names, and short. `None` when nothing safe can be made of it.
+pub fn safe_local_name(remote_name: &str) -> Option<String> {
+    // `\u{5c}` is the backslash; control characters (including NUL) are refused too.
+    if remote_name.chars().any(|c| matches!(c, '/' | '\u{5c}' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()) {
+        return None;
+    }
+    let trimmed = remote_name.trim_end_matches(['.', ' ']);
+    if trimmed.trim().is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    let mut name: String = trimmed.chars().take(200).collect();
+    if is_reserved_device(&name) {
+        name.insert(0, '_');
+    }
+    Some(name)
+}
+
+/// Folders first, then by `key`; ties by name (case-insensitive).
+pub fn sort_entries(v: &mut [Entry], key: SortKey, ascending: bool) {
+    v.sort_by(|a, b| {
+        let primary = match key {
+            SortKey::Name => std::cmp::Ordering::Equal,
+            SortKey::Size => a.size.cmp(&b.size),
+            SortKey::Modified => a.modified.cmp(&b.modified),
+        };
+        let primary = if ascending { primary } else { primary.reverse() };
+        let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+        // Name sorting honours the direction itself; other keys fall back to ascending names.
+        let by_name = if key == SortKey::Name && !ascending { by_name.reverse() } else { by_name };
+        b.is_dir.cmp(&a.is_dir).then(primary).then(by_name)
+    });
+}
+
+pub fn join_remote(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+pub fn parent_remote(path: &str) -> String {
+    let t = path.trim_end_matches('/');
+    match t.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(i) => t[..i].to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(name: &str, dir: bool, size: u64) -> Entry {
+        Entry { name: name.into(), path: format!("/x/{name}"), is_dir: dir, size, modified: None, is_link: false }
+    }
+
+    #[test]
+    fn safe_local_name_rejects_traversal() {
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b", "C:evil", "  "] {
+            assert!(safe_local_name(bad).is_none(), "{bad:?} must be refused");
+        }
+        assert_eq!(safe_local_name("laporan 2026.pdf").as_deref(), Some("laporan 2026.pdf"));
+        assert_eq!(safe_local_name("\u{4F60}\u{597D}.txt").as_deref(), Some("\u{4F60}\u{597D}.txt"));
+        let long = "\u{4F60}".repeat(300);
+        let cut = safe_local_name(&long).unwrap();
+        assert!(cut.chars().count() <= 200 && cut.chars().all(|c| c == '\u{4F60}'), "cut on a character boundary");
+        assert_eq!(safe_local_name("con.txt").as_deref(), Some("_con.txt"), "reserved Windows device names are prefixed");
+        assert_eq!(safe_local_name("a.txt. ").as_deref(), Some("a.txt"), "trailing dots and spaces are dropped on Windows");
+    }
+
+    #[test]
+    fn sort_puts_folders_first_and_is_case_insensitive() {
+        let mut v = vec![e("b.txt", false, 5), e("Zeta", true, 0), e("a.txt", false, 9), e("alpha", true, 0)];
+        sort_entries(&mut v, SortKey::Name, true);
+        assert_eq!(v.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["alpha", "Zeta", "a.txt", "b.txt"]);
+        sort_entries(&mut v, SortKey::Size, false);
+        assert_eq!(v.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["alpha", "Zeta", "a.txt", "b.txt"].map(|s| s), "folders stay first; larger files first");
+    }
+
+    #[test]
+    fn join_remote_handles_root_and_trailing_slash() {
+        assert_eq!(join_remote("/", "a"), "/a");
+        assert_eq!(join_remote("/home/x/", "a b"), "/home/x/a b");
+        assert_eq!(join_remote("", "a"), "a");
+        assert_eq!(parent_remote("/home/x/a"), "/home/x");
+        assert_eq!(parent_remote("/a"), "/");
+        assert_eq!(parent_remote("/"), "/");
+    }
+}

@@ -7,3 +7,4 @@ pub mod hostkeys;
 pub mod ssh;
 pub mod service;
 pub mod shell;
+pub mod fs;
