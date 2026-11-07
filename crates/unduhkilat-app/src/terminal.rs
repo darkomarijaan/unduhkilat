@@ -611,4 +611,56 @@ mod tests {
         let up = Event::Key { key: K::A, physical_key: None, pressed: false, repeat: false, modifiers: NONE };
         assert!(tr(&[up], NONE).is_empty());
     }
+
+    #[test]
+    fn layout_setting_parses_and_defaults_to_a() {
+        assert_eq!(TerminalLayout::from_setting(None), TerminalLayout::A);
+        assert_eq!(TerminalLayout::from_setting(Some("b")), TerminalLayout::B);
+        assert_eq!(TerminalLayout::from_setting(Some("B")), TerminalLayout::B);
+        assert_eq!(TerminalLayout::from_setting(Some("x")), TerminalLayout::A);
+        assert_eq!(TerminalLayout::B.as_setting(), "b");
+        assert_eq!(TerminalLayout::A.as_setting(), "a");
+    }
+
+    #[test]
+    fn app_shortcuts_are_off_only_while_the_terminal_has_focus() {
+        assert!(shortcuts_enabled(false, true), "on other screens the shortcuts work");
+        assert!(shortcuts_enabled(true, false), "terminal screen but focus is elsewhere (e.g. a dialog)");
+        assert!(!shortcuts_enabled(true, true), "Ctrl+N and Delete belong to the program while the terminal is focused");
+    }
+
+    #[test]
+    fn font_size_setting_is_clamped_and_defaults() {
+        assert_eq!(font_size_from_setting(None), 13.0);
+        assert_eq!(font_size_from_setting(Some("abc")), 13.0);
+        assert_eq!(font_size_from_setting(Some("5")), 8.0);
+        assert_eq!(font_size_from_setting(Some("99")), 32.0);
+        assert_eq!(font_size_from_setting(Some("14.5")), 14.5);
+    }
+
+    #[test]
+    fn start_folder_falls_back_to_downloads() {
+        let home = std::env::temp_dir().join(format!("uk-home-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(home.join("Downloads")).unwrap();
+        let real = std::env::temp_dir().join(format!("uk-start-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&real).unwrap();
+        assert_eq!(start_dir(Some(real.to_str().unwrap()), Some(&home)), real, "an existing folder setting is used");
+        assert_eq!(start_dir(Some("C:\\folder\\yang\\tidak\\ada"), Some(&home)), home.join("Downloads"), "a missing folder falls back");
+        assert_eq!(start_dir(None, Some(&home)), home.join("Downloads"));
+        assert_eq!(start_dir(Some("  "), Some(&home)), home.join("Downloads"), "blank means default");
+        assert_eq!(start_dir(None, None), std::env::current_dir().unwrap(), "no home: the working folder");
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_dir_all(real).ok();
+    }
+
+    #[test]
+    fn tab_title_prefers_the_program_title_but_stays_short() {
+        assert_eq!(tab_title("Terminal", None), "Terminal");
+        assert_eq!(tab_title("Terminal", Some("")), "Terminal");
+        assert_eq!(tab_title("Terminal", Some("vim notes.txt")), "vim notes.txt");
+        let long = "x".repeat(60);
+        let t = tab_title("Terminal", Some(&long));
+        assert!(t.chars().count() <= 24 && t.ends_with('\u{2026}'), "{t}");
+        assert_eq!(tab_title("T", Some("\u{4F60}\u{597D}")), "\u{4F60}\u{597D}", "multi-byte titles are cut on character boundaries");
+    }
 }

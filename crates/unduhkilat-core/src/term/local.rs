@@ -5,7 +5,7 @@ use crate::term::source::{SourceControl, SourceEvent, SourceIo};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,6 +14,37 @@ pub enum ShellKind {
     Cmd,
     GitBash,
     Wsl,
+}
+
+impl ShellKind {
+    /// Value stored in the settings table.
+    pub fn as_setting(&self) -> &'static str {
+        match self {
+            ShellKind::PowerShell => "powershell",
+            ShellKind::Cmd => "cmd",
+            ShellKind::GitBash => "gitbash",
+            ShellKind::Wsl => "wsl",
+        }
+    }
+
+    /// PowerShell when the setting is missing or unknown.
+    pub fn from_setting(value: Option<&str>) -> ShellKind {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("cmd") => ShellKind::Cmd,
+            Some("gitbash") => ShellKind::GitBash,
+            Some("wsl") => ShellKind::Wsl,
+            _ => ShellKind::PowerShell,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ShellKind::PowerShell => "PowerShell",
+            ShellKind::Cmd => "CMD",
+            ShellKind::GitBash => "Git Bash",
+            ShellKind::Wsl => "WSL",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,10 +114,29 @@ fn command_for(kind: ShellKind, cwd: &Path) -> Result<CommandBuilder> {
     Ok(cmd)
 }
 
+type SharedChild = Mutex<Box<dyn Child + Send + Sync>>;
+
+/// Every shell started by this process, so quitting the app can stop them all (`process::exit` does
+/// not run destructors).
+fn live() -> &'static Mutex<Vec<Weak<SharedChild>>> {
+    static LIVE: OnceLock<Mutex<Vec<Weak<SharedChild>>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Stop every local shell this process started. Call before the app exits.
+pub fn kill_all_local() {
+    let all: Vec<Weak<SharedChild>> = live().lock().unwrap().drain(..).collect();
+    for w in all {
+        if let Some(c) = w.upgrade() {
+            let _ = c.lock().unwrap().kill();
+        }
+    }
+}
+
 struct LocalControl {
     writer: Mutex<Box<dyn Write + Send>>,
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
-    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    child: Arc<SharedChild>,
 }
 
 fn gone() -> AppError {
@@ -133,6 +183,11 @@ pub fn spawn_local(opts: ShellOptions) -> Result<SourceIo> {
 
     let master = Arc::new(Mutex::new(Some(pair.master)));
     let child = Arc::new(Mutex::new(child));
+    {
+        let mut l = live().lock().unwrap();
+        l.retain(|w| w.strong_count() > 0);
+        l.push(Arc::downgrade(&child));
+    }
     let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -180,4 +235,26 @@ pub fn spawn_local(opts: ShellOptions) -> Result<SourceIo> {
     });
 
     Ok(SourceIo { rx, control: Arc::new(LocalControl { writer: Mutex::new(writer), master, child }) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_setting_round_trips_and_falls_back_to_powershell() {
+        for k in [ShellKind::PowerShell, ShellKind::Cmd, ShellKind::GitBash, ShellKind::Wsl] {
+            assert_eq!(ShellKind::from_setting(Some(k.as_setting())), k);
+        }
+        assert_eq!(ShellKind::from_setting(None), ShellKind::PowerShell, "not set");
+        assert_eq!(ShellKind::from_setting(Some("")), ShellKind::PowerShell);
+        assert_eq!(ShellKind::from_setting(Some("fish")), ShellKind::PowerShell, "unknown value");
+        assert_eq!(ShellKind::from_setting(Some("CMD")), ShellKind::Cmd, "case does not matter");
+    }
+
+    #[test]
+    fn labels_are_human_readable() {
+        assert_eq!(ShellKind::PowerShell.label(), "PowerShell");
+        assert_eq!(ShellKind::GitBash.label(), "Git Bash");
+    }
 }
