@@ -1,0 +1,183 @@
+//! Local shells through the Windows pseudo console (ConPTY). No SSH, no network.
+
+use crate::error::{AppError, ErrorCode, Result};
+use crate::term::source::{SourceControl, SourceEvent, SourceIo};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShellKind {
+    PowerShell,
+    Cmd,
+    GitBash,
+    Wsl,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShellOptions {
+    pub kind: ShellKind,
+    /// Starting folder. Must exist.
+    pub cwd: PathBuf,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+fn git_bash_path() -> Option<PathBuf> {
+    let candidates = [
+        std::env::var_os("ProgramFiles").map(|p| PathBuf::from(p).join("Git").join("bin").join("bash.exe")),
+        std::env::var_os("ProgramFiles(x86)").map(|p| PathBuf::from(p).join("Git").join("bin").join("bash.exe")),
+        std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Programs").join("Git").join("bin").join("bash.exe")),
+    ];
+    candidates.into_iter().flatten().find(|p| p.is_file())
+}
+
+fn wsl_path() -> Option<PathBuf> {
+    std::env::var_os("SystemRoot").map(|p| PathBuf::from(p).join("System32").join("wsl.exe")).filter(|p| p.is_file())
+}
+
+/// Shells that can be opened on this computer. PowerShell and CMD always; Git Bash and WSL when found.
+pub fn detect_shells() -> Vec<ShellKind> {
+    let mut v = vec![ShellKind::PowerShell, ShellKind::Cmd];
+    if git_bash_path().is_some() {
+        v.push(ShellKind::GitBash);
+    }
+    if wsl_path().is_some() {
+        v.push(ShellKind::Wsl);
+    }
+    v
+}
+
+fn command_for(kind: ShellKind, cwd: &Path) -> Result<CommandBuilder> {
+    let mut cmd = match kind {
+        ShellKind::PowerShell => {
+            let mut c = CommandBuilder::new("powershell.exe");
+            c.arg("-NoLogo");
+            c.cwd(cwd);
+            c
+        }
+        ShellKind::Cmd => {
+            let mut c = CommandBuilder::new("cmd.exe");
+            c.cwd(cwd);
+            c
+        }
+        ShellKind::GitBash => {
+            let bash = git_bash_path().ok_or_else(|| AppError::new(ErrorCode::ErrFileNotFound, "Git Bash tidak ditemukan di komputer ini."))?;
+            let mut c = CommandBuilder::new(bash);
+            c.args(["--login", "-i"]);
+            c.cwd(cwd);
+            c
+        }
+        ShellKind::Wsl => {
+            let wsl = wsl_path().ok_or_else(|| AppError::new(ErrorCode::ErrFileNotFound, "WSL tidak ditemukan di komputer ini."))?;
+            let mut c = CommandBuilder::new(wsl);
+            c.arg("--cd");
+            c.arg(cwd);
+            c
+        }
+    };
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    Ok(cmd)
+}
+
+struct LocalControl {
+    writer: Mutex<Box<dyn Write + Send>>,
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+}
+
+fn gone() -> AppError {
+    AppError::new(ErrorCode::ErrConnectionDropped, "Terminal sudah tertutup.")
+}
+
+impl SourceControl for LocalControl {
+    fn write(&self, bytes: &[u8]) -> Result<()> {
+        let mut w = self.writer.lock().unwrap();
+        w.write_all(bytes).and_then(|_| w.flush()).map_err(|_| gone())
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        match self.master.lock().unwrap().as_ref() {
+            Some(m) => m.resize(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 }).map_err(|_| gone()),
+            None => Err(gone()),
+        }
+    }
+
+    fn close(&self) {
+        let _ = self.child.lock().unwrap().kill();
+    }
+}
+
+impl Drop for LocalControl {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Start a shell in `opts.cwd` and return its byte stream and controls. Dropping the returned control
+/// (or calling `close`) stops the shell.
+pub fn spawn_local(opts: ShellOptions) -> Result<SourceIo> {
+    if !opts.cwd.is_dir() {
+        return Err(AppError::new(ErrorCode::ErrInvalidPath, format!("Folder tidak ditemukan: {}", opts.cwd.display())));
+    }
+    let size = PtySize { rows: opts.rows.max(1), cols: opts.cols.max(1), pixel_width: 0, pixel_height: 0 };
+    let start_failed = |e: &dyn std::fmt::Display| AppError::internal(format!("Tidak bisa menjalankan terminal (butuh Windows 10 versi 1809 atau lebih baru): {e}"));
+    let pair = native_pty_system().openpty(size).map_err(|e| start_failed(&e))?;
+    let child = pair.slave.spawn_command(command_for(opts.kind, &opts.cwd)?).map_err(|e| start_failed(&e))?;
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().map_err(|e| start_failed(&e))?;
+    let writer = pair.master.take_writer().map_err(|e| start_failed(&e))?;
+
+    let master = Arc::new(Mutex::new(Some(pair.master)));
+    let child = Arc::new(Mutex::new(child));
+    let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Output: ends when the pseudo console closes.
+    let (tx_r, code_r) = (tx.clone(), exit_code.clone());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx_r.send(SourceEvent::Data(buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        // The watcher publishes the exit code just before it closes the console; give it a moment.
+        let until = Instant::now() + Duration::from_secs(2);
+        let mut code = *code_r.lock().unwrap();
+        while code.is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            code = *code_r.lock().unwrap();
+        }
+        let _ = tx_r.send(SourceEvent::Closed(code));
+    });
+
+    // Exit watcher: ConPTY keeps the output pipe open after the shell exits, so closing it is our job.
+    let (child_w, master_w, code_w) = (child.clone(), master.clone(), exit_code);
+    std::thread::spawn(move || loop {
+        let status = child_w.lock().unwrap().try_wait();
+        match status {
+            Ok(Some(st)) => {
+                *code_w.lock().unwrap() = Some(st.exit_code() as i32);
+                std::thread::sleep(Duration::from_millis(200)); // let the last output drain
+                master_w.lock().unwrap().take();
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => {
+                master_w.lock().unwrap().take();
+                return;
+            }
+        }
+    });
+
+    Ok(SourceIo { rx, control: Arc::new(LocalControl { writer: Mutex::new(writer), master, child }) })
+}
