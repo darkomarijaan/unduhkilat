@@ -553,6 +553,11 @@ pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 const SCROLLBACK: usize = 10_000;
 const MAX_FILES: usize = 2000;
 
+/// Preview size limit in MB (default 25, 1 to 500).
+pub fn preview_mb_from_setting(v: Option<&str>) -> u32 {
+    v.and_then(|s| s.trim().parse::<u32>().ok()).map(|n| n.clamp(1, 500)).unwrap_or(25)
+}
+
 pub fn font_size_from_setting(v: Option<&str>) -> f32 {
     v.and_then(|s| s.trim().parse::<f32>().ok()).filter(|x| x.is_finite()).map(|x| x.clamp(8.0, 32.0)).unwrap_or(DEFAULT_FONT_SIZE)
 }
@@ -658,6 +663,8 @@ pub struct TermSettings {
     pub font_size: f32,
     pub ctrl_v_pastes: bool,
     pub layout: TerminalLayout,
+    /// Largest file the server preview fetches whole, in MB.
+    pub preview_max_mb: u32,
 }
 
 impl TermSettings {
@@ -669,6 +676,7 @@ impl TermSettings {
             font_size: font_size_from_setting(get(keys::TERMINAL_FONT_SIZE).as_deref()),
             ctrl_v_pastes: get(keys::TERMINAL_CTRL_V_PASTES).map(|v| v != "0").unwrap_or(true),
             layout: TerminalLayout::from_setting(get(keys::TERMINAL_LAYOUT).as_deref()),
+            preview_max_mb: preview_mb_from_setting(get(keys::PREVIEW_MAX_MB).as_deref()),
         }
     }
 }
@@ -679,6 +687,7 @@ impl TermSettings {
         set(keys::TERMINAL_START_DIR, &self.start_dir.display().to_string())?;
         set(keys::TERMINAL_FONT_SIZE, &self.font_size.to_string())?;
         set(keys::TERMINAL_CTRL_V_PASTES, if self.ctrl_v_pastes { "1" } else { "0" })?;
+        set(keys::PREVIEW_MAX_MB, &self.preview_max_mb.to_string())?;
         set(keys::TERMINAL_LAYOUT, self.layout.as_setting())
     }
 }
@@ -703,6 +712,10 @@ pub fn settings_ui(ui: &mut egui::Ui, s: &mut TermSettings) {
     ui.add(egui::Slider::new(&mut s.font_size, 8.0..=32.0).step_by(0.5));
     ui.add_space(8.0);
     ui.checkbox(&mut s.ctrl_v_pastes, "Ctrl+V menempel teks (Ctrl+C menyalin bila ada teks terpilih)");
+    ui.add_space(8.0);
+    ui.label(RichText::new("Batas pratinjau berkas server (MB)").font(theme::bold(13.0)));
+    ui.add(egui::DragValue::new(&mut s.preview_max_mb).range(1..=500).suffix(" MB"));
+    ui.label(RichText::new("Gambar, PDF, dan dokumen lebih besar dari ini tidak diambil; gunakan Unduh atau Buka di aplikasi Windows. Teks hanya dibaca bagian awalnya.").color(FG_SECONDARY));
     ui.add_space(8.0);
     ui.label(RichText::new("Tata letak").font(theme::bold(13.0)));
     ui.radio_value(&mut s.layout, TerminalLayout::A, "A: Terminal dan Berkas bergantian");
@@ -1580,5 +1593,14 @@ mod tests {
         let local = KeyContext { alt_v_image: false, ..ssh };
         assert_eq!(bytes(translate_events(&[key(K::V, ALT)], &modes(), false, true, &local)), b"\x1bv", "elsewhere Alt+V still reaches the program");
         assert!(!translate_events(&[key(K::V, CTRL)], &modes(), false, true, &ssh).contains(&TermInput::PasteImage), "Ctrl+V is not Alt+V");
+    }
+
+    #[test]
+    fn preview_limit_setting_is_clamped_and_defaults() {
+        assert_eq!(preview_mb_from_setting(None), 25);
+        assert_eq!(preview_mb_from_setting(Some("abc")), 25);
+        assert_eq!(preview_mb_from_setting(Some("0")), 1);
+        assert_eq!(preview_mb_from_setting(Some("9999")), 500);
+        assert_eq!(preview_mb_from_setting(Some(" 40 ")), 40);
     }
 }
