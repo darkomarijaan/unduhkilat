@@ -1334,7 +1334,11 @@ impl App {
                 ui.label(RichText::new("Tentukan parameter segmen koneksi, kategori berkas, dan folder tujuan.").color(FG_SECONDARY));
                 ui.add_space(8.0);
                 ui.label("Tautan Sumber (HTTP/HTTPS/FTP/magnet):");
-                ui.add(egui::TextEdit::multiline(&mut a.urls).desired_rows(3).desired_width(f32::INFINITY).font(theme::mono(12.0)).hint_text("Satu tautan per baris, atau tautan magnet:?xt=..."));
+                let urls_edit = ui.add(egui::TextEdit::multiline(&mut a.urls).desired_rows(3).desired_width(f32::INFINITY).font(theme::mono(12.0)).hint_text("Satu tautan per baris, atau tautan magnet:?xt=..."));
+                // With nothing focused, Ctrl+V reached no widget: focus the link box so paste works at once.
+                if ctx.memory(|m| m.focused().is_none()) {
+                    urls_edit.request_focus();
+                }
                 let urls: Vec<String> = a.urls.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
                 ui.horizontal(|ui| {
                     let probe_clicked = ui.add_enabled(urls.len() == 1 && a.torrent_file.is_none(), egui::Button::new("Periksa")).clicked();

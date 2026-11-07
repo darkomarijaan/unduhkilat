@@ -2,7 +2,7 @@
 
 Manajer unduhan berkecepatan tinggi untuk Windows 10/11 (x64), ditulis dengan Rust. Portabel (cukup ZIP, tanpa instalasi), tanpa telemetri, dan tidak pernah memulai atau menimpa berkas tanpa konfirmasi Anda.
 
-> **Status: pra-rilis (0.1.1).** Mesin unduhan, torrent, ekstensi browser, dan antarmuka sudah berfungsi dan teruji, tetapi beberapa bagian belum diuji di lingkungan nyata. Lihat [Status](#status) sebelum memakainya untuk hal penting. Binari belum ditandatangani kode, jadi Windows SmartScreen mungkin memperingatkan saat pertama dijalankan.
+> **Status: pra-rilis (0.1.2).** Mesin unduhan, torrent, ekstensi browser, dan antarmuka sudah berfungsi dan teruji, tetapi beberapa bagian belum diuji di lingkungan nyata. Lihat [Status](#status) sebelum memakainya untuk hal penting. Binari belum ditandatangani kode, jadi Windows SmartScreen mungkin memperingatkan saat pertama dijalankan.
 
 ## Fitur
 
