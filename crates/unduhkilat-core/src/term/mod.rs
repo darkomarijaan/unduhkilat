@@ -6,3 +6,4 @@ pub mod mouse;
 pub mod paste;
 pub mod source;
 pub mod local;
+pub mod session;
