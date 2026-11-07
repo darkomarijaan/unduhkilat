@@ -17,7 +17,6 @@ use unduhkilat_core::db::Db;
 use unduhkilat_core::engine::manager::Manager;
 
 pub mod ftp_proxy;
-pub mod ssh_server;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {

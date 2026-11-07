@@ -1,9 +1,11 @@
 //! Server (SSH) integration tests. Every SSH server runs in-process on loopback:
 //! nothing here touches the internet.
 
-mod common;
+// Not part of `common/mod.rs`: other crates share that module and do not depend on russh.
+#[path = "common/ssh_server.rs"]
+mod ssh_server;
 
-use common::ssh_server::{test_keypair, TestCred, TestSsh, TestSshConfig};
+use ssh_server::{test_keypair, TestCred, TestSsh, TestSshConfig};
 use futures_util::future::BoxFuture;
 use russh::client;
 use russh::keys::PublicKeyOrCertificate;
