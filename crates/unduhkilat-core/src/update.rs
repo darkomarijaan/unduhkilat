@@ -19,6 +19,11 @@ use std::path::{Path, PathBuf};
 pub const PUBLIC_KEY_B64: &str = "GKf5Qxn7KInpvO/Msh7Fty6AapLKT7ANaSJVA351lxk=";
 const RELEASES_URL: &str = "https://api.github.com/repos/darkomarijaan/unduhkilat/releases?per_page=20";
 const DOWNLOAD_PREFIX: &str = "https://github.com/darkomarijaan/unduhkilat/releases/download/";
+/// The same files through the GitHub API. Tried first: when the release page's download links
+/// answer 504 at GitHub's edge, the API still serves them.
+const API_ASSET_PREFIX: &str = "https://api.github.com/repos/darkomarijaan/unduhkilat/releases/assets/";
+/// Attempts per source; GitHub's transient 5xx answers usually pass within seconds.
+const ATTEMPTS: u32 = 3;
 /// Hard cap on what we are willing to download as an update.
 const MAX_ZIP_BYTES: u64 = 200 * 1024 * 1024;
 
@@ -29,8 +34,9 @@ const HOST_EXE: &str = "unduhkilat-host.exe";
 pub struct UpdateInfo {
     pub version: String,
     pub notes: String,
-    pub zip_url: String,
-    pub sig_url: String,
+    /// Where to fetch the zip, in order of preference (API first, release page as fallback).
+    pub zip_sources: Vec<String>,
+    pub sig_sources: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +54,20 @@ struct GhRelease {
 struct GhAsset {
     name: String,
     browser_download_url: String,
+    /// API URL of the asset (`.../releases/assets/<id>`).
+    #[serde(default)]
+    url: String,
+}
+
+impl GhAsset {
+    fn sources(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if self.url.starts_with(API_ASSET_PREFIX) {
+            v.push(self.url.clone());
+        }
+        v.push(self.browser_download_url.clone());
+        v
+    }
 }
 
 /// `v0.1.3` / `0.1.3` -> (0, 1, 3). Anything else is not a version we understand.
@@ -92,8 +112,8 @@ fn pick_update(releases: Vec<GhRelease>, cur: (u64, u64, u64)) -> Option<UpdateI
             let info = UpdateInfo {
                 version: r.tag_name.trim_start_matches('v').to_string(),
                 notes: r.body.clone().unwrap_or_default(),
-                zip_url: zip.browser_download_url.clone(),
-                sig_url: sig.browser_download_url.clone(),
+                zip_sources: zip.sources(),
+                sig_sources: sig.sources(),
             };
             Some((v, info))
         })
@@ -114,25 +134,64 @@ fn verify_with(key_b64: &str, data: &[u8], sig_b64: &str) -> Result<()> {
     key.verify(data, &Signature::from_bytes(&sig)).map_err(|_| bad("invalid cryptographic signature"))
 }
 
-async fn fetch(client: &reqwest::Client, url: &str, max: u64) -> Result<Vec<u8>> {
-    if !url.starts_with(DOWNLOAD_PREFIX) {
-        return Err(AppError::new(ErrorCode::ErrInvalidUrlScheme, "update URL is not from the official release page"));
+/// Server-side trouble worth retrying (GitHub answers 502/503/504 now and then).
+fn retryable_status(code: u16) -> bool {
+    code >= 500 || code == 429
+}
+
+/// One attempt. The flag says whether trying again (or another source) may help.
+async fn fetch_once(client: &reqwest::Client, url: &str, max: u64) -> std::result::Result<Vec<u8>, (AppError, bool)> {
+    let api = url.starts_with(API_ASSET_PREFIX);
+    if !api && !url.starts_with(DOWNLOAD_PREFIX) {
+        return Err((AppError::new(ErrorCode::ErrInvalidUrlScheme, "update URL is not from the official release page"), false));
     }
-    let resp = client.get(url).header("User-Agent", "UnduhKilat-updater").send().await.map_err(net)?.error_for_status().map_err(net)?;
+    let mut req = client.get(url).header("User-Agent", "UnduhKilat-updater");
+    if api {
+        req = req.header("Accept", "application/octet-stream");
+    }
+    let resp = req.send().await.map_err(|e| (net(e), true))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err((net(format!("HTTP {status} for {url}")), retryable_status(status.as_u16())));
+    }
     if resp.content_length().is_some_and(|n| n > max) {
-        return Err(AppError::internal("update is larger than allowed"));
+        return Err((AppError::internal("update is larger than allowed"), false));
     }
-    let bytes = resp.bytes().await.map_err(net)?;
+    let bytes = resp.bytes().await.map_err(|e| (net(e), true))?;
     if bytes.len() as u64 > max {
-        return Err(AppError::internal("update is larger than allowed"));
+        return Err((AppError::internal("update is larger than allowed"), false));
     }
     Ok(bytes.to_vec())
 }
 
+/// Each source in turn, each retried a few times on transient errors. Integrity does not depend on
+/// which source answered: the zip must still match the signature.
+async fn fetch(client: &reqwest::Client, sources: &[String], max: u64) -> Result<Vec<u8>> {
+    let mut last = AppError::internal("no download source for the update");
+    for url in sources {
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
+            }
+            match fetch_once(client, url, max).await {
+                Ok(b) => return Ok(b),
+                Err((e, retry)) => {
+                    tracing::warn!(url = %url, attempt, error = %e.message, "update download attempt failed");
+                    last = e;
+                    if !retry {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Err(last)
+}
+
 /// Download and verify. Returns the zip bytes only if the signature is valid.
 pub async fn download(client: &reqwest::Client, info: &UpdateInfo) -> Result<Vec<u8>> {
-    let sig = fetch(client, &info.sig_url, 4096).await?;
-    let zip = fetch(client, &info.zip_url, MAX_ZIP_BYTES).await?;
+    let sig = fetch(client, &info.sig_sources, 4096).await?;
+    let zip = fetch(client, &info.zip_sources, MAX_ZIP_BYTES).await?;
     verify(&zip, &String::from_utf8_lossy(&sig))?;
     Ok(zip)
 }
@@ -307,11 +366,26 @@ mod tests {
 
     fn rel(tag: &str, with_sig: bool, draft: bool) -> GhRelease {
         let zip = format!("UnduhKilat-portable-{}-x64.zip", tag.trim_start_matches('v'));
-        let mut assets = vec![GhAsset { name: zip.clone(), browser_download_url: format!("{DOWNLOAD_PREFIX}{tag}/{zip}") }];
+        let mut assets = vec![GhAsset { name: zip.clone(), browser_download_url: format!("{DOWNLOAD_PREFIX}{tag}/{zip}"), url: format!("{API_ASSET_PREFIX}1") }];
         if with_sig {
-            assets.push(GhAsset { name: format!("{zip}.sig"), browser_download_url: format!("{DOWNLOAD_PREFIX}{tag}/{zip}.sig") });
+            assets.push(GhAsset { name: format!("{zip}.sig"), browser_download_url: format!("{DOWNLOAD_PREFIX}{tag}/{zip}.sig"), url: String::new() });
         }
         GhRelease { tag_name: tag.into(), draft, body: None, assets }
+    }
+
+    #[test]
+    fn the_api_is_tried_before_the_release_page_and_foreign_urls_are_ignored() {
+        let got = pick_update(vec![rel("v0.1.3", true, false)], (0, 1, 2)).unwrap();
+        assert_eq!(got.zip_sources, vec![format!("{API_ASSET_PREFIX}1"), format!("{DOWNLOAD_PREFIX}v0.1.3/UnduhKilat-portable-0.1.3-x64.zip")]);
+        assert_eq!(got.sig_sources.len(), 1, "no API URL: only the release page");
+        let odd = GhAsset { name: "x".into(), browser_download_url: format!("{DOWNLOAD_PREFIX}x"), url: "https://evil.example/assets/1".into() };
+        assert_eq!(odd.sources(), vec![format!("{DOWNLOAD_PREFIX}x")]);
+    }
+
+    #[test]
+    fn only_server_side_errors_are_retried() {
+        assert!(retryable_status(504) && retryable_status(502) && retryable_status(429));
+        assert!(!retryable_status(404) && !retryable_status(403));
     }
 
     #[test]
