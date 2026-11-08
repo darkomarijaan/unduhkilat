@@ -11,3 +11,11 @@ license = "UNLICENSED"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Crate milik sendiri dikompilasi paralel: build rilis jauh lebih cepat, dependensi pihak ketiga
+# tetap codegen-units = 1 (sudah tersimpan di cache target/release, tidak dikompilasi ulang).
+[profile.release.package.unduhkilat-core]
+codegen-units = 16
+
+[profile.release.package.unduhkilat-app]
+codegen-units = 16

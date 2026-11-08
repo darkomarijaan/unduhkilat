@@ -1,0 +1,9 @@
+UnduhKilat (portabel, Windows 10/11 x64)
+
+Jalankan UnduhKilat.exe. Tidak perlu instalasi. Data (database, log) disimpan di folder "data" di samping program karena ada berkas unduhkilat-portable.marker; hapus marker itu untuk memakai %LOCALAPPDATA%.
+
+Integrasi browser: muat folder "extension" lewat chrome://extensions (mode pengembang > Muat yang belum dikemas). Pendaftaran host native untuk pengguna ini dibuat otomatis saat aplikasi dibuka.
+Perintah: UnduhKilat.exe register-host | unregister-host
+Admin (CMD sebagai Administrator): --admin-register-host, --admin-reset-data --confirm-reset
+
+Jangan pindahkan unduhkilat-host.exe dari folder ini.
