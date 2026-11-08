@@ -24,11 +24,25 @@ pub struct ServerService {
     db: Db,
     /// Current proxy settings, read at connect time so a change in Settings applies immediately.
     proxy: Arc<dyn Fn() -> ProxyConfig + Send + Sync>,
+    /// Kept transfer connections, closed whenever a server entry or a pinned key changes so the
+    /// next transfer logs in with the new settings.
+    pool: Option<Arc<crate::server::pool::ConnPool>>,
 }
 
 impl ServerService {
     pub fn new(db: Db, proxy: Arc<dyn Fn() -> ProxyConfig + Send + Sync>) -> Self {
-        ServerService { db, proxy }
+        ServerService { db, proxy, pool: None }
+    }
+
+    pub fn with_pool(mut self, pool: Arc<crate::server::pool::ConnPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    async fn drop_kept_connections(&self) {
+        if let Some(p) = &self.pool {
+            p.clear().await;
+        }
     }
 
     pub async fn list(&self) -> Result<Vec<Server>> {
@@ -38,6 +52,7 @@ impl ServerService {
     /// Create (`id = None`) or update a server. Secrets are written only when `save_secret` is on;
     /// turning it off wipes what was saved. A secret left `None` keeps the saved one.
     pub async fn save(&self, id: Option<String>, server: NewServer, secrets_in: NewServerSecrets) -> Result<Server> {
+        self.drop_kept_connections().await;
         self.db
             .write(move |c| {
                 let saved = match &id {
@@ -62,6 +77,7 @@ impl ServerService {
     /// Refused with `ErrServerInUse` while another server uses it as a jump host. Its saved secrets
     /// go with it (foreign-key cascade), and only if the delete is allowed.
     pub async fn delete(&self, id: &str) -> Result<()> {
+        self.drop_kept_connections().await;
         let id = id.to_string();
         self.db.write(move |c| store::delete_server(c, &id)).await
     }
@@ -108,6 +124,7 @@ impl ServerService {
 
     /// Forget the pinned host keys of `host:port` so the next connection asks again (explicit user action).
     pub async fn forget_host_key(&self, host: &str, port: u16) -> Result<()> {
+        self.drop_kept_connections().await;
         let host = host.to_string();
         self.db.write(move |c| hostkeys::forget(c, &host, port)).await
     }

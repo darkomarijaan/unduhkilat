@@ -14,7 +14,7 @@ use unduhkilat_core::engine::ftp;
 use unduhkilat_core::engine::grabber::ScanResult;
 use unduhkilat_core::engine::search::{Provider, SearchOutcome, Source};
 use unduhkilat_core::engine::http::{self, RangeSupport};
-use unduhkilat_core::engine::manager::{Manager, NewDownload};
+use unduhkilat_core::engine::manager::{Manager, NewDownload, Scope};
 use unduhkilat_core::engine::proxy::{ProxyConfig, ProxyMode};
 use unduhkilat_core::engine::torrent::{self, TorrentInfo};
 use unduhkilat_core::engine::EngineEvent;
@@ -148,6 +148,7 @@ struct SettingsState {
     browser_note: Option<String>,
     tab: SettingsTab,
     concurrency: u32,
+    server_concurrency: u32,
     connections: u32,
     global_kbps: u32,
     close_to_tray: bool,
@@ -179,7 +180,7 @@ enum Msg {
     Servers(servers::ServersMsg),
     Explorer(explorer::ExplorerMsg),
     /// Items of a copy were added to the queue; `finished` = that was the last of them.
-    CopyQueued { run: u64, ids: Vec<String>, failed: Vec<String>, finished: bool },
+    CopyQueued { run: u64, ids: Vec<String>, failed: Vec<String>, finished: bool, weight: usize },
 }
 
 #[derive(Clone)]
@@ -211,6 +212,8 @@ pub struct App {
     /// Copies between servers that the pop-up is following.
     copies: Vec<explorer::CopyRun>,
     copy_seq: u64,
+    /// The window that lists every transfer with a saved server (they are not in the download list).
+    transfers_open: bool,
     torrent: Option<(String, TorrentInfo)>,
     torrent_poll: Instant,
     grab: GrabState,
@@ -261,7 +264,7 @@ impl App {
         let mut app = App {
             rt, manager, paths, log_tail, ctx, tray, open_settings, bridge, proposals_rx, pending: VecDeque::new(),
             downloads: Vec::new(), categories: Vec::new(), segments: Vec::new(),
-            last_refresh: Instant::now() - Duration::from_secs(10), live: HashMap::new(), live_bytes: HashMap::new(), copies: Vec::new(), copy_seq: 0, torrent: None, torrent_poll: Instant::now() - Duration::from_secs(10), grab: GrabState::default(), search: SearchState::default(), clip_rx, clip_enabled, events,
+            last_refresh: Instant::now() - Duration::from_secs(10), live: HashMap::new(), live_bytes: HashMap::new(), copies: Vec::new(), copy_seq: 0, transfers_open: false, torrent: None, torrent_poll: Instant::now() - Duration::from_secs(10), grab: GrabState::default(), search: SearchState::default(), clip_rx, clip_enabled, events,
             selected: None, checked: HashSet::new(), filter: Filter::All, sort: (SortKey::None, true),
             screen: Screen::Downloads, dock_open: false, dock_height: DOCK_HEIGHT, add: None, settings: None,
             log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None, update: UpdState::None, servers: servers::ServersState::default(), terminal: terminal::TerminalState::default(), start_hidden: false,
@@ -394,8 +397,8 @@ impl App {
             self.categories = c;
         }
         // Show the segment map of something by default instead of an empty strip.
-        if self.selected.as_ref().is_none_or(|id| !self.downloads.iter().any(|d| &d.id == id)) {
-            self.selected = self.downloads.first().map(|d| d.id.clone());
+        if self.selected.as_ref().is_none_or(|id| !self.downloads.iter().any(|d| &d.id == id && listed(d))) {
+            self.selected = self.downloads.iter().find(|d| listed(d)).map(|d| d.id.clone());
         }
         self.close_to_tray = db.read(|c| repo::get_setting(c, keys::CLOSE_TO_TRAY)).ok().flatten().map(|v| v != "0").unwrap_or(true);
         self.segments = match &self.selected {
@@ -457,7 +460,7 @@ impl App {
                 },
                 Msg::Servers(m) => self.servers_msg(m),
                 Msg::Explorer(m) => self.explorer_msg(m),
-                Msg::CopyQueued { run, ids, failed, finished } => self.copy_run_update(run, ids, failed, finished),
+                Msg::CopyQueued { run, ids, failed, finished, weight } => self.copy_run_update(run, ids, failed, finished, weight),
                 Msg::UpdateStaged(r) => match r {
                     Ok(()) => self.apply_update(),
                     Err(e) => {
@@ -525,6 +528,9 @@ impl App {
         let mut v: Vec<usize> = (0..self.downloads.len())
             .filter(|&i| {
                 let d = &self.downloads[i];
+                if !listed(d) {
+                    return false;
+                }
                 match &self.filter {
                     Filter::All => true,
                     Filter::Active => matches!(d.state, DownloadState::Running | DownloadState::Queued),
@@ -554,9 +560,16 @@ impl App {
         v
     }
 
+    /// Counts only what the download list shows.
     fn count(&self, f: impl Fn(&Download) -> bool) -> usize {
-        self.downloads.iter().filter(|d| f(d)).count()
+        self.downloads.iter().filter(|d| listed(d) && f(d)).count()
     }
+}
+
+/// The download list holds what the user downloads from the web or by torrent. Transfers with saved
+/// servers (often thousands of files from one folder) live in their own window instead.
+fn listed(d: &Download) -> bool {
+    Scope::Downloads.contains(&d.original_url)
 }
 
 /// Path of the host binary that ships beside this executable.
@@ -947,6 +960,7 @@ impl eframe::App for App {
         }
 
         self.copy_windows(ctx);
+        self.server_transfers_window(ctx);
 
         let width = ctx.content_rect().width();
         let compact = width < 1000.0;
@@ -1191,6 +1205,7 @@ impl App {
             browser_note: None,
             tab: SettingsTab::Engine,
             concurrency: get(keys::CONCURRENCY_LIMIT).and_then(|v| v.parse().ok()).unwrap_or(cfg.default_concurrency as u32),
+            server_concurrency: get(keys::SERVER_CONCURRENCY_LIMIT).and_then(|v| v.parse().ok()).unwrap_or(unduhkilat_core::server::pool::PER_SERVER as u32),
             connections: get(keys::DEFAULT_CONNECTIONS).and_then(|v| v.parse().ok()).unwrap_or(cfg.default_connections),
             global_kbps: get(keys::GLOBAL_SPEED_LIMIT_KBPS).and_then(|v| v.parse().ok()).unwrap_or(0),
             close_to_tray: get(keys::CLOSE_TO_TRAY).map(|v| v != "0").unwrap_or(true),
@@ -1290,6 +1305,11 @@ impl App {
             if nav(ui, self.screen == Screen::Terminal, "Terminal", None, Some(self.terminal.tabs.len())) {
                 self.screen = if self.screen == Screen::Terminal { Screen::Downloads } else { Screen::Terminal };
             }
+            // Only there while something with a server is unfinished (or its window is open).
+            let pending = self.server_transfers_pending();
+            if (pending > 0 || self.transfers_open) && nav(ui, self.transfers_open, "Transfer server", None, Some(pending)) {
+                self.transfers_open = !self.transfers_open;
+            }
             // Pin the bottom block to the foot of the panel only when there is room for it.
             const BOTTOM_H: f32 = 120.0;
             let free = total - ui.min_rect().height();
@@ -1312,15 +1332,15 @@ impl App {
         ui.horizontal(|ui| {
             if ui.button("Lanjutkan semua").clicked() {
                 let m = self.manager.clone();
-                self.run(async move { m.start_all().await.map(|_| ()) });
+                self.run(async move { m.start_all_in(Scope::Downloads, false).await.map(|_| ()) });
             }
             if ui.button("Jeda semua").clicked() {
                 let m = self.manager.clone();
-                self.run(async move { m.stop_all().await.map(|_| ()) });
+                self.run(async move { m.stop_all_in(Scope::Downloads).await.map(|_| ()) });
             }
             if ui.button("Bersihkan selesai").clicked() {
                 let m = self.manager.clone();
-                self.run(async move { m.clear_finished().await.map(|_| ()) });
+                self.run(async move { m.clear_finished_in(Scope::Downloads).await.map(|_| ()) });
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let label = match self.sort.0 { SortKey::None => "Terbaru", SortKey::Name => "Nama", SortKey::Size => "Ukuran", SortKey::Status => "Status", SortKey::Progress => "Kemajuan", SortKey::Speed => "Kecepatan", SortKey::Priority => "Prioritas" };
@@ -1528,6 +1548,9 @@ impl App {
         let Some(mut a) = self.add.take() else { return };
         let mut close = false;
         let mut submit: Option<bool> = None; // Some(start_immediately)
+        let mut reject_all = false;
+        // Browser proposals still waiting behind this one (shown one at a time, FR-039).
+        let waiting = if a.origin.is_some() { self.pending.len() } else { 0 };
         let cats = self.categories.clone();
         egui::Window::new("Mulai Unduhan Baru")
             .title_bar(false)
@@ -1542,6 +1565,9 @@ impl App {
                     if a.origin.is_some() {
                         // Badge from the design: this request came from the browser.
                         ui.label(RichText::new(" Tangkap Otomatis ").font(theme::mono(10.0)).color(ACCENT_INK).background_color(ACCENT));
+                        if waiting > 0 {
+                            ui.label(RichText::new(format!("+{waiting} lagi menunggu")).font(theme::mono(10.0)).color(FG_SECONDARY));
+                        }
                     }
                 });
                 ui.label(RichText::new("Tentukan parameter segmen koneksi, kategori berkas, dan folder tujuan.").color(FG_SECONDARY));
@@ -1661,6 +1687,12 @@ impl App {
                         if ui.button("Antrikan Saja").clicked() { submit = Some(false); }
                     });
                     if ui.button("Batal").clicked() { close = true; }
+                    if waiting > 0
+                        && ui.button(format!("Tolak Semua ({})", waiting + 1)).on_hover_text("Batalkan usulan ini dan semua usulan browser yang masih menunggu").clicked()
+                    {
+                        close = true;
+                        reject_all = true;
+                    }
                 });
             });
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
@@ -1725,6 +1757,11 @@ impl App {
             if let (Some(b), Some(req)) = (&self.bridge, a.origin.take()) {
                 b.reject(&req);
             }
+            if reject_all {
+                for p in self.pending.drain(..) {
+                    if let Some(b) = &self.bridge { b.reject(&p.request_id); }
+                }
+            }
         }
         if !close { self.add = Some(a); }
         self.last_refresh = Instant::now() - Duration::from_secs(10);
@@ -1758,6 +1795,10 @@ impl App {
                             ui.end_row();
                             ui.label("Koneksi per unduhan (baru):");
                             ui.add(egui::DragValue::new(&mut s.connections).range(1..=u32::MAX).speed(0.2));
+                            ui.end_row();
+                            ui.label("Transfer server bersamaan:");
+                            ui.add(egui::DragValue::new(&mut s.server_concurrency).range(1..=u32::MAX).speed(0.2))
+                                .on_hover_text(format!("Salin, unggah, dan unduh dengan server tersimpan berjalan di jalur sendiri. Koneksi dipakai ulang antarberkas, dan tiap server dibatasi {} koneksi sekaligus.", unduhkilat_core::server::pool::PER_SERVER));
                             ui.end_row();
                         });
                         ui.label(RichText::new("Tanpa batas atas; nilai apa pun mulai 1 dipatuhi persis. Lihat Diagnostik untuk jumlah koneksi aktif.").color(FG_SECONDARY));
@@ -1942,6 +1983,7 @@ impl App {
         if save {
             let m = self.manager.clone();
             let (c, n, g, tray, toast) = (s.concurrency as usize, s.connections, s.global_kbps as u64, s.close_to_tray, s.toast);
+            let sc = s.server_concurrency as usize;
             self.clip_enabled.store(s.clip, Ordering::Relaxed);
             let clip = s.clip;
             let upd = s.upd;
@@ -1976,6 +2018,7 @@ impl App {
                 if net_changed {
                     m.reset_torrents().await;
                 }
+                m.set_server_concurrency_limit(sc).await?;
                 m.set_concurrency_limit(c).await
             });
             self.notice = Some(("Pengaturan disimpan.".into(), Instant::now()));

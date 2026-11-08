@@ -4,6 +4,7 @@
 use super::*;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use unduhkilat_core::engine::manager::Scope;
 use unduhkilat_core::models::{Download, DownloadState};
 
 /// How long a copy that finished without a problem stays on screen.
@@ -19,6 +20,8 @@ pub struct CopyRun {
     /// Items that could not even be queued (for example a file that already exists).
     pub failed: Vec<String>,
     pub finished_at: Option<Instant>,
+    /// Files carried by items that stand for more than one file (a fast folder stream).
+    pub weights: HashMap<String, usize>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -28,6 +31,8 @@ pub struct Tally {
     pub cancelled: usize,
     /// "name: reason" for items that failed while copying.
     pub errors: Vec<String>,
+    /// Files covered by the failed items (more than `errors.len()` when a folder stream failed).
+    pub failed_files: usize,
     pub bytes_done: i64,
     pub bytes_total: i64,
     /// Files still waiting or running whose size is not known yet.
@@ -40,13 +45,13 @@ pub struct Tally {
 impl Tally {
     /// Nothing is waiting or running any more.
     pub fn settled(&self) -> bool {
-        self.done + self.cancelled + self.errors.len() >= self.files
+        self.done + self.cancelled + self.failed_files >= self.files
     }
 
     /// 0..=1 for the bar. By bytes once every size is known, otherwise by files, so it never
     /// jumps back when a new file's size turns up.
     pub fn fraction(&self) -> f32 {
-        let live = self.files - self.cancelled - self.errors.len();
+        let live = self.files - self.cancelled - self.failed_files;
         if self.unknown == 0 && self.bytes_total > 0 {
             format::percent(self.bytes_done, self.bytes_total)
         } else if live == 0 {
@@ -59,22 +64,27 @@ impl Tally {
 
 /// `live_bytes` and `speeds` are the engine's latest numbers per running item; the database copy of
 /// the byte count is only saved now and then.
-pub fn tally(ids: &[String], downloads: &[Download], live_bytes: &HashMap<String, i64>, speeds: &HashMap<String, (u64, u32)>) -> Tally {
+/// `weights` names items that stand for several files (missing: one file).
+pub fn tally(ids: &[String], downloads: &[Download], live_bytes: &HashMap<String, i64>, speeds: &HashMap<String, (u64, u32)>, weights: &HashMap<String, usize>) -> Tally {
     let by_id: HashMap<&str, &Download> = downloads.iter().map(|d| (d.id.as_str(), d)).collect();
     let mut t = Tally::default();
     for id in ids {
         // Removed from the list by the user: nothing left to follow.
         let Some(d) = by_id.get(id.as_str()) else { continue };
-        t.files += 1;
+        let w = weights.get(id).copied().unwrap_or(1);
+        t.files += w;
         match d.state {
             DownloadState::Completed => {
-                t.done += 1;
+                t.done += w;
                 let n = d.total_bytes.max(d.downloaded_bytes).max(0);
                 t.bytes_done += n;
                 t.bytes_total += n;
             }
-            DownloadState::Cancelled => t.cancelled += 1,
-            DownloadState::Failed => t.errors.push(format!("{}: {}", d.file_name, d.error_message.as_deref().unwrap_or("gagal"))),
+            DownloadState::Cancelled => t.cancelled += w,
+            DownloadState::Failed => {
+                t.errors.push(format!("{}: {}", d.file_name, d.error_message.as_deref().unwrap_or("gagal")));
+                t.failed_files += w;
+            }
             DownloadState::Queued | DownloadState::Paused | DownloadState::Running => {
                 let got = live_bytes.get(id).copied().unwrap_or(d.downloaded_bytes).max(0);
                 t.bytes_done += got;
@@ -97,13 +107,16 @@ impl App {
     /// Start following a copy. Returns its id.
     pub(super) fn copy_run_start(&mut self, title: String) -> u64 {
         self.copy_seq += 1;
-        self.copies.push(CopyRun { id: self.copy_seq, title, ids: Vec::new(), queuing: true, failed: Vec::new(), finished_at: None });
+        self.copies.push(CopyRun { id: self.copy_seq, title, ids: Vec::new(), queuing: true, failed: Vec::new(), finished_at: None, weights: HashMap::new() });
         self.copy_seq
     }
 
     /// More items were queued, or the last of them was.
-    pub(crate) fn copy_run_update(&mut self, run: u64, ids: Vec<String>, failed: Vec<String>, finished: bool) {
+    pub(crate) fn copy_run_update(&mut self, run: u64, ids: Vec<String>, failed: Vec<String>, finished: bool, weight: usize) {
         if let Some(r) = self.copies.iter_mut().find(|r| r.id == run) {
+            if weight > 1 {
+                r.weights.extend(ids.iter().map(|id| (id.clone(), weight)));
+            }
             r.ids.extend(ids);
             r.failed.extend(failed);
             r.queuing &= !finished;
@@ -121,7 +134,7 @@ impl App {
         let mut cancel: Vec<String> = Vec::new();
         let mut close: Vec<u64> = Vec::new();
         for (n, run) in self.copies.iter_mut().enumerate() {
-            let t = tally(&run.ids, &self.downloads, &self.live_bytes, &self.live);
+            let t = tally(&run.ids, &self.downloads, &self.live_bytes, &self.live, &run.weights);
             let finished = !run.queuing && t.settled();
             if finished && run.finished_at.is_none() {
                 run.finished_at = Some(Instant::now());
@@ -186,7 +199,7 @@ impl App {
                                 cancel.extend(run.ids.iter().cloned());
                                 close.push(run.id);
                             }
-                            if ui.button("Sembunyikan").on_hover_text("Salinan tetap berjalan; lihat di layar Unduhan.").clicked() {
+                            if ui.button("Sembunyikan").on_hover_text("Salinan tetap berjalan; pantau lewat \"Transfer server\" di panel kiri.").clicked() {
                                 close.push(run.id);
                             }
                         }
@@ -194,12 +207,101 @@ impl App {
                 });
         }
         self.copies.retain(|r| !close.contains(&r.id));
-        for id in cancel {
-            let m = self.manager.clone();
-            // Already finished items refuse to be cancelled; that is fine.
-            self.rt.spawn(async move {
+        self.cancel_items(cancel);
+    }
+
+    fn cancel_items(&self, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        let m = self.manager.clone();
+        // Already finished items refuse to be cancelled; that is fine.
+        self.rt.spawn(async move {
+            for id in ids {
                 let _ = m.cancel(&id, false).await;
+            }
+        });
+    }
+
+    /// Transfers with saved servers that still need attention: waiting, running, paused or failed.
+    pub(crate) fn server_transfers_pending(&self) -> usize {
+        self.downloads.iter().filter(|d| Scope::ServerTransfers.contains(&d.original_url) && !matches!(d.state, DownloadState::Completed | DownloadState::Cancelled)).count()
+    }
+
+    /// Every transfer with a saved server, in one window. They are kept out of the download list, so
+    /// this is where they are paused, resumed, retried and cleared, also after the app restarts.
+    pub(crate) fn server_transfers_window(&mut self, ctx: &egui::Context) {
+        if !self.transfers_open {
+            return;
+        }
+        let items: Vec<&Download> = self.downloads.iter().filter(|d| Scope::ServerTransfers.contains(&d.original_url)).collect();
+        let ids: Vec<String> = items.iter().map(|d| d.id.clone()).collect();
+        let paused = items.iter().filter(|d| d.state == DownloadState::Paused).count();
+        let unfinished: Vec<String> = items.iter().filter(|d| !matches!(d.state, DownloadState::Completed | DownloadState::Cancelled)).map(|d| d.id.clone()).collect();
+        let t = tally(&ids, &self.downloads, &self.live_bytes, &self.live, &HashMap::new());
+        let (mut close, mut cancel) = (false, false);
+        let (mut resume, mut pause, mut clear) = (false, false, false);
+        let frame = egui::Frame::window(&ctx.global_style()).fill(SURFACE).inner_margin(egui::Margin::same(20));
+        egui::Window::new("server-transfers")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-24.0, -48.0])
+            .fixed_size([440.0, 0.0])
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Transfer server").font(theme::bold(15.0)));
+                ui.label(RichText::new("Unduh, unggah, dan salin dengan server tersimpan. Tidak dicampur dengan daftar unduhan.").small().color(MUTED));
+                ui.add_space(8.0);
+                if t.files == 0 {
+                    ui.label(RichText::new("Tidak ada transfer server.").color(FG_SECONDARY));
+                } else {
+                    let ok = t.errors.is_empty() && paused == 0;
+                    let bar = egui::ProgressBar::new(t.fraction()).desired_width(f32::INFINITY).fill(if t.settled() && ok { SUCCESS } else { ACCENT }).text(format!("{:.0}%", t.fraction() * 100.0));
+                    ui.add(bar);
+                    ui.add_space(4.0);
+                    let size = if t.unknown == 0 { format!("{} dari {}", format::bytes(t.bytes_done), format::bytes(t.bytes_total)) } else { format::bytes(t.bytes_done) };
+                    ui.label(RichText::new(format!("{} dari {} berkas selesai \u{b7} {size}", t.done, t.files)).color(FG_SECONDARY));
+                    if t.speed > 0 {
+                        ui.label(RichText::new(format::speed(t.speed)).color(FG_SECONDARY));
+                    }
+                    if let Some(name) = &t.current {
+                        ui.add(egui::Label::new(RichText::new(name).small().color(MUTED)).truncate());
+                    }
+                    if paused > 0 {
+                        ui.label(RichText::new(format!("{paused} berkas terjeda.")).color(WARNING));
+                    }
+                    if t.cancelled > 0 {
+                        ui.label(RichText::new(format!("{} berkas dibatalkan.", t.cancelled)).color(WARNING));
+                    }
+                    for p in t.errors.iter().take(4) {
+                        ui.add(egui::Label::new(RichText::new(format!("\u{2022} {p}")).color(DANGER)).wrap());
+                    }
+                    if t.errors.len() > 4 {
+                        ui.label(RichText::new(format!("dan {} lainnya gagal", t.errors.len() - 4)).color(DANGER));
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    resume = ui.add_enabled(paused + t.errors.len() > 0, egui::Button::new("Lanjutkan semua")).on_hover_text("Lanjutkan yang terjeda dan coba lagi yang gagal.").clicked();
+                    pause = ui.add_enabled(unfinished.len() > paused + t.errors.len(), egui::Button::new("Jeda semua")).clicked();
+                    cancel = ui.add_enabled(!unfinished.is_empty(), egui::Button::new("Batalkan sisa")).on_hover_text("Hentikan yang belum selesai. Yang sudah selesai tetap ada di tujuan.").clicked();
+                    clear = ui.add_enabled(t.done + t.cancelled > 0, egui::Button::new("Bersihkan selesai")).clicked();
+                    close = ui.button("Tutup").on_hover_text("Transfer tetap berjalan.").clicked();
+                });
             });
+        let m = self.manager.clone();
+        if resume {
+            self.run(async move { m.start_all_in(Scope::ServerTransfers, true).await.map(|_| ()) });
+        } else if pause {
+            self.run(async move { m.stop_all_in(Scope::ServerTransfers).await.map(|_| ()) });
+        } else if clear {
+            self.run(async move { m.clear_finished_in(Scope::ServerTransfers).await.map(|_| ()) });
+        } else if cancel {
+            self.cancel_items(unfinished);
+        }
+        if close {
+            self.transfers_open = false;
         }
     }
 }
@@ -239,11 +341,24 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_stream_counts_as_all_the_files_it_carries() {
+        let w: HashMap<String, usize> = [("tree".to_string(), 62)].into();
+        let d = [dl("tree", DownloadState::Running, 0, 1000), dl("x", DownloadState::Completed, 10, 10)];
+        let t = tally(&ids(&["tree", "x"]), &d, &HashMap::new(), &HashMap::new(), &w);
+        assert_eq!((t.files, t.done), (63, 1));
+        assert!(!t.settled());
+        let d = [dl("tree", DownloadState::Failed, 0, 1000), dl("x", DownloadState::Completed, 10, 10)];
+        let t = tally(&ids(&["tree", "x"]), &d, &HashMap::new(), &HashMap::new(), &w);
+        assert_eq!((t.errors.len(), t.failed_files), (1, 62));
+        assert!(t.settled(), "a failed stream does not leave the pop-up waiting forever");
+    }
+
+    #[test]
     fn bytes_come_from_live_numbers_and_the_bar_follows_them() {
         let d = [dl("a", DownloadState::Completed, 100, 100), dl("b", DownloadState::Running, 0, 300)];
         let live: HashMap<String, i64> = [("b".to_string(), 100)].into();
         let speeds: HashMap<String, (u64, u32)> = [("b".to_string(), (2048, 1))].into();
-        let t = tally(&ids(&["a", "b"]), &d, &live, &speeds);
+        let t = tally(&ids(&["a", "b"]), &d, &live, &speeds, &HashMap::new());
         assert_eq!((t.files, t.done, t.bytes_done, t.bytes_total, t.speed), (2, 1, 200, 400, 2048));
         assert_eq!(t.current.as_deref(), Some("b.bin"));
         assert!(!t.settled());
@@ -253,7 +368,7 @@ mod tests {
     #[test]
     fn unknown_sizes_make_the_bar_count_files() {
         let d = [dl("a", DownloadState::Completed, 50, 50), dl("b", DownloadState::Queued, 0, -1)];
-        let t = tally(&ids(&["a", "b"]), &d, &HashMap::new(), &HashMap::new());
+        let t = tally(&ids(&["a", "b"]), &d, &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert_eq!(t.unknown, 1);
         assert_eq!(t.fraction(), 0.5);
     }
@@ -263,7 +378,7 @@ mod tests {
         let mut bad = dl("b", DownloadState::Failed, 0, 10);
         bad.error_message = Some("sambungan putus".into());
         let d = [dl("a", DownloadState::Completed, 10, 10), bad, dl("c", DownloadState::Cancelled, 0, 10)];
-        let t = tally(&ids(&["a", "b", "c"]), &d, &HashMap::new(), &HashMap::new());
+        let t = tally(&ids(&["a", "b", "c"]), &d, &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert!(t.settled());
         assert_eq!((t.done, t.cancelled), (1, 1));
         assert_eq!(t.errors, ["b.bin: sambungan putus"]);
@@ -273,13 +388,13 @@ mod tests {
     #[test]
     fn items_removed_from_the_list_are_forgotten() {
         let d = [dl("a", DownloadState::Running, 5, 10)];
-        let t = tally(&ids(&["a", "gone"]), &d, &HashMap::new(), &HashMap::new());
+        let t = tally(&ids(&["a", "gone"]), &d, &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert_eq!(t.files, 1);
     }
 
     #[test]
     fn nothing_queued_counts_as_settled() {
-        let t = tally(&[], &[], &HashMap::new(), &HashMap::new());
+        let t = tally(&[], &[], &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert!(t.settled());
         assert_eq!(t.fraction(), 1.0);
     }

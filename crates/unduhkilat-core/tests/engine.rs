@@ -455,6 +455,30 @@ async fn stop_all_pauses_everything_and_start_all_resumes_within_the_limit() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_actions_can_be_limited_to_downloads_or_server_transfers() {
+    use unduhkilat_core::engine::manager::Scope;
+    let srv = TestServer::start(5_000, Mode::Ranges).await;
+    let env = Env::new().await;
+    let web = staged(&env, &srv, &[("web.bin", 0)]).await.remove(0);
+    // An unknown server fails at once, which leaves a server transfer in the list.
+    let copy = env.manager.enqueue_remote_copy("no-such-server", "/a/x.bin", "other", "/b", false).await.unwrap();
+    env.manager.wait_for_state(&copy.id, DownloadState::Failed, T).await.unwrap();
+    assert!(Scope::ServerTransfers.contains(&copy.original_url) && !Scope::Downloads.contains(&copy.original_url));
+
+    // Resuming the downloads leaves the failed server transfer alone.
+    assert_eq!(env.manager.start_all_in(Scope::Downloads, true).await.unwrap().0, 1);
+    env.manager.wait_for_state(&web, DownloadState::Completed, T).await.unwrap();
+    assert_eq!(env.manager.get(&copy.id).unwrap().state, DownloadState::Failed);
+
+    env.manager.cancel(&copy.id, false).await.unwrap();
+    assert_eq!(env.manager.clear_finished_in(Scope::Downloads).await.unwrap(), 1);
+    assert!(env.manager.get(&web).is_err());
+    assert!(env.manager.get(&copy.id).is_ok(), "the cancelled server transfer stays until its own scope is cleared");
+    assert_eq!(env.manager.clear_finished_in(Scope::ServerTransfers).await.unwrap(), 1);
+    assert!(env.manager.get(&copy.id).is_err());
+}
+
 // ---- TASK-24: bandwidth -----------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

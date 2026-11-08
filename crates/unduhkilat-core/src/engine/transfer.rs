@@ -39,6 +39,8 @@ pub struct TransferCtx {
     pub cfg: EngineConfig,
     pub events: broadcast::Sender<EngineEvent>,
     pub torrent: super::torrent::TorrentEngine,
+    /// Kept-open connections to saved servers, shared by all server transfers.
+    pub pool: Arc<crate::server::pool::ConnPool>,
 }
 
 impl TransferCtx {

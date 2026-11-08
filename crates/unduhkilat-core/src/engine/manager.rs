@@ -30,6 +30,8 @@ struct RunningEntry {
     cancel: CancellationToken,
     intent: Arc<Mutex<StopIntent>>,
     bucket: Arc<TokenBucket>,
+    /// A server transfer (counted against the server-transfer lanes, not the download limit).
+    remote: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,10 +68,41 @@ pub struct Manager {
     inner: Arc<Inner>,
 }
 
+/// Which items a bulk action touches. The download list shows only [`Scope::Downloads`]; transfers
+/// with saved servers are followed from their own window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    /// HTTP, FTP and torrent downloads.
+    Downloads,
+    /// Downloads from, uploads to and copies between saved servers.
+    ServerTransfers,
+}
+
+impl Scope {
+    pub fn contains(self, url: &str) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Downloads => !super::remote::is_remote(url),
+            Scope::ServerTransfers => super::remote::is_remote(url),
+        }
+    }
+
+    fn sql(self) -> String {
+        match self {
+            Scope::All => "1".into(),
+            Scope::Downloads => format!("NOT {}", super::remote::SQL_IS_REMOTE),
+            Scope::ServerTransfers => super::remote::SQL_IS_REMOTE.into(),
+        }
+    }
+}
+
 /// What queuing a whole folder produced.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FolderQueued {
     pub queued: usize,
+    /// Files copied by a single stream item (fast folder copy); 0 for per-file queuing.
+    pub streamed_files: usize,
     /// The queue items created, so a caller can follow their progress.
     pub ids: Vec<String>,
     pub failed: Vec<String>,
@@ -96,7 +129,7 @@ impl Manager {
         })?;
         let (events, _) = broadcast::channel(1024);
         let db2 = db.clone();
-        let ctx = Arc::new(TransferCtx { db, client: RwLock::new(client), proxy: RwLock::new(proxy), throttle: Arc::new(Throttler::new(global)), cfg, events, torrent: super::torrent::TorrentEngine::new(db2) });
+        let ctx = Arc::new(TransferCtx { db, client: RwLock::new(client), proxy: RwLock::new(proxy), throttle: Arc::new(Throttler::new(global)), cfg, events, torrent: super::torrent::TorrentEngine::new(db2), pool: crate::server::pool::ConnPool::new() });
         Ok(Manager { inner: Arc::new(Inner { ctx, running: Mutex::new(HashMap::new()), dispatch_gate: tokio::sync::Mutex::new(()) }) })
     }
 
@@ -121,7 +154,7 @@ impl Manager {
     /// Saved servers (SSH/SFTP/FTP/FTPS). Connections follow the proxy settings in force when they start.
     pub fn servers(&self) -> crate::server::service::ServerService {
         let m = self.clone();
-        crate::server::service::ServerService::new(self.db().clone(), std::sync::Arc::new(move || m.proxy_config()))
+        crate::server::service::ServerService::new(self.db().clone(), std::sync::Arc::new(move || m.proxy_config())).with_pool(self.inner.ctx.pool.clone())
     }
 
     /// Persist and apply new proxy settings. Transfers started afterwards use them;
@@ -134,6 +167,8 @@ impl Manager {
         *self.inner.ctx.client.write().unwrap() = new_client;
         *self.inner.ctx.proxy.write().unwrap() = cfg;
         self.reset_torrents().await;
+        // Kept server connections went through the old proxy: the next transfer reconnects.
+        self.inner.ctx.pool.clear().await;
         Ok(())
     }
 
@@ -266,6 +301,30 @@ impl Manager {
 
     pub fn running_count(&self) -> usize {
         self.inner.running.lock().unwrap().len()
+    }
+
+    fn running_in(&self, remote: bool) -> usize {
+        self.inner.running.lock().unwrap().values().filter(|e| e.remote == remote).count()
+    }
+
+    /// Parallel server transfers. Each one reuses kept connections, and every server is capped at
+    /// `pool::PER_SERVER` connections regardless of this number.
+    pub fn server_concurrency_limit(&self) -> usize {
+        self.db()
+            .read(|c| repo::get_setting(c, keys::SERVER_CONCURRENCY_LIMIT))
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(crate::server::pool::PER_SERVER)
+    }
+
+    pub async fn set_server_concurrency_limit(&self, n: usize) -> Result<()> {
+        if n < 1 {
+            return Err(AppError::invalid("server_concurrency_limit must be >= 1"));
+        }
+        self.db().write(move |c| repo::set_setting(c, keys::SERVER_CONCURRENCY_LIMIT, &n.to_string())).await?;
+        self.dispatch().await
     }
 
     fn concurrency_limit(&self) -> usize {
@@ -602,6 +661,13 @@ impl Manager {
             return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Folder tidak bisa disalin ke dalam dirinya sendiri."));
         }
         let found = crate::server::fs::walk::walk_remote(src_fs, src_dir).await?;
+        // Many small files between two SSH servers: one tar stream instead of one item per file.
+        let bytes: u64 = found.iter().map(|f| f.item.size).sum();
+        if !overwrite && super::folder_stream::prefer_stream(found.len(), bytes) {
+            if let Some(d) = self.try_enqueue_stream(src_fs, src_server, src_dir, dst_server, dst_dir, &found).await {
+                return Ok(FolderQueued { queued: 1, streamed_files: found.len(), ids: vec![d.id], failed: Vec::new() });
+            }
+        }
         let mut out = FolderQueued::default();
         for f in found {
             let dir = f.rel_dir.iter().fold(dst_dir.to_string(), |acc, part| crate::server::fs::join_remote(&acc, part));
@@ -616,7 +682,36 @@ impl Manager {
         Ok(out)
     }
 
+    /// One stream item for the whole folder, or `None` when the fast path does not apply (no SSH or
+    /// no `tar` on either side, or the folder already exists at the destination); the caller then
+    /// queues file by file, which reports each existing file instead of touching it.
+    async fn try_enqueue_stream(&self, src_fs: &mut dyn crate::server::fs::RemoteFs, src_server: &str, src_dir: &str, dst_server: &str, dst_dir: &str, found: &[crate::server::fs::walk::Found<crate::server::fs::Entry>]) -> Option<Download> {
+        use super::folder_stream;
+        let name = src_dir.trim_end_matches('/').rsplit('/').next().filter(|n| !n.is_empty())?.to_string();
+        if !folder_stream::can_stream(src_fs).await {
+            return None;
+        }
+        let target = crate::server::fs::join_remote(dst_dir, &name);
+        let cancel = CancellationToken::new();
+        let mut lease = self.inner.ctx.pool.lease(&self.servers(), Arc::new(super::remote::NoPrompt), &[dst_server], &cancel).await.ok()??.pop()?;
+        let usable = folder_stream::can_stream(lease.fs()).await && matches!(lease.fs().stat(&target).await, Err(e) if e.code == ErrorCode::ErrNotFound);
+        lease.keep();
+        if !usable {
+            return None;
+        }
+        let dirs: std::collections::HashSet<&[String]> = found.iter().flat_map(|f| (1..=f.rel_dir.len()).map(move |i| &f.rel_dir[..i])).collect();
+        let rel: Vec<(String, u64)> = found.iter().map(|f| (format!("{}/{}", f.rel_dir.join("/"), f.item.name), f.item.size)).collect();
+        let estimate = folder_stream::tar_size_estimate(rel.iter().map(|(p, s)| (p.as_str(), *s)), dirs.len());
+        let url = super::remote::make_tree_url(src_server, src_dir, dst_server, dst_dir);
+        let label = format!("server://{dst_server}{target}");
+        self.insert_remote_sized(url, PathBuf::from(label), name, false, estimate).await.ok()
+    }
+
     async fn insert_remote(&self, url: String, local: PathBuf, file_name: String, check_target_clash: bool) -> Result<Download> {
+        self.insert_remote_sized(url, local, file_name, check_target_clash, -1).await
+    }
+
+    async fn insert_remote_sized(&self, url: String, local: PathBuf, file_name: String, check_target_clash: bool, total_bytes: i64) -> Result<Download> {
         let ts = repo::now();
         let dl = Download {
             id: uuid::Uuid::new_v4().to_string(),
@@ -624,7 +719,7 @@ impl Manager {
             effective_url: url,
             target_path: local.to_string_lossy().into_owned(),
             file_name,
-            total_bytes: -1,
+            total_bytes,
             downloaded_bytes: 0,
             state: DownloadState::Queued,
             segmentation_supported: false,
@@ -680,14 +775,17 @@ impl Manager {
 
     async fn dispatch_impl(&self) -> Result<()> {
         let _gate = self.inner.dispatch_gate.lock().await;
-        let limit = self.concurrency_limit();
-        let running = self.running_count();
-        if running >= limit {
-            return Ok(());
-        }
-        let ids = self.db().read(|c| repo::next_dispatch_candidates(c, limit - running))?;
-        for id in ids {
-            self.spawn_transfer(id).await?;
+        // Ordinary downloads and server transfers fill separate lanes, each by priority then FIFO.
+        for (scope, limit, remote) in [(Scope::Downloads, self.concurrency_limit(), false), (Scope::ServerTransfers, self.server_concurrency_limit(), true)] {
+            let running = self.running_in(remote);
+            if running >= limit {
+                continue;
+            }
+            let filter = scope.sql();
+            let ids = self.db().read(move |c| repo::next_dispatch_candidates_where(c, &filter, limit - running))?;
+            for id in ids {
+                self.spawn_transfer(id).await?;
+            }
         }
         Ok(())
     }
@@ -701,7 +799,8 @@ impl Manager {
         let cancel = CancellationToken::new();
         let intent = Arc::new(Mutex::new(StopIntent::Pause));
         let bucket = Arc::new(TokenBucket::new(dl.speed_limit_kbps as u64));
-        self.inner.running.lock().unwrap().insert(id.clone(), RunningEntry { cancel: cancel.clone(), intent: intent.clone(), bucket: bucket.clone() });
+        let remote = super::remote::is_remote(&dl.original_url);
+        self.inner.running.lock().unwrap().insert(id.clone(), RunningEntry { cancel: cancel.clone(), intent: intent.clone(), bucket: bucket.clone(), remote });
 
         let this = self.clone();
         tokio::spawn(async move {
@@ -894,32 +993,42 @@ impl Manager {
 
     /// Toolbar "Bersihkan Selesai": drop completed and cancelled records; files stay on disk.
     pub async fn clear_finished(&self) -> Result<usize> {
-        self.db().write(|c| Ok(c.execute("DELETE FROM downloads WHERE state IN ('completed','cancelled')", [])?)).await
+        self.clear_finished_in(Scope::All).await
+    }
+
+    pub async fn clear_finished_in(&self, scope: Scope) -> Result<usize> {
+        let sql = format!("DELETE FROM downloads WHERE state IN ('completed','cancelled') AND {}", scope.sql());
+        self.db().write(move |c| Ok(c.execute(&sql, [])?)).await
     }
 
     /// FR-022. Paused items become queued; only up to the concurrency limit start.
     pub async fn start_all(&self) -> Result<(usize, usize)> {
-        let n = self
-            .db()
-            .write(|c| {
-                Ok(c.execute(
-                    "UPDATE downloads SET state='queued', error_code=NULL, error_message=NULL, updated_at=?1 \
-                     WHERE state='paused' AND id IN (SELECT download_id FROM queue_items)",
-                    [repo::now()],
-                )?)
-            })
-            .await?;
+        self.start_all_in(Scope::All, false).await
+    }
+
+    /// [`Manager::start_all`] limited to `scope`. `include_failed` also retries failed items.
+    pub async fn start_all_in(&self, scope: Scope, include_failed: bool) -> Result<(usize, usize)> {
+        let states = if include_failed { "('paused','failed')" } else { "('paused')" };
+        let sql = format!(
+            "UPDATE downloads SET state='queued', error_code=NULL, error_message=NULL, updated_at=?1 \
+             WHERE state IN {states} AND id IN (SELECT download_id FROM queue_items) AND {}",
+            scope.sql()
+        );
+        let n = self.db().write(move |c| Ok(c.execute(&sql, [repo::now()])?)).await?;
         self.dispatch().await?;
         Ok((n, self.running_count()))
     }
 
     /// FR-022. Running items checkpoint and pause; queued items become paused.
     pub async fn stop_all(&self) -> Result<usize> {
-        let queued = self
-            .db()
-            .write(|c| Ok(c.execute("UPDATE downloads SET state='paused', updated_at=?1 WHERE state='queued'", [repo::now()])?))
-            .await?;
+        self.stop_all_in(Scope::All).await
+    }
+
+    pub async fn stop_all_in(&self, scope: Scope) -> Result<usize> {
+        let sql = format!("UPDATE downloads SET state='paused', updated_at=?1 WHERE state='queued' AND {}", scope.sql());
+        let queued = self.db().write(move |c| Ok(c.execute(&sql, [repo::now()])?)).await?;
         let ids: Vec<String> = self.inner.running.lock().unwrap().keys().cloned().collect();
+        let ids: Vec<String> = ids.into_iter().filter(|id| self.get(id).is_ok_and(|d| scope.contains(&d.original_url))).collect();
         for id in &ids {
             self.signal(id, StopIntent::Pause);
         }

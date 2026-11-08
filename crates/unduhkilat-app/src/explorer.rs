@@ -607,6 +607,8 @@ impl App {
     /// Queue the named items of the server folder for download into the folder on the left. A folder
     /// brings every file under it; inside a folder an existing file is reported, never replaced.
     fn explorer_enqueue_downloads(&mut self, ex: &ExplorerState, names: &[String], overwrite: bool) {
+        // Server transfers are not in the download list; show where they can be followed.
+        self.transfers_open = true;
         let (m, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
         let (sid, dir, local, fs) = (ex.server_id.clone(), ex.dir.clone(), ex.local_dir.clone(), ex.fs.clone());
         let items: Vec<(String, bool)> = names.iter().map(|n| (n.clone(), ex.entries.iter().find(|e| &e.name == n).map(|e| e.is_dir).unwrap_or(false))).collect();
@@ -641,6 +643,7 @@ impl App {
 
     /// Download one file by its own full path (the preview may stay open while the folder changes).
     fn explorer_enqueue_download_path(&mut self, ex: &ExplorerState, entry: &Entry) {
+        self.transfers_open = true;
         let (m, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
         let (sid, local, path) = (ex.server_id.clone(), ex.local_dir.clone(), entry.path.clone());
         self.rt.spawn(async move {
@@ -656,6 +659,7 @@ impl App {
     /// Queue the named items of the folder on the left for upload to the server folder. A folder brings
     /// every file under it; inside a folder an existing file is reported, never replaced.
     fn explorer_enqueue_uploads(&mut self, ex: &ExplorerState, names: &[String], overwrite: bool) {
+        self.transfers_open = true;
         let (m, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
         let (sid, dir, local) = (ex.server_id.clone(), ex.dir.clone(), ex.local_dir.clone());
         let items: Vec<(String, bool)> = names.iter().map(|n| (n.clone(), ex.local_entries.iter().find(|e| &e.name == n).map(|e| e.is_dir).unwrap_or(false))).collect();

@@ -68,6 +68,11 @@ impl SshSession {
         self.handles.last().expect("a session always has a target")
     }
 
+    /// True once the target or any hop on the way has dropped the connection.
+    pub fn is_closed(&self) -> bool {
+        self.handles.iter().any(|h| h.is_closed())
+    }
+
     pub async fn close(self) {
         for h in self.handles.iter().rev() {
             let _ = h.disconnect(russh::Disconnect::ByApplication, "bye", "en").await;

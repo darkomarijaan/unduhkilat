@@ -251,10 +251,18 @@ pub fn enqueue(conn: &Connection, download_id: &str, priority: i32) -> Result<()
 
 /// Authoritative dispatch rule (DEC-002, FR-018): priority DESC, queue_position ASC.
 pub fn next_dispatch_candidates(conn: &Connection, limit: usize) -> Result<Vec<String>> {
-    let mut st = conn.prepare(
+    next_dispatch_candidates_where(conn, "1=1", limit)
+}
+
+/// Like `next_dispatch_candidates`, limited to downloads matching `filter` (an SQL condition on
+/// the `downloads` columns, e.g. the server-transfer scope).
+pub fn next_dispatch_candidates_where(conn: &Connection, filter: &str, limit: usize) -> Result<Vec<String>> {
+    let sql = format!(
         "SELECT q.download_id FROM queue_items q JOIN downloads d ON d.id = q.download_id \
-         WHERE d.state='queued' ORDER BY q.priority DESC, q.queue_position ASC LIMIT ?1",
-    )?;
+         WHERE d.state='queued' AND d.id IN (SELECT id FROM downloads WHERE {filter}) \
+         ORDER BY q.priority DESC, q.queue_position ASC LIMIT ?1"
+    );
+    let mut st = conn.prepare(&sql)?;
     let rows = st.query_map([limit as i64], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }

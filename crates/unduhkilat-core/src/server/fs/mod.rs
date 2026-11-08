@@ -46,6 +46,14 @@ pub trait RemoteFs: Send {
     async fn open_write(&mut self, path: &str, offset: u64, append: bool) -> Result<RemoteWriter>;
     /// Home or starting directory of the login.
     async fn home(&mut self) -> Result<String>;
+    /// False when the connection is known to be gone (checked without contacting the server).
+    fn is_alive(&self) -> bool {
+        true
+    }
+    /// The SSH connection underneath, when there is one (SFTP), for running commands.
+    fn ssh(&self) -> Option<&crate::server::ssh::SshSession> {
+        None
+    }
     async fn close(self: Box<Self>);
 }
 

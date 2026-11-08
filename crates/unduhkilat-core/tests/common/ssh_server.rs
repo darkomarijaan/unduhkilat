@@ -11,7 +11,7 @@ use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Server as _, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -47,6 +47,8 @@ struct Shared {
     sftp_root: Option<std::path::PathBuf>,
     conn_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     conn_handles: Arc<Mutex<Vec<server::Handle>>>,
+    /// Answer `exec` requests for `tar` (a stand-in for a server with shell access).
+    tar: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -125,6 +127,19 @@ impl server::Handler for Conn {
                 };
                 session.channel_success(channel)?;
                 tokio::spawn(russh_sftp::server::run(ch.into_stream(), sftp_server::FolderSftp::new(root)));
+            }
+            _ => session.channel_failure(channel)?,
+        }
+        Ok(())
+    }
+
+    async fn exec_request(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+        let root = self.0.sftp_root.clone();
+        let ch = if self.0.tar.load(Ordering::SeqCst) { self.1.lock().await.remove(&channel) } else { None };
+        match (root, ch) {
+            (Some(root), Some(ch)) => {
+                session.channel_success(channel)?;
+                tokio::spawn(fake_exec(ch, root, String::from_utf8_lossy(data).into_owned()));
             }
             _ => session.channel_failure(channel)?,
         }
@@ -224,6 +239,7 @@ impl TestSsh {
             sftp_root,
             conn_tasks: Arc::new(Mutex::new(Vec::new())),
             conn_handles: Arc::new(Mutex::new(Vec::new())),
+            tar: Arc::new(AtomicBool::new(false)),
         };
         let (sc, fp) = new_config();
         let config = Arc::new(Mutex::new(sc));
@@ -273,6 +289,11 @@ impl TestSsh {
         for t in self.shared.conn_tasks.lock().unwrap().drain(..) {
             t.abort();
         }
+    }
+
+    /// From now on, `exec` of `tar` (and `command -v tar`) works on this server.
+    pub fn enable_tar(&self) {
+        self.shared.tar.store(true, Ordering::SeqCst);
     }
 
     pub fn login_count(&self) -> usize {
@@ -328,4 +349,101 @@ pub fn test_keypair(passphrase: Option<&str>) -> (String, String) {
         None => key.to_openssh(LineEnding::LF).unwrap().to_string(),
     };
     (private, public)
+}
+
+/// Split a command line the way a POSIX shell would for the simple forms the app sends
+/// (single quotes, `'\''` escapes, spaces).
+fn shell_words(cmd: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                quoted = !quoted;
+                any = true;
+            }
+            '\\' if !quoted => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            ' ' if !quoted => {
+                if any || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if any || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Runs `tar -C <dir> -cf - .`, `tar -C <dir> -xf -` and `command -v tar` against the SFTP root.
+async fn fake_exec(mut ch: Channel<Msg>, root: std::path::PathBuf, cmd: String) {
+    let words = shell_words(&cmd);
+    let local = |dir: &str| root.join(dir.trim_start_matches('/'));
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    let status: u32 = match w.as_slice() {
+        ["command", "-v", "tar"] => {
+            let _ = ch.data_bytes(b"/bin/tar\n".to_vec()).await;
+            0
+        }
+        ["tar", "-C", dir, "-cf", "-", "."] => {
+            let path = local(dir);
+            let built = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+                let mut b = tar::Builder::new(Vec::new());
+                b.follow_symlinks(false);
+                b.append_dir_all(".", &path)?;
+                b.into_inner()
+            })
+            .await
+            .unwrap();
+            match built {
+                Ok(bytes) => {
+                    let mut ok = true;
+                    for chunk in bytes.chunks(32 * 1024) {
+                        if ch.data_bytes(chunk.to_vec()).await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok { 0 } else { 2 }
+                }
+                Err(e) => {
+                    let _ = ch.extended_data_bytes(1, format!("tar: {e}\n").into_bytes()).await;
+                    2
+                }
+            }
+        }
+        ["tar", "-C", dir, "-xf", "-"] => {
+            let path = local(dir);
+            let mut buf = Vec::new();
+            while let Some(m) = ch.wait().await {
+                match m {
+                    russh::ChannelMsg::Data { data } => buf.extend_from_slice(&data),
+                    russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            let res = tokio::task::spawn_blocking(move || tar::Archive::new(&buf[..]).unpack(&path)).await.unwrap();
+            match res {
+                Ok(()) => 0,
+                Err(e) => {
+                    let _ = ch.extended_data_bytes(1, format!("tar: {e}\n").into_bytes()).await;
+                    2
+                }
+            }
+        }
+        _ => {
+            let _ = ch.extended_data_bytes(1, b"sh: perintah tidak dikenal\n".to_vec()).await;
+            127
+        }
+    };
+    let _ = ch.exit_status(status).await;
+    let _ = ch.eof().await;
+    let _ = ch.close().await;
 }

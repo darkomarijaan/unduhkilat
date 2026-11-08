@@ -1,5 +1,6 @@
 //! Download engine: probe, segmentation, throttling, transfer workers, queue manager.
 
+pub mod folder_stream;
 pub mod ftp;
 pub mod grabber;
 pub mod http;

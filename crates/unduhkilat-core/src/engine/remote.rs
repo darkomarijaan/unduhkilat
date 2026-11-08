@@ -5,7 +5,9 @@
 //! local source is `target_path`). `?overwrite=1` is added only after the user confirmed replacing an
 //! existing file. `server-copy://<source id>/<path>?to=<destination id>&dst=<path>` copies between two
 //! servers, streaming through this computer without writing to its disk (`target_path` then only
-//! names the destination for display). Pause, resume, priority, speed limits and notifications come from the shared engine.
+//! names the destination for display). `server-tree://<source id>/<folder>?to=<destination id>&dst=<parent>`
+//! copies a whole folder as one tar stream (see `folder_stream`). Pause, resume, priority, speed
+//! limits and notifications come from the shared engine.
 
 use super::throttle::TokenBucket;
 use super::transfer::{Outcome, TransferCtx};
@@ -26,9 +28,10 @@ use tokio_util::sync::CancellationToken;
 const DOWN_PREFIX: &str = "server://";
 const UP_PREFIX: &str = "server-up://";
 const COPY_PREFIX: &str = "server-copy://";
+const TREE_PREFIX: &str = "server-tree://";
 const CHUNK: usize = 64 * 1024;
 /// A transfer that moves nothing for this long fails instead of hanging.
-const IDLE: Duration = Duration::from_secs(60);
+pub(super) const IDLE: Duration = Duration::from_secs(60);
 /// Everything but `/` is escaped, so names with spaces, `?`, `#`, or Unicode survive the URL.
 const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'/');
 
@@ -38,6 +41,8 @@ pub enum Direction {
     Upload,
     /// From `server_id` to `dest`, both servers.
     Copy,
+    /// The folder `path` on `server_id` into the folder `dest` (as `dest/<name>`), one tar stream.
+    Tree,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,12 +56,21 @@ pub struct RemoteRef {
 }
 
 pub fn is_remote(url: &str) -> bool {
-    url.starts_with(DOWN_PREFIX) || url.starts_with(UP_PREFIX) || url.starts_with(COPY_PREFIX)
+    url.starts_with(DOWN_PREFIX) || url.starts_with(UP_PREFIX) || url.starts_with(COPY_PREFIX) || url.starts_with(TREE_PREFIX)
 }
+
+/// SQL condition on the `downloads` table that is true exactly when [`is_remote`] is true.
+pub const SQL_IS_REMOTE: &str = "(original_url LIKE 'server://%' OR original_url LIKE 'server-up://%' OR original_url LIKE 'server-copy://%' OR original_url LIKE 'server-tree://%')";
 
 /// Uploads and copies have no local file of their own to restart into or delete.
 pub fn leaves_local_files_alone(url: &str) -> bool {
-    url.starts_with(UP_PREFIX) || url.starts_with(COPY_PREFIX)
+    url.starts_with(UP_PREFIX) || url.starts_with(COPY_PREFIX) || url.starts_with(TREE_PREFIX)
+}
+
+/// A whole folder copied as one stream into `dst_parent` (it arrives as `dst_parent/<name>`).
+pub fn make_tree_url(src_server: &str, src_dir: &str, dst_server: &str, dst_parent: &str) -> String {
+    let copy = make_copy_url(src_server, src_dir, dst_server, dst_parent, false);
+    format!("{TREE_PREFIX}{}", &copy[COPY_PREFIX.len()..])
 }
 
 pub fn make_copy_url(src_server: &str, src_path: &str, dst_server: &str, dst_path: &str, overwrite: bool) -> String {
@@ -106,6 +120,10 @@ pub fn parse_url(url: &str) -> Option<RemoteRef> {
     if let Some(rest) = url.strip_prefix(COPY_PREFIX) {
         return parse_copy_url(rest);
     }
+    if let Some(rest) = url.strip_prefix(TREE_PREFIX) {
+        // A stream item may carry a `&created=1` marker in its effective URL, never here.
+        return parse_copy_url(rest).map(|r| RemoteRef { direction: Direction::Tree, ..r });
+    }
     let (direction, rest) = if let Some(r) = url.strip_prefix(DOWN_PREFIX) {
         (Direction::Download, r)
     } else {
@@ -124,7 +142,7 @@ pub fn parse_url(url: &str) -> Option<RemoteRef> {
 }
 
 /// Queue items cannot show dialogs: anything that needs the user to answer fails with a hint.
-struct NoPrompt;
+pub(crate) struct NoPrompt;
 
 impl Interact for NoPrompt {
     fn confirm_host_key<'a>(&'a self, _h: &'a str, _p: u16, _t: &'a str, _f: &'a str) -> BoxFuture<'a, bool> {
@@ -149,23 +167,54 @@ pub async fn run_remote(ctx: &TransferCtx, id: &str, cancel: &CancellationToken,
     let r = parse_url(&dl.original_url).ok_or_else(|| AppError::new(ErrorCode::ErrInvalidUrlScheme, "Tautan transfer server tidak valid."))?;
     let proxy = ctx.proxy();
     let svc = ServerService::new(ctx.db.clone(), Arc::new(move || proxy.clone()));
-    let mut fs = svc.open_fs(&r.server_id, Arc::new(NoPrompt), cancel.clone()).await.map_err(needs_the_user);
+    let dest = match r.direction {
+        Direction::Copy | Direction::Tree => {
+            let (dst_id, dst_path) = r.dest.clone().ok_or_else(|| AppError::new(ErrorCode::ErrInvalidUrlScheme, "Tautan salinan tidak punya tujuan."))?;
+            if dst_id == r.server_id && dst_path == r.path {
+                return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Sumber dan tujuan adalah berkas yang sama."));
+            }
+            Some((dst_id, dst_path))
+        }
+        _ => None,
+    };
+    // Connections come from the shared pool: thousands of small files reuse a few logins.
+    let mut ids = vec![r.server_id.as_str()];
+    if let Some((dst_id, _)) = &dest {
+        ids.push(dst_id.as_str());
+    }
+    let mut leases = match ctx.pool.lease(&svc, Arc::new(NoPrompt), &ids, cancel).await.map_err(needs_the_user)? {
+        Some(l) => l,
+        None => return Ok(Outcome::Stopped),
+    };
     if cancel.is_cancelled() {
-        if let Ok(fs) = fs {
-            fs.close().await;
+        for l in leases {
+            l.keep();
         }
         return Ok(Outcome::Stopped);
     }
-    let result = match fs.as_mut() {
-        Ok(fs) => match r.direction {
-            Direction::Download => download(ctx, id, &dl.target_path, &r, fs.as_mut(), cancel, &bucket).await,
-            Direction::Upload => upload(ctx, id, &dl.target_path, &r, fs.as_mut(), cancel, &bucket).await,
-            Direction::Copy => copy_between(ctx, id, &svc, &r, fs.as_mut(), cancel, &bucket).await,
-        },
-        Err(e) => Err(e.clone()),
+    let result = match (r.direction, leases.as_mut_slice()) {
+        (Direction::Download, [src]) => download(ctx, id, &dl.target_path, &r, src.fs(), cancel, &bucket).await,
+        (Direction::Upload, [dst]) => upload(ctx, id, &dl.target_path, &r, dst.fs(), cancel, &bucket).await,
+        (Direction::Copy, [src, dst]) => {
+            let (dst_id, dst_path) = dest.as_ref().expect("copy has a destination");
+            copy_between(ctx, id, &r, dst_id, dst_path, src.fs(), dst.fs(), cancel, &bucket).await
+        }
+        (Direction::Tree, [src, dst]) => super::folder_stream::run(ctx, id, &r, src.fs(), dst.fs(), cancel, &bucket).await,
+        _ => Err(AppError::internal("jumlah koneksi tidak cocok dengan jenis transfer")),
     };
-    if let Ok(fs) = fs {
-        fs.close().await;
+    // Only a cleanly finished transfer (or one refused for a file-level reason) hands its
+    // connections back; anything that may have left the link half-used closes it.
+    let reusable = match &result {
+        Ok(Outcome::Completed) => true,
+        Ok(_) => false,
+        Err(e) => crate::server::pool::connection_survives(e),
+    };
+    for l in leases {
+        if reusable {
+            l.keep();
+        } else {
+            l.discard().await;
+        }
     }
     result
 }
@@ -201,7 +250,7 @@ pub async fn ensure_remote_dir(fs: &mut dyn RemoteFs, dir: &str) -> Result<()> {
 }
 
 /// Tracks progress: events every 250 ms, durable checkpoints about once a second.
-struct Meter {
+pub(super) struct Meter {
     started: Instant,
     last_emit: Instant,
     last_bytes: i64,
@@ -209,12 +258,12 @@ struct Meter {
 }
 
 impl Meter {
-    fn new(at: i64) -> Self {
+    pub(super) fn new(at: i64) -> Self {
         let now = Instant::now();
         Meter { started: now, last_emit: now, last_bytes: at, last_save: now }
     }
 
-    async fn tick(&mut self, ctx: &TransferCtx, id: &str, bytes: i64, total: i64) {
+    pub(super) async fn tick(&mut self, ctx: &TransferCtx, id: &str, bytes: i64, total: i64) {
         if self.last_emit.elapsed() >= Duration::from_millis(250) {
             let dt = self.last_emit.elapsed().as_secs_f64().max(0.001);
             let speed = ((bytes - self.last_bytes).max(0) as f64 / dt) as u64;
@@ -228,7 +277,7 @@ impl Meter {
         let _ = self.started;
     }
 
-    async fn save(&mut self, ctx: &TransferCtx, id: &str, bytes: i64) {
+    pub(super) async fn save(&mut self, ctx: &TransferCtx, id: &str, bytes: i64) {
         let id2 = id.to_string();
         let _ = ctx.db.write(move |c| repo::set_downloaded_bytes(c, &id2, bytes)).await;
         self.last_save = Instant::now();
@@ -385,11 +434,8 @@ async fn upload(ctx: &TransferCtx, id: &str, source: &str, r: &RemoteRef, fs: &m
 }
 
 /// Stream a file from the source server (`src`) to the destination server, never storing it here.
-async fn copy_between(ctx: &TransferCtx, id: &str, svc: &ServerService, r: &RemoteRef, src: &mut dyn RemoteFs, cancel: &CancellationToken, bucket: &Arc<TokenBucket>) -> Result<Outcome> {
-    let (dst_id, dst_path) = r.dest.clone().ok_or_else(|| AppError::new(ErrorCode::ErrInvalidUrlScheme, "Tautan salinan tidak punya tujuan."))?;
-    if dst_id == r.server_id && dst_path == r.path {
-        return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Sumber dan tujuan adalah berkas yang sama."));
-    }
+#[allow(clippy::too_many_arguments)]
+async fn copy_between(ctx: &TransferCtx, id: &str, r: &RemoteRef, dst_id: &str, dst_path: &str, src: &mut dyn RemoteFs, dst: &mut dyn RemoteFs, cancel: &CancellationToken, bucket: &Arc<TokenBucket>) -> Result<Outcome> {
     let entry = src.stat(&r.path).await?;
     if entry.is_dir {
         return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Folder tidak bisa disalin sebagai satu berkas."));
@@ -398,13 +444,9 @@ async fn copy_between(ctx: &TransferCtx, id: &str, svc: &ServerService, r: &Remo
         return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Ini bukan berkas biasa (socket, FIFO, atau perangkat), jadi tidak ada isi yang bisa disalin."));
     }
     let total = entry.size as i64;
-    let (id2, url) = (id.to_string(), make_copy_url(&r.server_id, &r.path, &dst_id, &dst_path, r.overwrite));
+    let (id2, url) = (id.to_string(), make_copy_url(&r.server_id, &r.path, dst_id, dst_path, r.overwrite));
     ctx.db.write(move |c| repo::update_probe_result(c, &id2, &url, total, None, false)).await?;
-
-    let mut dst = svc.open_fs(&dst_id, Arc::new(NoPrompt), cancel.clone()).await.map_err(needs_the_user)?;
-    let result = copy_stream(ctx, id, r, &dst_path, total, src, dst.as_mut(), cancel, bucket).await;
-    dst.close().await;
-    result
+    copy_stream(ctx, id, r, dst_path, total, src, dst, cancel, bucket).await
 }
 
 #[allow(clippy::too_many_arguments)]

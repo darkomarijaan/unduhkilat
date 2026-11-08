@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use unduhkilat_core::config::{keys, EngineConfig};
 use unduhkilat_core::db::Db;
-use unduhkilat_core::engine::manager::Manager;
+use unduhkilat_core::engine::manager::{Manager, Scope};
 use unduhkilat_core::engine::EngineEvent;
 use unduhkilat_core::logging::{self, LogHandle};
 use unduhkilat_core::models::DownloadState;
@@ -27,6 +27,11 @@ pub async fn boot() -> Result<Boot, Box<dyn std::error::Error>> {
     let root = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| paths.data_dir.clone()).join("Downloads");
     category::seed_defaults(&db, &root)?;
     let manager = Manager::start(db, EngineConfig::default()).await?;
+    // Finished server transfers are not shown in the download list, and their pop-ups do not outlive
+    // the app, so nothing would ever clear them: drop them here.
+    if let Err(e) = manager.clear_finished_in(Scope::ServerTransfers).await {
+        tracing::warn!(error = %e, "could not clear finished server transfers");
+    }
     Ok(Boot { paths, manager, log })
 }
 
@@ -47,7 +52,8 @@ pub fn spawn_toasts(rt: &Handle, manager: &Manager) {
             if !enabled {
                 continue;
             }
-            if let Ok(d) = manager.get(&id) {
+            // Server transfers report through their own pop-up; a toast per file would flood Windows.
+            if let Some(d) = manager.get(&id).ok().filter(|d| Scope::Downloads.contains(&d.original_url)) {
                 let text = format!("{} berhasil diunduh dan diverifikasi integritasnya.", d.file_name);
                 let path = d.target_path.clone();
                 let _ = tokio::task::spawn_blocking(move || show_toast(&text, &path)).await;

@@ -8,3 +8,5 @@ pub mod ssh;
 pub mod service;
 pub mod shell;
 pub mod fs;
+pub mod pool;
+pub mod exec;

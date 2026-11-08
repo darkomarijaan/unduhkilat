@@ -39,6 +39,8 @@ impl Default for EngineConfig {
 
 pub mod keys {
     pub const CONCURRENCY_LIMIT: &str = "concurrency_limit";
+    /// Server transfers (download/upload/copy with saved servers) run in their own lanes.
+    pub const SERVER_CONCURRENCY_LIMIT: &str = "server_concurrency_limit";
     pub const DEFAULT_CONNECTIONS: &str = "default_connections_per_download";
     pub const GLOBAL_SPEED_LIMIT_KBPS: &str = "global_speed_limit_kbps";
     pub const LOG_LEVEL: &str = "log_level";

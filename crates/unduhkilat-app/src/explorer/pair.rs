@@ -371,31 +371,35 @@ impl App {
         let (m, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             // Each step reports what it queued, so the pop-up can show progress while a big folder is still being read.
-            let report = |ids: Vec<String>, failed: Vec<String>, finished: bool| {
-                let _ = tx.send(Msg::CopyQueued { run, ids, failed, finished });
+            // `weight`: files each queued item carries (a fast folder stream carries the whole folder).
+            let report = |ids: Vec<String>, failed: Vec<String>, finished: bool, weight: usize| {
+                let _ = tx.send(Msg::CopyQueued { run, ids, failed, finished, weight });
                 ctx.request_repaint();
             };
             for j in jobs {
                 if j.is_dir {
                     let Some(fs) = &src_fs else {
-                        report(Vec::new(), vec![format!("{}: sambungan sumber tidak tersedia", j.name)], false);
+                        report(Vec::new(), vec![format!("{}: sambungan sumber tidak tersedia", j.name)], false, 1);
                         continue;
                     };
                     match fs.lock().await.as_mut() {
                         Some(f) => match m.enqueue_folder_copy(f.as_mut(), &j.src_server, &j.src_path, &j.dst_server, &j.dst_dir, false).await {
-                            Ok(r) => report(r.ids, r.failed, false),
-                            Err(e) => report(Vec::new(), vec![format!("{}: {}", j.name, e.message)], false),
+                            Ok(r) => {
+                                let w = r.streamed_files.max(1);
+                                report(r.ids, r.failed, false, w)
+                            }
+                            Err(e) => report(Vec::new(), vec![format!("{}: {}", j.name, e.message)], false, 1),
                         },
-                        None => report(Vec::new(), vec![format!("{}: sambungan sumber sudah ditutup", j.name)], false),
+                        None => report(Vec::new(), vec![format!("{}: sambungan sumber sudah ditutup", j.name)], false, 1),
                     }
                     continue;
                 }
                 match m.enqueue_remote_copy(&j.src_server, &j.src_path, &j.dst_server, &j.dst_dir, overwrite.contains(&j.name)).await {
-                    Ok(d) => report(vec![d.id], Vec::new(), false),
-                    Err(e) => report(Vec::new(), vec![format!("{}: {}", j.name, e.message)], false),
+                    Ok(d) => report(vec![d.id], Vec::new(), false, 1),
+                    Err(e) => report(Vec::new(), vec![format!("{}: {}", j.name, e.message)], false, 1),
                 }
             }
-            report(Vec::new(), Vec::new(), true);
+            report(Vec::new(), Vec::new(), true, 1);
         });
     }
 
@@ -408,6 +412,14 @@ impl App {
             Direction::Upload => (r.server_id, r.path),
             Direction::Copy => match r.dest {
                 Some(d) => d,
+                None => return,
+            },
+            // The folder lands inside the destination folder under its own name.
+            Direction::Tree => match r.dest {
+                Some((srv, parent)) => {
+                    let name = r.path.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+                    (srv, unduhkilat_core::server::fs::join_remote(&parent, &name))
+                }
                 None => return,
             },
             Direction::Download => return,

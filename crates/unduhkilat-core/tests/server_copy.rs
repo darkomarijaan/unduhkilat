@@ -31,9 +31,13 @@ struct Rig {
 }
 
 async fn side(env: &Env, name: &str) -> Side {
+    side_with(env, name, None).await
+}
+
+async fn side_with(env: &Env, name: &str, accept_delay: Option<Duration>) -> Side {
     let folder = env.dir.join(name);
     std::fs::create_dir_all(&folder).unwrap();
-    let ssh = TestSsh::start_with_sftp(TestSshConfig { users: vec![("eko".into(), TestCred::Password("pw".into()))], allow_forwarding: false, accept_delay: None, shell: false }, folder.clone()).await;
+    let ssh = TestSsh::start_with_sftp(TestSshConfig { users: vec![("eko".into(), TestCred::Password("pw".into()))], allow_forwarding: false, accept_delay, shell: false }, folder.clone()).await;
     let n = NewServer { name: name.into(), protocol: Protocol::Sftp, host: "127.0.0.1".into(), port: Some(ssh.addr.port()), username: "eko".into(), auth: AuthMethod::Password, key_path: None, save_secret: true, hops: vec![] };
     let db = env.manager.db().clone();
     let s = db.write_blocking(move |c| store::insert_server(c, &n)).unwrap();
@@ -272,6 +276,242 @@ async fn existing_files_inside_a_folder_are_reported_not_overwritten_and_self_ne
 
     let e = r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Proyek", &r.a.id, "/Proyek/sub", false).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::ErrInvalidArgument, "a folder cannot be copied into itself");
+    r.a.ssh.stop();
+    r.b.ssh.stop();
+}
+
+fn make_many(root: &std::path::Path, n: usize) {
+    std::fs::create_dir_all(root).unwrap();
+    for i in 0..n {
+        std::fs::write(root.join(format!("f{i:03}.txt")), format!("isi berkas {i}")).unwrap();
+    }
+}
+
+fn assert_many(root: &std::path::Path, n: usize) {
+    for i in 0..n {
+        assert_eq!(std::fs::read_to_string(root.join(format!("f{i:03}.txt"))).unwrap(), format!("isi berkas {i}"));
+    }
+}
+
+/// Thousands of small files must not mean thousands of SSH logins: connections are reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_small_files_reuse_connections_instead_of_logging_in_per_file() {
+    let r = rig().await;
+    make_many(&r.a.folder.join("Banyak"), 30);
+    let mut src = open(&r, &r.a.id).await;
+    let (a0, b0) = (r.a.ssh.login_count(), r.b.ssh.login_count());
+    let res = r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Banyak", &r.b.id, "/", false).await.unwrap();
+    src.close().await;
+    assert_eq!(res.queued, 30);
+    all_done(&r, 30).await;
+    assert_many(&r.b.folder.join("Banyak"), 30);
+    let cap = unduhkilat_core::server::pool::PER_SERVER;
+    let (a, b) = (r.a.ssh.login_count() - a0, r.b.ssh.login_count() - b0);
+    assert!(a <= cap && b <= cap, "logins: source {a}, destination {b}; at most {cap} each expected");
+    r.a.ssh.stop();
+    r.b.ssh.stop();
+}
+
+/// Copying many files within ONE server needs two connections per file from the same server; this
+/// must neither deadlock nor exceed the per-server limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_files_copied_within_one_server_finish_without_deadlock() {
+    let r = rig().await;
+    make_many(&r.a.folder.join("Banyak"), 20);
+    std::fs::create_dir_all(r.a.folder.join("Salinan")).unwrap();
+    let mut src = open(&r, &r.a.id).await;
+    let a0 = r.a.ssh.login_count();
+    let res = r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Banyak", &r.a.id, "/Salinan", false).await.unwrap();
+    src.close().await;
+    assert_eq!(res.queued, 20);
+    all_done(&r, 20).await;
+    assert_many(&r.a.folder.join("Salinan/Banyak"), 20);
+    let cap = unduhkilat_core::server::pool::PER_SERVER;
+    assert!(r.a.ssh.login_count() - a0 <= cap, "logins: {}", r.a.ssh.login_count() - a0);
+    r.a.ssh.stop();
+    r.b.ssh.stop();
+}
+
+/// A kept connection the server dropped in the meantime is replaced, not reported as a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_connection_that_died_is_replaced_transparently() {
+    let r = rig().await;
+    std::fs::write(r.a.folder.join("satu.txt"), b"1").unwrap();
+    std::fs::write(r.a.folder.join("dua.txt"), b"2").unwrap();
+    let d1 = r.env.manager.enqueue_remote_copy(&r.a.id, "/satu.txt", &r.b.id, "/", false).await.unwrap();
+    r.env.manager.wait_for_state(&d1.id, DownloadState::Completed, T).await.unwrap();
+    r.a.ssh.kill_connections().await;
+    r.b.ssh.kill_connections().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let d2 = r.env.manager.enqueue_remote_copy(&r.a.id, "/dua.txt", &r.b.id, "/", false).await.unwrap();
+    let done = r.env.manager.wait_for_state(&d2.id, DownloadState::Completed, T).await;
+    assert!(done.is_ok(), "second copy: {:?}", r.env.manager.get(&d2.id).unwrap().error_message);
+    assert_eq!(std::fs::read(r.b.folder.join("dua.txt")).unwrap(), b"2");
+    r.a.ssh.stop();
+    r.b.ssh.stop();
+}
+
+/// Server transfers have their own parallel lanes: the download limit (here 1) does not make a
+/// folder of thousands of files crawl through one file at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_transfers_run_in_parallel_even_when_the_download_limit_is_one() {
+    let r = rig().await;
+    r.env.manager.set_concurrency_limit(1).await.unwrap();
+    r.env.manager.set_global_speed_limit(1500).await.unwrap();
+    let root = r.a.folder.join("Paralel");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..8 {
+        std::fs::write(root.join(format!("p{i}.bin")), data(400_000)).unwrap();
+    }
+    let mut src = open(&r, &r.a.id).await;
+    let res = r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Paralel", &r.b.id, "/", false).await.unwrap();
+    src.close().await;
+    assert_eq!(res.queued, 8);
+    let mut most = 0;
+    let deadline = Instant::now() + T;
+    while list_all(&r).iter().filter(|d| d.state == DownloadState::Completed).count() < 8 {
+        most = most.max(r.env.manager.running_count());
+        assert!(Instant::now() < deadline, "timed out");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(most > 1, "at most {most} server transfer ran at once");
+    r.env.manager.set_global_speed_limit(0).await.unwrap();
+    r.a.ssh.stop();
+    r.b.ssh.stop();
+}
+
+/// Not a pass/fail test: how long 200 small files take when every login costs 300 ms, as it does
+/// against a real server. Run with `--ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn bench_many_small_files_with_slow_logins() {
+    let env = Env::new().await;
+    let a = side_with(&env, "server-a", Some(Duration::from_millis(300))).await;
+    let b = side_with(&env, "server-b", Some(Duration::from_millis(300))).await;
+    let r = Rig { env, a, b };
+    make_many(&r.a.folder.join("Banyak"), 200);
+    let mut src = open(&r, &r.a.id).await;
+    let started = Instant::now();
+    r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Banyak", &r.b.id, "/", false).await.unwrap();
+    src.close().await;
+    all_done(&r, 200).await;
+    let took = started.elapsed();
+    let logins = r.a.ssh.login_count() + r.b.ssh.login_count();
+    println!("200 berkas: {took:.1?}, {logins} login (tanpa pool: 400 login, sekitar 200 x 0.6 s / 3 jalur = 40 s)");
+    assert_many(&r.b.folder.join("Banyak"), 200);
+}
+
+// ---- fast folder copy: one tar stream (folder_stream) ------------------------------------------
+
+fn make_big_tree(root: &std::path::Path) {
+    make_many(root, 60);
+    std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+    std::fs::write(root.join("sub/deep/c.bin"), data(70_000)).unwrap();
+    std::fs::write(root.join("sub/it's ok.txt"), b"kutip").unwrap();
+}
+
+fn assert_big_tree(root: &std::path::Path) {
+    assert_many(root, 60);
+    assert_eq!(std::fs::read(root.join("sub/deep/c.bin")).unwrap(), data(70_000));
+    assert_eq!(std::fs::read(root.join("sub/it's ok.txt")).unwrap(), b"kutip");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_of_many_small_files_is_copied_as_one_stream() {
+    let r = rig().await;
+    r.a.ssh.enable_tar();
+    r.b.ssh.enable_tar();
+    make_big_tree(&r.a.folder.join("Banyak"));
+    std::fs::create_dir_all(r.b.folder.join("Masuk")).unwrap();
+    let mut src = open(&r, &r.a.id).await;
+    let res = r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Banyak", &r.b.id, "/Masuk", false).await.unwrap();
+    src.close().await;
+    assert_eq!((res.queued, res.streamed_files, res.failed.len()), (1, 62, 0), "one queue item for the whole folder");
+    let done = r.env.manager.wait_for_state(&res.ids[0], DownloadState::Completed, T).await;
+    let d = r.env.manager.get(&res.ids[0]).unwrap();
+    assert!(done.is_ok(), "stream copy: {:?}", d.error_message);
+    assert_big_tree(&r.b.folder.join("Masuk/Banyak"));
+    assert_eq!(d.downloaded_bytes, d.total_bytes, "progress ends at 100%");
+    r.a.ssh.stop();
+    r.b.ssh.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_copy_within_one_server_works() {
+    let r = rig().await;
+    r.a.ssh.enable_tar();
+    make_big_tree(&r.a.folder.join("Banyak"));
+    std::fs::create_dir_all(r.a.folder.join("Salinan")).unwrap();
+    let mut src = open(&r, &r.a.id).await;
+    let res = r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Banyak", &r.a.id, "/Salinan", false).await.unwrap();
+    src.close().await;
+    assert_eq!(res.streamed_files, 62);
+    r.env.manager.wait_for_state(&res.ids[0], DownloadState::Completed, T).await.unwrap();
+    assert_big_tree(&r.a.folder.join("Salinan/Banyak"));
+    r.a.ssh.stop();
+    r.b.ssh.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_tar_on_a_server_the_folder_is_copied_file_by_file() {
+    let r = rig().await;
+    r.a.ssh.enable_tar(); // the destination has no shell access
+    make_big_tree(&r.a.folder.join("Banyak"));
+    let mut src = open(&r, &r.a.id).await;
+    let res = r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Banyak", &r.b.id, "/", false).await.unwrap();
+    src.close().await;
+    assert_eq!((res.queued, res.streamed_files), (62, 0));
+    all_done(&r, 62).await;
+    assert_big_tree(&r.b.folder.join("Banyak"));
+    r.a.ssh.stop();
+    r.b.ssh.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_existing_destination_folder_is_never_overwritten_by_a_stream() {
+    let r = rig().await;
+    r.a.ssh.enable_tar();
+    r.b.ssh.enable_tar();
+    make_big_tree(&r.a.folder.join("Banyak"));
+    std::fs::create_dir_all(r.b.folder.join("Banyak")).unwrap();
+    std::fs::write(r.b.folder.join("Banyak/f000.txt"), b"keep").unwrap();
+    let mut src = open(&r, &r.a.id).await;
+    let res = r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Banyak", &r.b.id, "/", false).await.unwrap();
+    src.close().await;
+    assert_eq!(res.streamed_files, 0, "falls back to per-file copying, which reports each existing file");
+    let deadline = Instant::now() + T;
+    while list_all(&r).iter().filter(|d| matches!(d.state, DownloadState::Completed | DownloadState::Failed)).count() < 62 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert_eq!(std::fs::read(r.b.folder.join("Banyak/f000.txt")).unwrap(), b"keep");
+    assert_eq!(std::fs::read_to_string(r.b.folder.join("Banyak/f001.txt")).unwrap(), "isi berkas 1");
+    r.a.ssh.stop();
+    r.b.ssh.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_stream_copy_starts_again_and_completes() {
+    let r = rig().await;
+    r.a.ssh.enable_tar();
+    r.b.ssh.enable_tar();
+    let root = r.a.folder.join("Banyak");
+    make_many(&root, 60);
+    std::fs::write(root.join("besar.bin"), data(1_500_000)).unwrap();
+    r.env.manager.set_global_speed_limit(400).await.unwrap();
+    let mut src = open(&r, &r.a.id).await;
+    let res = r.env.manager.enqueue_folder_copy(src.as_mut(), &r.a.id, "/Banyak", &r.b.id, "/", false).await.unwrap();
+    src.close().await;
+    let id = res.ids[0].clone();
+    wait_bytes(&r, &id, 200_000).await;
+    r.env.manager.pause(&id).await.unwrap();
+    r.env.manager.wait_for_state(&id, DownloadState::Paused, T).await.unwrap();
+    r.env.manager.set_global_speed_limit(0).await.unwrap();
+    r.env.manager.resume(&id).await.unwrap();
+    let done = r.env.manager.wait_for_state(&id, DownloadState::Completed, T).await;
+    assert!(done.is_ok(), "resumed stream: {:?}", r.env.manager.get(&id).unwrap().error_message);
+    assert_many(&r.b.folder.join("Banyak"), 60);
+    assert_eq!(std::fs::read(r.b.folder.join("Banyak/besar.bin")).unwrap(), data(1_500_000));
     r.a.ssh.stop();
     r.b.ssh.stop();
 }

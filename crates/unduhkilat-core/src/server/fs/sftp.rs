@@ -153,6 +153,14 @@ impl RemoteFs for SftpFs {
         self.sftp.canonicalize(".").await.map_err(map_err)
     }
 
+    fn is_alive(&self) -> bool {
+        !self.session.is_closed()
+    }
+
+    fn ssh(&self) -> Option<&SshSession> {
+        Some(&self.session)
+    }
+
     async fn close(self: Box<Self>) {
         let _ = self.sftp.close().await;
         self.session.close().await;
