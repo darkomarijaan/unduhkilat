@@ -413,6 +413,9 @@ impl App {
                     Ok(v) => {
                         ex.dir = dir;
                         ex.entries = v;
+                        // The cached view is keyed by the request number, which changes before the answer
+                        // arrives: a frame in between would keep showing the old folder.
+                        ex.view_cache = None;
                         ex.selected.clear();
                         // Test aid: `UNDUHKILAT_PREVIEW=<file name>` previews that file once listed.
                         if let (Ok(name), None) = (std::env::var("UNDUHKILAT_PREVIEW"), ex.preview.as_ref()) {
