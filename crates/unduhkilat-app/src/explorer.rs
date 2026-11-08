@@ -18,6 +18,14 @@ pub type SharedFs = Arc<Mutex<Option<Box<dyn RemoteFs>>>>;
 
 /// High bit marks an explorer connection in `ServersState::shell_waiters` (tab ids are small).
 pub const EXPLORER_BIT: u64 = 1 << 62;
+/// Marks a picture-paste upload in `shell_waiters`.
+pub const PASTE_BIT: u64 = 1 << 61;
+
+/// A random 64-bit number for file names (the standard library seeds its hasher from the OS).
+fn random_nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new().build_hasher().finish()
+}
 
 // ---- pure helpers (unit tested) ---------------------------------------------------------------
 
@@ -63,6 +71,20 @@ pub fn overwrite_conflicts(names: &[String], existing: &BTreeSet<String>, case_i
     let lower: BTreeSet<String> = existing.iter().map(|e| e.to_lowercase()).collect();
     names.iter().filter(|n| if case_insensitive { lower.contains(&n.to_lowercase()) } else { existing.contains(*n) }).cloned().collect()
 }
+
+/// File types that must not be started straight from a server: programs, scripts, shortcuts, and
+/// documents with macros. They can still be downloaded and opened on purpose.
+pub fn is_unsafe_to_open(name: &str) -> bool {
+    const RISKY: [&str; 36] = [
+        "exe", "com", "bat", "cmd", "msi", "msp", "scr", "pif", "cpl", "lnk", "url", "hta", "js", "jse", "vbs", "vbe", "wsf", "wsh", "ps1", "psm1", "reg", "jar", "dll", "sys", "appx", "msix", "inf", "gadget", "docm", "xlsm", "pptm", "dotm", "xlam", "ppam", "iso", "chm",
+    ];
+    let ext = name.rsplit_once('.').map(|(_, e)| e.trim().to_ascii_lowercase()).unwrap_or_default();
+    RISKY.contains(&ext.as_str())
+}
+
+/// Contents of the `Zone.Identifier` stream that marks a file as coming from the Internet, so Windows
+/// opens Office documents in Protected View and warns before running anything.
+pub const ZONE_IDENTIFIER: &str = "[ZoneTransfer]\r\nZoneId=3\r\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewChoice {
@@ -143,6 +165,10 @@ pub struct ExplorerState {
     pub dialog: Option<ExDialog>,
     pub preview: Option<PreviewView>,
     pub max_preview_mb: u64,
+    /// Set when the connection was blocked because the pinned key or certificate changed.
+    pub changed_key: Option<(String, u16)>,
+    /// Cached sorted and filtered server listing: (entries gen, sort, filter) -> view.
+    pub view_cache: Option<((u64, SortKey, bool, String), Vec<Entry>)>,
 }
 
 impl ExplorerState {
@@ -167,6 +193,8 @@ impl ExplorerState {
             dialog: None,
             preview: None,
             max_preview_mb,
+            changed_key: None,
+            view_cache: None,
         }
     }
 
@@ -189,7 +217,7 @@ pub enum ExplorerMsg {
     Listed { tab_id: u64, gen: u64, dir: String, result: Result<Vec<Entry>, AppError> },
     OpDone { tab_id: u64, what: &'static str, result: Result<(), AppError> },
     Previewed { tab_id: u64, path: String, result: Result<Preview, AppError> },
-    PdfPage { tab_id: u64, page: usize, result: Result<PageImage, AppError> },
+    PdfPage { tab_id: u64, path: String, page: usize, result: Result<PageImage, AppError> },
     Opened(Result<PathBuf, AppError>),
     /// A pasted picture reached the server at this path.
     ImagePasted { tab_id: u64, result: Result<String, AppError> },
@@ -272,7 +300,8 @@ impl App {
     }
 
     pub(super) fn new_explorer(&mut self, server_id: &str) -> ExplorerState {
-        clean_preview_temp();
+        static CLEANED: std::sync::Once = std::sync::Once::new();
+        CLEANED.call_once(clean_preview_temp);
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
         let local = super::terminal::start_dir(None, home.as_deref());
         let db = self.manager.db();
@@ -338,12 +367,18 @@ impl App {
             }
             ExplorerMsg::Opened(Err(e)) => self.notice = Some((e.message, std::time::Instant::now())),
             ExplorerMsg::ImagePasted { tab_id, result: Ok(path) } => {
+                self.servers.shell_waiters.remove(&(tab_id | PASTE_BIT));
+                self.servers.clear_prompts_if_idle();
                 self.terminal.pasted.entry(tab_id).or_default().push(path.clone());
                 if let Some(s) = self.terminal.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.session.as_ref()) {
                     s.send(format!("{path} ").into_bytes());
                 }
             }
-            ExplorerMsg::ImagePasted { result: Err(e), .. } => self.notice = Some((e.message, std::time::Instant::now())),
+            ExplorerMsg::ImagePasted { tab_id, result: Err(e) } => {
+                self.servers.shell_waiters.remove(&(tab_id | PASTE_BIT));
+                self.servers.clear_prompts_if_idle();
+                self.notice = Some((e.message, std::time::Instant::now()));
+            }
             ExplorerMsg::Connected { tab_id, result } => {
                 self.servers.shell_waiters.remove(&(tab_id | EXPLORER_BIT));
                 self.servers.clear_prompts_if_idle();
@@ -360,7 +395,10 @@ impl App {
                         let dir = ex.dir.clone();
                         self.explorer_list_start(tab_id, &mut ex, dir, true);
                     }
-                    Err(e) => ex.status = ExStatus::Failed(e.message),
+                    Err(e) => {
+                        ex.changed_key = e.details.as_ref().filter(|_| e.code == unduhkilat_core::error::ErrorCode::ErrHostKeyChanged).and_then(|d| Some((d.get("host")?.as_str()?.to_string(), d.get("port")?.as_u64()? as u16)));
+                        ex.status = ExStatus::Failed(e.message);
+                    }
                 }
                 self.put_explorer(tab_id, ex);
             }
@@ -419,10 +457,13 @@ impl App {
                     Ok(Preview::Sheets(s)) => PvState::Ready(PvContent::Sheets { sheets: s, active: 0 }),
                 };
             }
-            ExplorerMsg::PdfPage { tab_id, page, result } => {
+            ExplorerMsg::PdfPage { tab_id, path, page, result } => {
                 let ctx = self.ctx.clone();
                 let Some(ex) = self.explorer_mut(tab_id) else { return };
                 let Some(PreviewView { state: PvState::Ready(PvContent::Pdf { page: cur, tex, busy, .. }), entry, .. }) = ex.preview.as_mut() else { return };
+                if entry.path != path {
+                    return; // a page of a PDF that is no longer shown
+                }
                 *busy = false;
                 if let Ok(img) = result {
                     *tex = Some(texture(&ctx, &format!("{}#{page}", entry.path), &img));
@@ -464,6 +505,20 @@ impl App {
                 }
             }
             let msg = if failed.is_empty() { format!("{ok} unduhan ditambahkan ke antrean.") } else { format!("{ok} ditambahkan; gagal: {}", failed.join("; ")) };
+            let _ = tx.send(Msg::Notice(msg));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Download one file by its own full path (the preview may stay open while the folder changes).
+    fn explorer_enqueue_download_path(&mut self, ex: &ExplorerState, entry: &Entry) {
+        let (m, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
+        let (sid, local, path) = (ex.server_id.clone(), ex.local_dir.clone(), entry.path.clone());
+        self.rt.spawn(async move {
+            let msg = match m.enqueue_remote_download(&sid, &path, &local, false).await {
+                Ok(_) => "1 unduhan ditambahkan ke antrean.".to_string(),
+                Err(e) => e.message,
+            };
             let _ = tx.send(Msg::Notice(msg));
             ctx.request_repaint();
         });
@@ -518,6 +573,10 @@ impl App {
     fn explorer_open_external(&mut self, ex: &ExplorerState, entry: &Entry) {
         let Some(fs) = ex.fs.clone() else { return };
         let Some(name) = safe_local_name(&entry.name) else { return };
+        if is_unsafe_to_open(&name) {
+            self.notice = Some(("Jenis berkas ini bisa menjalankan program atau makro, jadi tidak dibuka langsung dari server. Unduh dulu, lalu buka sendiri bila Anda yakin.".into(), std::time::Instant::now()));
+            return;
+        }
         let (tx, ctx, path, size) = (self.tx.clone(), self.ctx.clone(), entry.path.clone(), entry.size);
         let max = ex.max_preview_mb.max(25) * 1024 * 1024 * 4;
         self.rt.spawn(async move {
@@ -532,7 +591,15 @@ impl App {
                 let f = guard.as_mut().ok_or_else(|| AppError::new(unduhkilat_core::error::ErrorCode::ErrConnectionDropped, "Sambungan sudah ditutup."))?;
                 let mut reader = f.open_read(&path, 0).await?;
                 let mut out = tokio::fs::File::create(&target).await.map_err(|e| AppError::internal(e.to_string()))?;
-                tokio::io::copy(&mut reader, &mut out).await.map_err(|e| AppError::new(unduhkilat_core::error::ErrorCode::ErrConnectionDropped, e.to_string()))?;
+                // Never copy more than the size we were told (a server may lie).
+                let mut limited = tokio::io::AsyncReadExt::take(&mut reader, size.min(max) + 1);
+                let copied = tokio::io::copy(&mut limited, &mut out).await.map_err(|e| AppError::new(unduhkilat_core::error::ErrorCode::ErrConnectionDropped, e.to_string()))?;
+                if copied > size.min(max) {
+                    return Err(AppError::new(unduhkilat_core::error::ErrorCode::ErrPreviewTooLarge, "Berkas lebih besar dari yang dilaporkan server; dihentikan."));
+                }
+                drop(out);
+                // Mark it as downloaded from the Internet (Protected View, SmartScreen).
+                let _ = std::fs::write(format!("{}:Zone.Identifier", target.display()), ZONE_IDENTIFIER);
                 Ok(target)
             }
             .await;
@@ -547,6 +614,8 @@ impl App {
         let (svc, tx, ctx) = (self.manager.servers(), self.tx.clone(), self.ctx.clone());
         let interact = Arc::new(super::servers::UiInteract { tx: tx.clone(), ctx: ctx.clone() });
         self.notice = Some(("Mengunggah gambar dari papan klip...".into(), std::time::Instant::now()));
+        // Questions (host key, password) from this connection must reach the user.
+        self.servers.shell_waiters.insert(tab_id | PASTE_BIT);
         self.rt.spawn(async move {
             let result: Result<String, AppError> = async {
                 let png = tokio::task::spawn_blocking(|| {
@@ -556,10 +625,13 @@ impl App {
                 .await
                 .map_err(|_| AppError::internal("pembacaan papan klip berhenti"))??;
                 let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-                let name = unduhkilat_core::server::fs::temp_image_name(millis, std::time::Instant::now().elapsed().as_nanos() as u64 ^ (millis as u64).rotate_left(17));
-                let path = join_remote(unduhkilat_core::server::fs::PASTE_DIR, &name);
+                let name = unduhkilat_core::server::fs::temp_image_name(millis, random_nonce());
                 let mut fs = svc.open_fs(&server_id, interact, CancellationToken::new()).await?;
-                let _ = fs.mkdir(unduhkilat_core::server::fs::PASTE_DIR).await; // exists already, usually
+                // Inside the login's own home: not readable or plantable by other users of the server.
+                let home = fs.home().await?;
+                let dir = join_remote(&home, unduhkilat_core::server::fs::PASTE_SUBDIR);
+                let _ = fs.mkdir(&dir).await; // exists already, usually
+                let path = join_remote(&dir, &name);
                 let outcome: Result<(), AppError> = async {
                     use tokio::io::AsyncWriteExt;
                     let mut w = fs.open_write(&path, 0, false).await?;
@@ -602,9 +674,10 @@ impl App {
         *busy = true;
         *sc = scale;
         let (bytes, tx, ctx) = (bytes.clone(), self.tx.clone(), self.ctx.clone());
+        let path = ex.preview.as_ref().map(|p| p.entry.path.clone()).unwrap_or_default();
         self.rt.spawn(async move {
             let result = tokio::task::spawn_blocking(move || preview::pdf::render_page(&bytes, page, scale)).await.unwrap_or_else(|_| Err(AppError::internal("render PDF berhenti")));
-            let _ = tx.send(Msg::Explorer(ExplorerMsg::PdfPage { tab_id, page, result }));
+            let _ = tx.send(Msg::Explorer(ExplorerMsg::PdfPage { tab_id, path, page, result }));
             ctx.request_repaint();
         });
     }
@@ -632,6 +705,16 @@ impl App {
                 ui.label(RichText::new(&msg).color(DANGER));
                 if ui.button("Coba lagi").clicked() {
                     self.explorer_connect(tab_id, ex);
+                }
+                if let Some((host, port)) = ex.changed_key.clone() {
+                    ui.label(RichText::new("Bila Anda yakin server ini memang diganti (mis. sertifikat diperbarui), percayai yang baru:").color(FG_SECONDARY));
+                    if ui.add(egui::Button::new(RichText::new("Lupakan yang lama dan percayai yang baru").color(egui::Color32::WHITE)).fill(DANGER)).clicked() {
+                        let (svc, rt) = (self.manager.servers(), self.rt.clone());
+                        // The forgetting finishes before the next connection attempt asks about the new one.
+                        let _ = rt.block_on(svc.forget_host_key(&host, port));
+                        ex.changed_key = None;
+                        self.explorer_connect(tab_id, ex);
+                    }
                 }
                 return;
             }
@@ -673,14 +756,16 @@ impl App {
             ex.local_loaded = Some(ex.local_dir.clone());
         }
         let h = (ui.available_height() - 40.0).max(120.0);
-        egui::ScrollArea::vertical().id_salt("local-list").max_height(h).auto_shrink([false, false]).show(ui, |ui| {
-            if ui.selectable_label(false, "\u{2191}  ..").clicked() {
+        let rows = ex.local_entries.len() + 1;
+        egui::ScrollArea::vertical().id_salt("local-list").max_height(h).auto_shrink([false, false]).show_rows(ui, 22.0, rows, |ui, range| {
+            if range.start == 0 && ui.selectable_label(false, "\u{2191}  ..").clicked() {
                 if let Some(p) = ex.local_dir.parent() {
                     ex.local_dir = p.to_path_buf();
                     ex.local_selected.clear();
                 }
             }
-            for e in ex.local_entries.clone() {
+            for i in range.start.saturating_sub(1)..range.end.saturating_sub(1).min(ex.local_entries.len()) {
+                let e = ex.local_entries[i].clone();
                 let sel = ex.local_selected.contains(&e.name);
                 let slash = if e.is_dir { "/" } else { "" };
                 let size = if e.is_dir { String::new() } else { format::bytes(e.size as i64) };
@@ -736,13 +821,18 @@ impl App {
             ui.label(RichText::new(e).color(DANGER));
         }
         let h = (ui.available_height() - 74.0).max(120.0);
-        let view = view_of(&ex.entries, ex.sort.0, ex.sort.1, &ex.filter);
-        egui::ScrollArea::vertical().id_salt("server-list").max_height(h).auto_shrink([false, false]).show(ui, |ui| {
-            if ex.dir != "/" && ui.selectable_label(false, "\u{2191}  ..").clicked() {
+        let key = (ex.gen, ex.sort.0, ex.sort.1, ex.filter.clone());
+        if ex.view_cache.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+            ex.view_cache = Some((key, view_of(&ex.entries, ex.sort.0, ex.sort.1, &ex.filter)));
+        }
+        let view: Vec<Entry> = ex.view_cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default();
+        let up_row = usize::from(ex.dir != "/");
+        egui::ScrollArea::vertical().id_salt("server-list").max_height(h).auto_shrink([false, false]).show_rows(ui, 22.0, view.len() + up_row, |ui, range| {
+            if up_row == 1 && range.start == 0 && ui.selectable_label(false, "\u{2191}  ..").clicked() {
                 let p = parent_remote(&ex.dir);
                 self.explorer_list(tab_id, ex, &p);
             }
-            for e in &view {
+            for e in view.iter().skip(range.start.saturating_sub(up_row)).take(range.len()) {
                 let sel = ex.selected.contains(&e.path);
                 let slash = if e.is_dir { "/" } else { "" };
                 let size = if e.is_dir { String::new() } else { format::bytes(e.size as i64) };
@@ -854,11 +944,12 @@ impl App {
                 });
                 match act {
                     Some(true) if safe_local_name(&name).is_some() && name != entry.name => {
+                        let name = name.trim().to_string();
                         if ex.entries.iter().any(|e| e.name == name) {
                             self.notice = Some(("Nama itu sudah dipakai di folder ini.".into(), std::time::Instant::now()));
                             keep = Some(ExDialog::Rename(entry, name));
                         } else {
-                            let (from, to) = (entry.path.clone(), join_remote(&ex.dir, name.trim()));
+                            let (from, to) = (entry.path.clone(), join_remote(&parent_remote(&entry.path), &name));
                             self.explorer_op(tab_id, ex, "Gagal mengganti nama", move |f| Box::pin(async move { f.rename(&from, &to).await }));
                         }
                     }
@@ -1080,7 +1171,7 @@ impl App {
             self.explorer_open_external(ex, &entry);
         }
         if want_download {
-            self.explorer_enqueue_downloads(ex, &[entry.name.clone()], false);
+            self.explorer_enqueue_download_path(ex, &entry);
         }
     }
 }
@@ -1165,6 +1256,17 @@ mod tests {
         assert_eq!(overwrite_conflicts(&names, &existing, false), ["a.txt"], "servers are case-sensitive");
         assert_eq!(overwrite_conflicts(&names, &existing, true), ["a.txt", "b.txt"], "Windows is not");
         assert!(overwrite_conflicts(&[], &existing, true).is_empty());
+    }
+
+    #[test]
+    fn programs_and_macro_documents_are_not_opened_from_a_server() {
+        for bad in ["setup.exe", "run.BAT", "x.js", "a.hta", "link.lnk", "i.msi", "s.ps1", "m.docm", "m.XLSM", "t.scr"] {
+            assert!(is_unsafe_to_open(bad), "{bad}");
+        }
+        for ok in ["report.pdf", "notes.txt", "photo.png", "sheet.xlsx", "doc.docx", "noext", "archive.zip"] {
+            assert!(!is_unsafe_to_open(ok), "{ok}");
+        }
+        assert!(ZONE_IDENTIFIER.contains("ZoneId=3"));
     }
 
     #[test]

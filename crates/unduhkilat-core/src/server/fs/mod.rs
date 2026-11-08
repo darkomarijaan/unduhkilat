@@ -149,8 +149,9 @@ pub mod ftp;
 
 // ---- pasting a picture into a remote terminal (Alt+V) -------------------------------------------
 
-/// Folder on the server that receives pasted pictures.
-pub const PASTE_DIR: &str = "/tmp/unduhkilat";
+/// Hidden folder inside the login's own home directory that receives pasted pictures (a shared
+/// /tmp folder could be read or planted by other users).
+pub const PASTE_SUBDIR: &str = ".unduhkilat-paste";
 
 /// A unique, shell-safe file name for a pasted picture (`img-<milliseconds>-<nonce hex>.png`).
 pub fn temp_image_name(millis: u128, nonce: u64) -> String {
@@ -176,7 +177,7 @@ mod paste_tests {
         assert_eq!(a, "img-1700000000123-00000000deadbeef.png");
         assert_ne!(a, temp_image_name(1_700_000_000_123, 1), "the nonce separates two pastes in the same millisecond");
         assert!(a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'), "nothing a shell would treat specially");
-        assert_eq!(join_remote(PASTE_DIR, &a), format!("/tmp/unduhkilat/{a}"));
+        assert_eq!(join_remote(&join_remote("/home/eko", PASTE_SUBDIR), &a), format!("/home/eko/.unduhkilat-paste/{a}"));
     }
 
     #[test]
