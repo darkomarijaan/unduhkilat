@@ -169,6 +169,9 @@ pub struct ExplorerState {
     pub local_entries: Vec<Entry>,
     pub local_loaded: Option<PathBuf>,
     pub local_loaded_at: Option<std::time::Instant>,
+    /// A file that just finished downloading into the folder on the left: select it and scroll to it.
+    pub highlight: Option<(String, u8)>,
+    pub local_scroll_to: Option<usize>,
     pub local_selected: BTreeSet<String>,
     pub dialog: Option<ExDialog>,
     pub preview: Option<PreviewView>,
@@ -198,6 +201,8 @@ impl ExplorerState {
             local_entries: Vec::new(),
             local_loaded: None,
             local_loaded_at: None,
+            highlight: None,
+            local_scroll_to: None,
             local_selected: BTreeSet::new(),
             dialog: None,
             preview: None,
@@ -316,6 +321,20 @@ impl App {
         let db = self.manager.db();
         let mb = db.read(|c| unduhkilat_core::repo::get_setting(c, unduhkilat_core::config::keys::PREVIEW_MAX_MB)).ok().flatten().and_then(|v| v.parse::<u64>().ok()).filter(|v| *v >= 1).unwrap_or(25);
         ExplorerState::new(server_id, local, mb)
+    }
+
+    /// A download finished: when it landed in the folder an explorer shows on the left, mark it there.
+    pub(super) fn highlight_downloaded(&mut self, target: &str) {
+        let target = PathBuf::from(target);
+        let (Some(dir), Some(name)) = (target.parent(), target.file_name().map(|n| n.to_string_lossy().into_owned())) else { return };
+        for t in self.terminal.tabs.iter_mut() {
+            if let Some(ex) = t.explorer.as_mut() {
+                if ex.local_dir == dir {
+                    ex.highlight = Some((name.clone(), 0));
+                    ex.local_loaded_at = None;
+                }
+            }
+        }
     }
 
     pub(super) fn explorer_connect(&mut self, tab_id: u64, ex: &mut ExplorerState) {
@@ -805,11 +824,25 @@ impl App {
             let names: BTreeSet<&String> = ex.local_entries.iter().map(|e| &e.name).collect();
             ex.local_selected.retain(|n| names.contains(n));
         }
+        if let Some((name, tries)) = ex.highlight.take() {
+            if let Some(i) = ex.local_entries.iter().position(|e| e.name == name) {
+                ex.local_selected = [name].into();
+                ex.local_scroll_to = Some(i + 1);
+            } else if tries < 5 {
+                ex.highlight = Some((name, tries + 1));
+                ex.local_loaded_at = None;
+            }
+        }
         // New files (a finished download) show up without clicking anything.
         ui.ctx().request_repaint_after(LOCAL_REFRESH);
         let h = (ui.available_height() - 40.0).max(120.0);
         let rows = ex.local_entries.len() + 1;
-        egui::ScrollArea::vertical().id_salt("local-list").max_height(h).auto_shrink([false, false]).show_rows(ui, 22.0, rows, |ui, range| {
+        let mut area = egui::ScrollArea::vertical().id_salt("local-list").max_height(h).auto_shrink([false, false]);
+        if let Some(row) = ex.local_scroll_to.take() {
+            let step = 22.0 + ui.spacing().item_spacing.y;
+            area = area.vertical_scroll_offset((row as f32 * step - h / 2.0).max(0.0));
+        }
+        area.show_rows(ui, 22.0, rows, |ui, range| {
             if range.start == 0 && ui.selectable_label(false, "\u{2191}  ..").clicked() {
                 if let Some(p) = ex.local_dir.parent() {
                     ex.local_dir = p.to_path_buf();

@@ -423,6 +423,11 @@ impl App {
                         self.live.remove(&id);
                     }
                     self.last_refresh = Instant::now() - Duration::from_secs(10);
+                    if state == DownloadState::Completed {
+                        if let Ok(d) = self.manager.get(&id) {
+                            self.highlight_downloaded(&d.target_path);
+                        }
+                    }
                 }
             }
         }
