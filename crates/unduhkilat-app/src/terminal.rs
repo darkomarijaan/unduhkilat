@@ -969,6 +969,7 @@ impl App {
             }
             self.servers.shell_waiters.remove(&id);
             self.servers.shell_waiters.remove(&(id | super::explorer::EXPLORER_BIT));
+            self.servers.shell_waiters.remove(&(id | super::explorer::LEFT_BIT));
             self.cleanup_pasted_images(id);
             if let Some(mut ex) = self.terminal.tabs[i].explorer.take() {
                 ex.close(&self.rt);

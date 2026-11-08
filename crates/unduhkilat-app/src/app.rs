@@ -426,6 +426,7 @@ impl App {
                     if state == DownloadState::Completed {
                         if let Ok(d) = self.manager.get(&id) {
                             self.highlight_downloaded(&d.target_path);
+                            self.after_transfer(&d.original_url);
                         }
                     }
                 }

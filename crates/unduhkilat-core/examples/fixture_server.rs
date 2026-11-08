@@ -36,8 +36,15 @@ async fn main() {
     let (private, public) = test_keypair(None);
     let key_path = app_dir.join("fixture_key");
     std::fs::write(&key_path, private).unwrap();
-    let cfg = TestSshConfig { users: vec![("eko".into(), TestCred::Key(public))], allow_forwarding: false, accept_delay: None, shell: false };
+    let cfg = TestSshConfig { users: vec![("eko".into(), TestCred::Key(public.clone()))], allow_forwarding: false, accept_delay: None, shell: false };
     let ssh = TestSsh::start_with_sftp(cfg, root).await;
+    // A second server (its own folder) to copy between.
+    let root_b = std::env::temp_dir().join("uk-fixture-root-b");
+    let _ = std::fs::remove_dir_all(&root_b);
+    std::fs::create_dir_all(root_b.join("Masuk")).unwrap();
+    std::fs::write(root_b.join("sudah-ada.txt"), "isi lama di server B\n").unwrap();
+    let cfg_b = TestSshConfig { users: vec![("eko".into(), TestCred::Key(public))], allow_forwarding: false, accept_delay: None, shell: false };
+    let ssh_b = TestSsh::start_with_sftp(cfg_b, root_b).await;
 
     let state = app_dir.join("data").join("state");
     std::fs::create_dir_all(&state).unwrap();
@@ -47,6 +54,11 @@ async fn main() {
     db.write_blocking(move |c| store::insert_server(c, &n)).unwrap();
     let fp = ssh.host_key_fingerprint();
     db.write_blocking(move |c| hostkeys::trust(c, "127.0.0.1", port, "ssh-ed25519", &fp)).unwrap();
+    let port_b = ssh_b.addr.port();
+    let nb = NewServer { name: "Fixture B".into(), protocol: Protocol::Sftp, host: "127.0.0.1".into(), port: Some(port_b), username: "eko".into(), auth: AuthMethod::Key, key_path: Some(key_path.to_string_lossy().into_owned()), save_secret: false, hops: vec![] };
+    db.write_blocking(move |c| store::insert_server(c, &nb)).unwrap();
+    let fpb = ssh_b.host_key_fingerprint();
+    db.write_blocking(move |c| hostkeys::trust(c, "127.0.0.1", port_b, "ssh-ed25519", &fpb)).unwrap();
     println!("READY port={port}");
     std::io::stdout().flush().unwrap();
     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;

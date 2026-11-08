@@ -14,6 +14,11 @@ use unduhkilat_core::error::AppError;
 use unduhkilat_core::preview::{self, Block, Kind, Limits, PageImage, Preview, Sheet};
 use unduhkilat_core::server::fs::{join_remote, parent_remote, safe_local_name, sort_entries, Entry, RemoteFs, SortKey};
 
+#[path = "explorer/pair.rs"]
+mod pair;
+use pair::{CopyJob, LeftServer, PairMsg};
+pub use pair::LEFT_BIT;
+
 pub type SharedFs = Arc<Mutex<Option<Box<dyn RemoteFs>>>>;
 
 /// High bit marks an explorer connection in `ServersState::shell_waiters` (tab ids are small).
@@ -128,6 +133,8 @@ pub enum ExDialog {
     ConfirmDelete(Vec<Entry>),
     /// Names that exist at the destination; replacing them needs a yes. `download` = server to computer.
     ConfirmOverwrite { download: bool, names: Vec<String>, all: Vec<String> },
+    /// Copying between two servers: `names` already exist at the destination.
+    ConfirmCopy { names: Vec<String>, jobs: Vec<CopyJob> },
 }
 
 pub enum PvContent {
@@ -180,6 +187,11 @@ pub struct ExplorerState {
     pub changed_key: Option<(String, u16)>,
     /// Cached sorted and filtered server listing: (entries gen, sort, filter) -> view.
     pub view_cache: Option<((u64, SortKey, bool, String), Vec<Entry>)>,
+    /// The left panel shows this server instead of this computer.
+    pub left: Option<LeftServer>,
+    /// A file that just arrived in this folder: select it and scroll to it once listed.
+    pub reveal: Option<String>,
+    pub scroll_to: Option<String>,
 }
 
 impl ExplorerState {
@@ -209,10 +221,16 @@ impl ExplorerState {
             max_preview_mb,
             changed_key: None,
             view_cache: None,
+            left: None,
+            reveal: None,
+            scroll_to: None,
         }
     }
 
     pub fn close(&mut self, rt: &tokio::runtime::Handle) {
+        if let Some(mut l) = self.left.take() {
+            l.close(rt);
+        }
         if let Some(c) = self.cancel.take() {
             c.cancel();
         }
@@ -233,6 +251,8 @@ pub enum ExplorerMsg {
     Previewed { tab_id: u64, path: String, result: Result<Preview, AppError> },
     PdfPage { tab_id: u64, path: String, page: usize, result: Result<PageImage, AppError> },
     Opened(Result<PathBuf, AppError>),
+    /// The server shown in the left panel (copying between servers).
+    Pair(PairMsg),
     /// A pasted picture reached the server at this path.
     ImagePasted { tab_id: u64, result: Result<String, AppError> },
 }
@@ -390,6 +410,7 @@ impl App {
 
     pub(super) fn explorer_msg(&mut self, m: ExplorerMsg) {
         match m {
+            ExplorerMsg::Pair(m) => self.pair_msg(m),
             ExplorerMsg::Opened(Ok(path)) => {
                 let _ = std::process::Command::new("explorer").arg(&path).spawn();
             }
@@ -420,6 +441,13 @@ impl App {
                     Ok(fs) => {
                         ex.fs = Some(Arc::new(Mutex::new(Some(fs))));
                         ex.status = ExStatus::Ready;
+                        // Test aid: `UNDUHKILAT_LEFT=<server name>` shows that server on the left.
+                        if let (Ok(name), None) = (std::env::var("UNDUHKILAT_LEFT"), ex.left.as_ref()) {
+                            if let Some(s) = self.servers.servers.iter().find(|s| s.name == name) {
+                                let (id, n) = (s.id.clone(), s.name.clone());
+                                self.pair_choose(tab_id, &mut ex, Some((id, n)));
+                            }
+                        }
                         let dir = ex.dir.clone();
                         self.explorer_list_start(tab_id, &mut ex, dir, true);
                     }
@@ -444,6 +472,12 @@ impl App {
                         // The cached view is keyed by the request number, which changes before the answer
                         // arrives: a frame in between would keep showing the old folder.
                         ex.view_cache = None;
+                        if let Some(p) = ex.reveal.take() {
+                            if ex.entries.iter().any(|e| e.path == p) {
+                                ex.selected = [p.clone()].into();
+                                ex.scroll_to = Some(p);
+                            }
+                        }
                         ex.selected.clear();
                         // Test aid: `UNDUHKILAT_PREVIEW=<file name>` previews that file once listed.
                         if let (Ok(name), None) = (std::env::var("UNDUHKILAT_PREVIEW"), ex.preview.as_ref()) {
@@ -793,7 +827,7 @@ impl App {
         }
         if wide {
             ui.columns(2, |cols| {
-                self.local_panel(&mut cols[0], ex);
+                self.local_panel(&mut cols[0], tab_id, ex);
                 self.server_panel(&mut cols[1], tab_id, ex);
             });
         } else {
@@ -801,13 +835,22 @@ impl App {
         }
     }
 
-    fn local_panel(&mut self, ui: &mut Ui, ex: &mut ExplorerState) {
+    fn local_panel(&mut self, ui: &mut Ui, tab_id: u64, ex: &mut ExplorerState) {
+        if ex.left.is_some() {
+            self.pair_left_ui(ui, tab_id, ex);
+            return;
+        }
+        let mut choice = None;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Komputer ini").font(theme::bold(13.0)));
+            choice = self.source_picker(ui, ex);
             if ui.small_button("Muat ulang").clicked() {
                 ex.local_loaded_at = None;
             }
         });
+        if let Some(c) = choice {
+            self.pair_choose(tab_id, ex, c);
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             for (label, path) in crumbs_local(&ex.local_dir) {
                 if ui.small_button(&label).clicked() {
@@ -912,7 +955,14 @@ impl App {
         }
         let view: Vec<Entry> = ex.view_cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default();
         let up_row = usize::from(ex.dir != "/");
-        egui::ScrollArea::vertical().id_salt("server-list").max_height(h).auto_shrink([false, false]).show_rows(ui, 22.0, view.len() + up_row, |ui, range| {
+        let mut area = egui::ScrollArea::vertical().id_salt("server-list").max_height(h).auto_shrink([false, false]);
+        if let Some(p) = ex.scroll_to.take() {
+            if let Some(i) = view.iter().position(|e| e.path == p) {
+                let step = 22.0 + ui.spacing().item_spacing.y;
+                area = area.vertical_scroll_offset((((i + up_row) as f32) * step - h / 2.0).max(0.0));
+            }
+        }
+        area.show_rows(ui, 22.0, view.len() + up_row, |ui, range| {
             if up_row == 1 && range.start == 0 && ui.selectable_label(false, "\u{2191}  ..").clicked() {
                 let p = parent_remote(&ex.dir);
                 self.explorer_list(tab_id, ex, &p);
@@ -945,6 +995,16 @@ impl App {
         let chosen: Vec<Entry> = ex.entries.iter().filter(|e| ex.selected.contains(&e.path)).cloned().collect();
         let files: Vec<&Entry> = chosen.iter().filter(|e| !e.is_dir).collect();
         ui.horizontal_wrapped(|ui| {
+            let left_ready = ex.left.as_ref().map(|l| l.status == ExStatus::Ready).unwrap_or(false);
+            if left_ready {
+                if ui.add_enabled(!files.is_empty(), egui::Button::new("\u{2190} Salin ke kiri")).on_hover_text("Salin berkas terpilih di server ini ke folder di panel kiri, langsung antar server").clicked() {
+                    self.pair_copy(ex, true);
+                }
+                let can_right = ex.left.as_ref().map(|l| !l.selected.is_empty()).unwrap_or(false);
+                if ui.add_enabled(can_right, egui::Button::new("Salin ke kanan \u{2192}")).on_hover_text("Salin berkas terpilih di panel kiri ke folder ini, langsung antar server").clicked() {
+                    self.pair_copy(ex, false);
+                }
+            } else {
             if ui.add_enabled(!files.is_empty(), egui::Button::new("\u{2190} Unduh")).on_hover_text("Unduh berkas terpilih ke folder di panel kiri").clicked() {
                 let names: Vec<String> = files.iter().map(|e| e.name.clone()).collect();
                 let existing: BTreeSet<String> = ex.local_entries.iter().map(|e| e.name.clone()).collect();
@@ -965,6 +1025,7 @@ impl App {
                 } else {
                     ex.dialog = Some(ExDialog::ConfirmOverwrite { download: false, names: conflicts, all: local_files });
                 }
+            }
             }
             if ui.add_enabled(files.len() == 1, egui::Button::new("Pratinjau")).clicked() {
                 if let Some(e) = files.first() {
@@ -1074,6 +1135,34 @@ impl App {
                     }
                     Some(false) => {}
                     None => keep = Some(ExDialog::ConfirmDelete(items)),
+                }
+            }
+            ExDialog::ConfirmCopy { names, jobs } => {
+                let mut act: Option<bool> = None;
+                win("Timpa berkas").frame(frame).show(ctx, |ui| {
+                    ui.label(RichText::new("Berkas ini sudah ada di server tujuan").font(theme::bold(15.0)));
+                    for n in names.iter().take(8) {
+                        ui.label(format!("\u{2022} {n}"));
+                    }
+                    ui.label(RichText::new("Menimpa akan mengganti isinya dan tidak bisa dibatalkan.").color(FG_SECONDARY));
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Timpa").color(egui::Color32::WHITE)).fill(DANGER)).clicked() {
+                            act = Some(true);
+                        }
+                        if ui.button("Lewati yang sudah ada").clicked() {
+                            act = Some(false);
+                        }
+                    });
+                });
+                match act {
+                    Some(true) => self.pair_enqueue(jobs, names),
+                    Some(false) => {
+                        let rest: Vec<CopyJob> = jobs.into_iter().filter(|j| !names.contains(&j.name)).collect();
+                        if !rest.is_empty() {
+                            self.pair_enqueue(rest, Vec::new());
+                        }
+                    }
+                    None => keep = Some(ExDialog::ConfirmCopy { names, jobs }),
                 }
             }
             ExDialog::ConfirmOverwrite { download, names, all } => {

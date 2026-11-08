@@ -3,7 +3,9 @@
 //! A queue item is recognised by its URL: `server://<server id>/<remote path>` is a download (the
 //! local destination is `target_path`) and `server-up://<server id>/<remote path>` is an upload (the
 //! local source is `target_path`). `?overwrite=1` is added only after the user confirmed replacing an
-//! existing file. Pause, resume, priority, speed limits and notifications come from the shared engine.
+//! existing file. `server-copy://<source id>/<path>?to=<destination id>&dst=<path>` copies between two
+//! servers, streaming through this computer without writing to its disk (`target_path` then only
+//! names the destination for display). Pause, resume, priority, speed limits and notifications come from the shared engine.
 
 use super::throttle::TokenBucket;
 use super::transfer::{Outcome, TransferCtx};
@@ -23,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 const DOWN_PREFIX: &str = "server://";
 const UP_PREFIX: &str = "server-up://";
+const COPY_PREFIX: &str = "server-copy://";
 const CHUNK: usize = 64 * 1024;
 /// A transfer that moves nothing for this long fails instead of hanging.
 const IDLE: Duration = Duration::from_secs(60);
@@ -33,6 +36,8 @@ const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC.remove(b'/');
 pub enum Direction {
     Download,
     Upload,
+    /// From `server_id` to `dest`, both servers.
+    Copy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,10 +46,46 @@ pub struct RemoteRef {
     pub server_id: String,
     pub path: String,
     pub overwrite: bool,
+    /// Only for `Direction::Copy`: the destination server id and path.
+    pub dest: Option<(String, String)>,
 }
 
 pub fn is_remote(url: &str) -> bool {
-    url.starts_with(DOWN_PREFIX) || url.starts_with(UP_PREFIX)
+    url.starts_with(DOWN_PREFIX) || url.starts_with(UP_PREFIX) || url.starts_with(COPY_PREFIX)
+}
+
+/// Uploads and copies have no local file of their own to restart into or delete.
+pub fn leaves_local_files_alone(url: &str) -> bool {
+    url.starts_with(UP_PREFIX) || url.starts_with(COPY_PREFIX)
+}
+
+pub fn make_copy_url(src_server: &str, src_path: &str, dst_server: &str, dst_path: &str, overwrite: bool) -> String {
+    let abs = |p: &str| if p.starts_with('/') { p.to_string() } else { format!("/{p}") };
+    let mut url = format!("{COPY_PREFIX}{src_server}{}?to={dst_server}&dst={}", utf8_percent_encode(&abs(src_path), PATH_SET), utf8_percent_encode(&abs(dst_path), NON_ALPHANUMERIC));
+    if overwrite {
+        url.push_str("&overwrite=1");
+    }
+    url
+}
+
+fn parse_copy_url(rest: &str) -> Option<RemoteRef> {
+    let (head, query) = rest.split_once('?')?;
+    let slash = head.find('/')?;
+    let (server_id, path) = head.split_at(slash);
+    if server_id.is_empty() {
+        return None;
+    }
+    let (mut to, mut dst, mut overwrite) = (None, None, false);
+    for kv in query.split('&') {
+        match kv.split_once('=') {
+            Some(("to", v)) => to = Some(v.to_string()),
+            Some(("dst", v)) => dst = Some(percent_decode_str(v).decode_utf8().ok()?.into_owned()),
+            Some(("overwrite", "1")) => overwrite = true,
+            _ => {}
+        }
+    }
+    let (to, dst) = (to.filter(|t| !t.is_empty())?, dst.filter(|d| d.starts_with('/'))?);
+    Some(RemoteRef { direction: Direction::Copy, server_id: server_id.to_string(), path: percent_decode_str(path).decode_utf8().ok()?.into_owned(), overwrite, dest: Some((to, dst)) })
 }
 
 pub fn is_upload(url: &str) -> bool {
@@ -62,6 +103,9 @@ pub fn make_url(direction: Direction, server_id: &str, remote_path: &str, overwr
 }
 
 pub fn parse_url(url: &str) -> Option<RemoteRef> {
+    if let Some(rest) = url.strip_prefix(COPY_PREFIX) {
+        return parse_copy_url(rest);
+    }
     let (direction, rest) = if let Some(r) = url.strip_prefix(DOWN_PREFIX) {
         (Direction::Download, r)
     } else {
@@ -76,7 +120,7 @@ pub fn parse_url(url: &str) -> Option<RemoteRef> {
     if server_id.is_empty() {
         return None;
     }
-    Some(RemoteRef { direction, server_id: server_id.to_string(), path: percent_decode_str(path).decode_utf8().ok()?.into_owned(), overwrite })
+    Some(RemoteRef { direction, server_id: server_id.to_string(), path: percent_decode_str(path).decode_utf8().ok()?.into_owned(), overwrite, dest: None })
 }
 
 /// Queue items cannot show dialogs: anything that needs the user to answer fails with a hint.
@@ -116,6 +160,7 @@ pub async fn run_remote(ctx: &TransferCtx, id: &str, cancel: &CancellationToken,
         Ok(fs) => match r.direction {
             Direction::Download => download(ctx, id, &dl.target_path, &r, fs.as_mut(), cancel, &bucket).await,
             Direction::Upload => upload(ctx, id, &dl.target_path, &r, fs.as_mut(), cancel, &bucket).await,
+            Direction::Copy => copy_between(ctx, id, &svc, &r, fs.as_mut(), cancel, &bucket).await,
         },
         Err(e) => Err(e.clone()),
     };
@@ -305,9 +350,104 @@ async fn upload(ctx: &TransferCtx, id: &str, source: &str, r: &RemoteRef, fs: &m
     Ok(Outcome::Completed)
 }
 
+/// Stream a file from the source server (`src`) to the destination server, never storing it here.
+async fn copy_between(ctx: &TransferCtx, id: &str, svc: &ServerService, r: &RemoteRef, src: &mut dyn RemoteFs, cancel: &CancellationToken, bucket: &Arc<TokenBucket>) -> Result<Outcome> {
+    let (dst_id, dst_path) = r.dest.clone().ok_or_else(|| AppError::new(ErrorCode::ErrInvalidUrlScheme, "Tautan salinan tidak punya tujuan."))?;
+    if dst_id == r.server_id && dst_path == r.path {
+        return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Sumber dan tujuan adalah berkas yang sama."));
+    }
+    let entry = src.stat(&r.path).await?;
+    if entry.is_dir {
+        return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Folder tidak bisa disalin sebagai satu berkas."));
+    }
+    let total = entry.size as i64;
+    let (id2, url) = (id.to_string(), make_copy_url(&r.server_id, &r.path, &dst_id, &dst_path, r.overwrite));
+    ctx.db.write(move |c| repo::update_probe_result(c, &id2, &url, total, None, false)).await?;
+
+    let mut dst = svc.open_fs(&dst_id, Arc::new(NoPrompt), cancel.clone()).await.map_err(needs_the_user)?;
+    let result = copy_stream(ctx, id, r, &dst_path, total, src, dst.as_mut(), cancel, bucket).await;
+    dst.close().await;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn copy_stream(ctx: &TransferCtx, id: &str, r: &RemoteRef, dst_path: &str, total: i64, src: &mut dyn RemoteFs, dst: &mut dyn RemoteFs, cancel: &CancellationToken, bucket: &Arc<TokenBucket>) -> Result<Outcome> {
+    let dl = ctx.db.read(|c| repo::get_download(c, id))?;
+    // What is already at the destination decides between a collision and a resume.
+    let offset = match dst.stat(dst_path).await {
+        Ok(e) if e.is_dir => return Err(AppError::new(ErrorCode::ErrNameCollision, "Di server tujuan sudah ada folder dengan nama itu.")),
+        Ok(e) if dl.downloaded_bytes > 0 && (e.size as i64) <= total => e.size as i64,
+        Ok(_) if r.overwrite => 0,
+        Ok(_) => return Err(AppError::new(ErrorCode::ErrNameCollision, "Berkas dengan nama itu sudah ada di server tujuan dan tidak ditimpa.")),
+        Err(e) if e.code == ErrorCode::ErrNotFound => 0,
+        Err(e) => return Err(e),
+    };
+    let mut reader = src.open_read(&r.path, offset as u64).await?;
+    let mut writer = dst.open_write(dst_path, offset as u64, offset > 0).await?;
+    let mut buf = vec![0u8; CHUNK];
+    let mut sent = offset;
+    let mut meter = Meter::new(offset);
+    loop {
+        if cancel.is_cancelled() {
+            let _ = writer.flush().await;
+            drop(writer);
+            meter.save(ctx, id, sent).await;
+            return Ok(Outcome::Stopped);
+        }
+        let n = tokio::select! {
+            _ = cancel.cancelled() => continue,
+            n = tokio::time::timeout(IDLE, reader.read(&mut buf)) => n.map_err(|_| AppError::new(ErrorCode::ErrConnectionDropped, "Server sumber berhenti mengirim data. Lanjutkan untuk meneruskan."))?.map_err(|e| AppError::new(ErrorCode::ErrConnectionDropped, format!("Pembacaan dari server sumber terputus: {e}")))?,
+        };
+        if n == 0 {
+            break;
+        }
+        ctx.throttle.acquire(bucket, n).await;
+        let wrote = tokio::select! {
+            _ = cancel.cancelled() => None,
+            w = tokio::time::timeout(IDLE, writer.write_all(&buf[..n])) => Some(w),
+        };
+        match wrote {
+            None => {
+                drop(writer);
+                meter.save(ctx, id, sent).await;
+                return Ok(Outcome::Stopped);
+            }
+            Some(Err(_)) => return Err(AppError::new(ErrorCode::ErrConnectionDropped, "Server tujuan berhenti menerima data. Lanjutkan untuk meneruskan.")),
+            Some(Ok(w)) => w.map_err(|e| AppError::new(ErrorCode::ErrConnectionDropped, format!("Penulisan ke server tujuan terputus: {e}")))?,
+        }
+        sent += n as i64;
+        meter.tick(ctx, id, sent, total).await;
+    }
+    match tokio::time::timeout(IDLE, writer.shutdown()).await {
+        Err(_) => return Err(AppError::new(ErrorCode::ErrConnectionDropped, "Server tujuan tidak mengonfirmasi (kehabisan waktu).")),
+        Ok(r) => r.map_err(|e| AppError::new(ErrorCode::ErrConnectionDropped, format!("Server tujuan tidak mengonfirmasi: {e}")))?,
+    }
+    drop(writer);
+    meter.save(ctx, id, sent).await;
+    let size = dst.stat(dst_path).await?.size as i64;
+    if size != total {
+        return Err(AppError::new(ErrorCode::ErrConnectionDropped, format!("Ukuran di server tujuan ({size}) berbeda dari sumber ({total}). Lanjutkan untuk meneruskan.")));
+    }
+    Ok(Outcome::Completed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_urls_roundtrip_and_never_confuse_server_ids() {
+        for (sp, dp) in [("/a.txt", "/in/a.txt"), ("/dir with space/#1?.txt", "/x&y=z/b c?.bin"), ("/100%/x", "/%2F/y")] {
+            for ow in [false, true] {
+                let u = make_copy_url("src-1", sp, "dst-2", dp, ow);
+                assert!(is_remote(&u) && leaves_local_files_alone(&u) && !is_upload(&u));
+                assert_eq!(parse_url(&u), Some(RemoteRef { direction: Direction::Copy, server_id: "src-1".into(), path: sp.into(), overwrite: ow, dest: Some(("dst-2".into(), dp.into())) }), "{u}");
+            }
+        }
+        assert!(parse_url("server-copy://s/x").is_none(), "no destination");
+        assert!(parse_url("server-copy://s/x?to=&dst=%2Fa").is_none());
+        assert!(parse_url("server-copy://s/x?to=d&dst=relative").is_none());
+    }
 
     #[test]
     fn urls_roundtrip_with_awkward_names() {
@@ -315,7 +455,7 @@ mod tests {
             for (dir, ow) in [(Direction::Download, false), (Direction::Upload, true)] {
                 let u = make_url(dir, "srv-1", path, ow);
                 assert!(is_remote(&u));
-                assert_eq!(parse_url(&u), Some(RemoteRef { direction: dir, server_id: "srv-1".into(), path: path.into(), overwrite: ow }), "{u}");
+                assert_eq!(parse_url(&u), Some(RemoteRef { direction: dir, server_id: "srv-1".into(), path: path.into(), overwrite: ow, dest: None }), "{u}");
             }
         }
         assert!(parse_url("https://example.com/x").is_none());

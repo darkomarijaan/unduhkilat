@@ -512,6 +512,26 @@ impl Manager {
         self.insert_remote(url, local_file.to_path_buf(), name, false).await
     }
 
+    /// Queue a copy of `src_path` on one saved server into `dst_dir` on another (or the same) server.
+    /// The data streams through this computer without being stored. An existing file at the
+    /// destination is refused unless `overwrite` (the caller asked the user first), and a file can
+    /// never be copied onto itself.
+    pub async fn enqueue_remote_copy(&self, src_server: &str, src_path: &str, dst_server: &str, dst_dir: &str, overwrite: bool) -> Result<Download> {
+        let name = src_path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(AppError::new(ErrorCode::ErrInvalidPath, "Nama berkas sumber kosong atau tidak valid."));
+        }
+        let dst_path = crate::server::fs::join_remote(dst_dir, name);
+        let src_abs = if src_path.starts_with('/') { src_path.to_string() } else { format!("/{src_path}") };
+        if src_server == dst_server && src_abs == dst_path {
+            return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Sumber dan tujuan adalah berkas yang sama. Pilih folder tujuan yang lain."));
+        }
+        let url = super::remote::make_copy_url(src_server, src_path, dst_server, &dst_path, overwrite);
+        // `target_path` is only a label here: nothing is ever written to or removed from this computer.
+        let label = format!("server://{dst_server}{dst_path}");
+        self.insert_remote(url, PathBuf::from(label), name.to_string(), false).await
+    }
+
     async fn insert_remote(&self, url: String, local: PathBuf, file_name: String, check_target_clash: bool) -> Result<Download> {
         let ts = repo::now();
         let dl = Download {
@@ -723,7 +743,7 @@ impl Manager {
         // The segment plan is gone, so the next run re-probes and re-allocates. For an upload
         // `target_path` is the user's own file: it is never touched.
         let path = PathBuf::from(&dl.target_path);
-        if path.exists() && !super::remote::is_upload(&dl.original_url) {
+        if path.exists() && !super::remote::leaves_local_files_alone(&dl.original_url) {
             let f = std::fs::OpenOptions::new().write(true).open(&path).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
             f.set_len(0).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
         }
@@ -748,7 +768,7 @@ impl Manager {
         // (UI, tests, a crash-restart) must never find the file still on disk.
         if torrent::is_magnet(&dl.original_url) {
             self.inner.ctx.torrent.forget(id, delete_file).await?;
-        } else if delete_file && !super::remote::is_upload(&dl.original_url) {
+        } else if delete_file && !super::remote::leaves_local_files_alone(&dl.original_url) {
             // For an upload `target_path` is the user's own source file: it is never deleted.
             let _ = std::fs::remove_file(&dl.target_path);
         }
@@ -782,7 +802,7 @@ impl Manager {
         }
         let id2 = id.to_string();
         self.db().write(move |c| Ok(c.execute("DELETE FROM downloads WHERE id=?1", [&id2])?)).await?;
-        if delete_file && !is_torrent && !super::remote::is_upload(&dl.original_url) {
+        if delete_file && !is_torrent && !super::remote::leaves_local_files_alone(&dl.original_url) {
             let _ = std::fs::remove_file(&dl.target_path);
         }
         Ok(())
