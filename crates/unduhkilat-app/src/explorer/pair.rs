@@ -272,7 +272,7 @@ impl App {
             if let Some(e) = &left.error {
                 ui.label(RichText::new(e).color(DANGER));
             }
-            let h = (ui.available_height() - 40.0).max(120.0);
+            let h = (ui.available_height() - 74.0).max(120.0);
             let up = usize::from(left.dir != "/");
             let mut area = egui::ScrollArea::vertical().id_salt("left-server-list").max_height(h).auto_shrink([false, false]);
             if let Some(row) = left.scroll_row.take() {
@@ -305,6 +305,19 @@ impl App {
                     ui.label(RichText::new("Folder kosong.").color(FG_SECONDARY));
                 }
             });
+        }
+        // This panel's own buttons: they act on what is chosen here.
+        let right_name = self.servers.servers.iter().find(|s| s.id == ex.server_id).map(|s| s.name.clone()).unwrap_or_else(|| "server".to_string());
+        let (dirs, total) = ex.left.as_ref().map(|l| (l.entries.iter().filter(|e| e.is_dir && l.selected.contains(&e.path)).count(), l.selected.len())).unwrap_or((0, 0));
+        ui.label(RichText::new(selection_summary(dirs, total - dirs)).color(FG_SECONDARY).small());
+        let mut copy = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(total > 0, egui::Button::new(format!("Salin ke {right_name} \u{2192}"))).on_hover_text("Salin berkas dan folder yang dipilih di panel ini ke folder yang terbuka di panel kanan, langsung antar server").clicked() {
+                copy = true;
+            }
+        });
+        if copy {
+            self.pair_copy(ex, false);
         }
         if refresh && go.is_none() {
             go = ex.left.as_ref().map(|l| l.dir.clone());

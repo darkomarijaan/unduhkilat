@@ -71,6 +71,16 @@ pub fn view_of(entries: &[Entry], key: SortKey, ascending: bool, filter: &str) -
     v
 }
 
+/// One line under a panel saying what its buttons will act on.
+pub fn selection_summary(dirs: usize, files: usize) -> String {
+    match (dirs, files) {
+        (0, 0) => "Belum ada yang dipilih".to_string(),
+        (0, f) => format!("{f} berkas dipilih"),
+        (d, 0) => format!("{d} folder dipilih"),
+        (d, f) => format!("{} dipilih: {d} folder, {f} berkas", d + f),
+    }
+}
+
 /// How often the folder on this computer is read again while the explorer is open.
 pub const LOCAL_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -908,7 +918,7 @@ impl App {
         }
         // New files (a finished download) show up without clicking anything.
         ui.ctx().request_repaint_after(LOCAL_REFRESH);
-        let h = (ui.available_height() - 40.0).max(120.0);
+        let h = (ui.available_height() - 74.0).max(120.0);
         let rows = ex.local_entries.len() + 1;
         let mut area = egui::ScrollArea::vertical().id_salt("local-list").max_height(h).auto_shrink([false, false]);
         if let Some(row) = ex.local_scroll_to.take() {
@@ -939,6 +949,23 @@ impl App {
                     } else {
                         ex.local_selected = [e.name.clone()].into();
                     }
+                }
+            }
+        });
+        // This panel's own buttons: they act on what is chosen here.
+        let server_name = self.servers.servers.iter().find(|s| s.id == ex.server_id).map(|s| s.name.clone()).unwrap_or_else(|| "server".to_string());
+        let names: Vec<String> = ex.local_selected.iter().cloned().collect();
+        let dirs = names.iter().filter(|n| ex.local_entries.iter().any(|e| &e.name == *n && e.is_dir)).count();
+        ui.label(RichText::new(selection_summary(dirs, names.len() - dirs)).color(FG_SECONDARY).small());
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(!names.is_empty(), egui::Button::new(format!("Unggah ke {server_name} \u{2192}"))).on_hover_text("Unggah berkas dan folder yang dipilih di panel ini ke folder yang terbuka di server (panel kanan)").clicked() {
+                let existing: BTreeSet<String> = ex.entries.iter().map(|e| e.name.clone()).collect();
+                let plain: Vec<String> = names.iter().filter(|n| !ex.local_entries.iter().any(|e| &e.name == *n && e.is_dir)).cloned().collect();
+                let conflicts = overwrite_conflicts(&plain, &existing, false);
+                if conflicts.is_empty() {
+                    self.explorer_enqueue_uploads(ex, &names, false);
+                } else {
+                    ex.dialog = Some(ExDialog::ConfirmOverwrite { download: false, names: conflicts, all: names.clone() });
                 }
             }
         });
@@ -1024,41 +1051,32 @@ impl App {
         });
         let chosen: Vec<Entry> = ex.entries.iter().filter(|e| ex.selected.contains(&e.path)).cloned().collect();
         let files: Vec<&Entry> = chosen.iter().filter(|e| !e.is_dir).collect();
+        let left_state = ex.left.as_ref().map(|l| (l.name.clone(), l.status == ExStatus::Ready));
+        // This panel's own buttons: they act on what is chosen here.
+        ui.label(RichText::new(selection_summary(chosen.len() - files.len(), files.len())).color(FG_SECONDARY).small());
         ui.horizontal_wrapped(|ui| {
-            let left_ready = ex.left.as_ref().map(|l| l.status == ExStatus::Ready).unwrap_or(false);
-            if left_ready {
-                if ui.add_enabled(!chosen.is_empty(), egui::Button::new("\u{2190} Salin ke kiri")).on_hover_text("Salin berkas dan folder terpilih di server ini ke folder di panel kiri, langsung antar server").clicked() {
-                    self.pair_copy(ex, true);
+            match &left_state {
+                Some((name, true)) => {
+                    if ui.add_enabled(!chosen.is_empty(), egui::Button::new(format!("\u{2190} Salin ke {name}"))).on_hover_text("Salin berkas dan folder yang dipilih di panel ini ke folder yang terbuka di panel kiri, langsung antar server").clicked() {
+                        self.pair_copy(ex, true);
+                    }
                 }
-                let can_right = ex.left.as_ref().map(|l| !l.selected.is_empty()).unwrap_or(false);
-                if ui.add_enabled(can_right, egui::Button::new("Salin ke kanan \u{2192}")).on_hover_text("Salin berkas dan folder terpilih di panel kiri ke folder ini, langsung antar server").clicked() {
-                    self.pair_copy(ex, false);
-                }
-            } else {
-            if ui.add_enabled(!chosen.is_empty(), egui::Button::new("\u{2190} Unduh")).on_hover_text("Unduh berkas dan folder terpilih ke folder di panel kiri").clicked() {
-                let names: Vec<String> = chosen.iter().map(|e| e.name.clone()).collect();
-                let existing: BTreeSet<String> = ex.local_entries.iter().map(|e| e.name.clone()).collect();
-                let safe: Vec<String> = files.iter().filter_map(|e| safe_local_name(&e.name)).collect();
-                let conflicts = overwrite_conflicts(&safe, &existing, true);
-                if conflicts.is_empty() {
-                    self.explorer_enqueue_downloads(ex, &names, false);
-                } else {
-                    ex.dialog = Some(ExDialog::ConfirmOverwrite { download: true, names: conflicts, all: names });
-                }
-            }
-            let local_files: Vec<String> = ex.local_selected.iter().cloned().collect();
-            if ui.add_enabled(!local_files.is_empty(), egui::Button::new("Unggah \u{2192}")).on_hover_text("Unggah berkas dan folder terpilih di panel kiri ke folder ini").clicked() {
-                let existing: BTreeSet<String> = ex.entries.iter().map(|e| e.name.clone()).collect();
-                let local_plain: Vec<String> = local_files.iter().filter(|n| !ex.local_entries.iter().any(|e| &e.name == *n && e.is_dir)).cloned().collect();
-                let conflicts = overwrite_conflicts(&local_plain, &existing, false);
-                if conflicts.is_empty() {
-                    self.explorer_enqueue_uploads(ex, &local_files, false);
-                } else {
-                    ex.dialog = Some(ExDialog::ConfirmOverwrite { download: false, names: conflicts, all: local_files });
+                Some((_, false)) => {}
+                None => {
+                    if ui.add_enabled(!chosen.is_empty(), egui::Button::new("\u{2190} Unduh ke komputer ini")).on_hover_text("Unduh berkas dan folder yang dipilih di panel ini ke folder yang terbuka di panel kiri").clicked() {
+                        let names: Vec<String> = chosen.iter().map(|e| e.name.clone()).collect();
+                        let existing: BTreeSet<String> = ex.local_entries.iter().map(|e| e.name.clone()).collect();
+                        let safe: Vec<String> = files.iter().filter_map(|e| safe_local_name(&e.name)).collect();
+                        let conflicts = overwrite_conflicts(&safe, &existing, true);
+                        if conflicts.is_empty() {
+                            self.explorer_enqueue_downloads(ex, &names, false);
+                        } else {
+                            ex.dialog = Some(ExDialog::ConfirmOverwrite { download: true, names: conflicts, all: names });
+                        }
+                    }
                 }
             }
-            }
-            if ui.add_enabled(files.len() == 1, egui::Button::new("Pratinjau")).clicked() {
+            if ui.add_enabled(files.len() == 1 && chosen.len() == 1, egui::Button::new("Pratinjau")).clicked() {
                 if let Some(e) = files.first() {
                     self.explorer_start_preview(tab_id, ex, (*e).clone(), 1024 * 1024);
                 }
@@ -1429,6 +1447,14 @@ fn blocks_ui(ui: &mut Ui, blocks: &[Block]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_summary_says_what_the_buttons_act_on() {
+        assert_eq!(selection_summary(0, 0), "Belum ada yang dipilih");
+        assert_eq!(selection_summary(0, 1), "1 berkas dipilih");
+        assert_eq!(selection_summary(2, 0), "2 folder dipilih");
+        assert_eq!(selection_summary(1, 2), "3 dipilih: 1 folder, 2 berkas");
+    }
 
     #[test]
     fn local_listing_refreshes_after_a_short_while() {
