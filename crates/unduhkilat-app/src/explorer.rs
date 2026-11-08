@@ -473,8 +473,37 @@ impl App {
         }
     }
 
-    fn explorer_list_start(&mut self, tab_id: u64, ex: &mut ExplorerState, dir: String, _first: bool) {
-        self.explorer_list(tab_id, ex, &dir);
+    /// `first`: right after connecting, start in the server's home folder (falling back to `dir`).
+    fn explorer_list_start(&mut self, tab_id: u64, ex: &mut ExplorerState, dir: String, first: bool) {
+        if !first {
+            self.explorer_list(tab_id, ex, &dir);
+            return;
+        }
+        let Some(fs) = ex.fs.clone() else { return };
+        ex.gen += 1;
+        ex.loading = true;
+        ex.error = None;
+        let gen = ex.gen;
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let (dir, result) = match fs.lock().await.as_mut() {
+                Some(f) => {
+                    let start = match f.home().await {
+                        Ok(h) if h.starts_with('/') => h,
+                        _ => dir,
+                    };
+                    let r = f.list(&start).await;
+                    match r {
+                        Ok(v) => (start, Ok(v)),
+                        Err(_) if start != "/" => (String::from("/"), f.list("/").await),
+                        Err(e) => (start, Err(e)),
+                    }
+                }
+                None => (dir, Err(AppError::new(unduhkilat_core::error::ErrorCode::ErrConnectionDropped, "Sambungan sudah ditutup."))),
+            };
+            let _ = tx.send(Msg::Explorer(ExplorerMsg::Listed { tab_id, gen, dir, result }));
+            ctx.request_repaint();
+        });
     }
 
     fn explorer_mut(&mut self, tab_id: u64) -> Option<&mut ExplorerState> {
