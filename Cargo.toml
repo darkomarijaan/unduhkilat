@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/unduhkilat-core", "crates/unduhkilat-host", "crates/unduhkilat-app", "crates/unduhkilat-sign"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "UNLICENSED"
 
