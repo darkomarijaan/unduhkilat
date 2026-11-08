@@ -15,17 +15,19 @@ pub struct CopyJob {
     pub dst_server: String,
     pub dst_dir: String,
     pub name: String,
+    /// A folder: every file under it is copied, keeping the folder structure.
+    pub is_dir: bool,
 }
 
-/// The files (never folders) among `chosen`, as copy jobs into `dst_dir`, and the names that already
-/// exist there (replacing those needs a yes).
+/// `chosen` as copy jobs into `dst_dir`, and the names of files that already exist there (replacing
+/// those needs a yes). A folder that already exists is merged into: its files are checked one by one
+/// when they are queued, and an existing one is reported, never replaced.
 pub fn plan_copy(src_server: &str, chosen: &[Entry], dst_server: &str, dst_dir: &str, existing: &BTreeSet<String>) -> (Vec<CopyJob>, Vec<String>) {
     let jobs: Vec<CopyJob> = chosen
         .iter()
-        .filter(|e| !e.is_dir)
-        .map(|e| CopyJob { src_server: src_server.into(), src_path: e.path.clone(), dst_server: dst_server.into(), dst_dir: dst_dir.into(), name: e.name.clone() })
+        .map(|e| CopyJob { src_server: src_server.into(), src_path: e.path.clone(), dst_server: dst_server.into(), dst_dir: dst_dir.into(), name: e.name.clone(), is_dir: e.is_dir })
         .collect();
-    let conflicts = jobs.iter().filter(|j| existing.contains(&j.name)).map(|j| j.name.clone()).collect();
+    let conflicts = jobs.iter().filter(|j| !j.is_dir && existing.contains(&j.name)).map(|j| j.name.clone()).collect();
     (jobs, conflicts)
 }
 
@@ -289,7 +291,7 @@ impl App {
                     let r = ui.selectable_label(sel, format!("{}{slash}    {size}", e.name));
                     if r.double_clicked() && e.is_dir {
                         go = Some(e.path.clone());
-                    } else if r.clicked() && !e.is_dir {
+                    } else if r.clicked() {
                         if ui.input(|i| i.modifiers.command) {
                             if !left.selected.remove(&e.path) {
                                 left.selected.insert(e.path.clone());
@@ -315,6 +317,7 @@ impl App {
     /// Copy the chosen files across: `to_left` = from the server on the right to the one on the left.
     pub(super) fn pair_copy(&mut self, ex: &mut ExplorerState, to_left: bool) {
         let Some(left) = ex.left.as_ref() else { return };
+        let src_fs = if to_left { ex.fs.clone() } else { left.fs.clone() };
         let (jobs, conflicts) = if to_left {
             let chosen: Vec<Entry> = ex.entries.iter().filter(|e| ex.selected.contains(&e.path)).cloned().collect();
             let existing: BTreeSet<String> = left.entries.iter().map(|e| e.name.clone()).collect();
@@ -328,24 +331,42 @@ impl App {
             return;
         }
         if conflicts.is_empty() {
-            self.pair_enqueue(jobs, Vec::new());
+            self.pair_enqueue(jobs, Vec::new(), src_fs);
         } else {
-            ex.dialog = Some(ExDialog::ConfirmCopy { names: conflicts, jobs });
+            ex.dialog = Some(ExDialog::ConfirmCopy { names: conflicts, jobs, src_fs });
         }
     }
 
     /// Queue the jobs; the files named in `overwrite` replace what is already at the destination.
-    pub(super) fn pair_enqueue(&mut self, jobs: Vec<CopyJob>, overwrite: Vec<String>) {
+    /// `src_fs` is the connection to the source server, used to list the files of folders.
+    pub(super) fn pair_enqueue(&mut self, jobs: Vec<CopyJob>, overwrite: Vec<String>, src_fs: Option<SharedFs>) {
         let (m, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             let (mut ok, mut failed) = (0, Vec::new());
             for j in jobs {
+                if j.is_dir {
+                    let Some(fs) = &src_fs else {
+                        failed.push(format!("{}: sambungan sumber tidak tersedia", j.name));
+                        continue;
+                    };
+                    match fs.lock().await.as_mut() {
+                        Some(f) => match m.enqueue_folder_copy(f.as_mut(), &j.src_server, &j.src_path, &j.dst_server, &j.dst_dir, false).await {
+                            Ok(r) => {
+                                ok += r.queued;
+                                failed.extend(r.failed);
+                            }
+                            Err(e) => failed.push(format!("{}: {}", j.name, e.message)),
+                        },
+                        None => failed.push(format!("{}: sambungan sumber sudah ditutup", j.name)),
+                    }
+                    continue;
+                }
                 match m.enqueue_remote_copy(&j.src_server, &j.src_path, &j.dst_server, &j.dst_dir, overwrite.contains(&j.name)).await {
                     Ok(_) => ok += 1,
                     Err(e) => failed.push(format!("{}: {}", j.name, e.message)),
                 }
             }
-            let msg = if failed.is_empty() { format!("{ok} salinan ditambahkan ke antrean.") } else { format!("{ok} ditambahkan; gagal: {}", failed.join("; ")) };
+            let msg = if failed.is_empty() { format!("{ok} salinan ditambahkan ke antrean.") } else { format!("{ok} ditambahkan; gagal: {}", failed.iter().take(3).cloned().collect::<Vec<_>>().join("; ")) };
             let _ = tx.send(Msg::Notice(msg));
             ctx.request_repaint();
         });
@@ -364,40 +385,66 @@ impl App {
             },
             Direction::Download => return,
         };
-        let dir = parent_remote(&path);
         let ids: Vec<u64> = self.terminal.tabs.iter().filter(|t| t.explorer.is_some()).map(|t| t.id).collect();
         for id in ids {
             let Some(mut ex) = self.take_explorer(id) else { continue };
-            if ex.server_id == server && ex.dir == dir && ex.fs.is_some() {
-                ex.reveal = Some(path.clone());
-                let d = ex.dir.clone();
-                self.explorer_list(id, &mut ex, &d);
-            }
-            let left_hit = ex.left.as_ref().map(|l| l.server_id == server && l.dir == dir && l.fs.is_some()).unwrap_or(false);
-            if left_hit {
-                if let Some(l) = ex.left.as_mut() {
-                    l.reveal = Some(path.clone());
+            if ex.server_id == server && ex.fs.is_some() && !ex.loading {
+                if let Some(top) = top_under(&ex.dir, &path) {
+                    ex.reveal = Some(top);
+                    let d = ex.dir.clone();
+                    self.explorer_list(id, &mut ex, &d);
                 }
-                self.pair_list(id, &mut ex, &dir, false);
+            }
+            let left_top = ex.left.as_ref().filter(|l| l.server_id == server && l.fs.is_some() && !l.loading).and_then(|l| top_under(&l.dir, &path).map(|t| (t, l.dir.clone())));
+            if let Some((top, ldir)) = left_top {
+                if let Some(l) = ex.left.as_mut() {
+                    l.reveal = Some(top);
+                }
+                self.pair_list(id, &mut ex, &ldir, false);
             }
             self.put_explorer(id, ex);
         }
     }
 }
 
+/// The item directly inside `dir` that `path` is, or is inside of: `/a` and `/a/b/c.txt` give `/a/b`.
+pub fn top_under(dir: &str, path: &str) -> Option<String> {
+    let base = dir.trim_end_matches('/');
+    let rest = path.strip_prefix(base)?.strip_prefix('/')?;
+    let first = rest.split('/').next().filter(|s| !s.is_empty())?;
+    Some(format!("{base}/{first}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nested_file_reveals_the_folder_it_is_in() {
+        assert_eq!(top_under("/home", "/home/Proyek/src/a.txt").as_deref(), Some("/home/Proyek"));
+        assert_eq!(top_under("/home", "/home/a.txt").as_deref(), Some("/home/a.txt"));
+        assert_eq!(top_under("/", "/Proyek/a.txt").as_deref(), Some("/Proyek"));
+        assert_eq!(top_under("/home", "/homework/a.txt"), None, "a sibling with the same prefix is not inside");
+        assert_eq!(top_under("/home/x", "/home/a.txt"), None);
+    }
+
+    #[test]
+    fn folders_are_copied_whole_and_only_files_can_collide() {
+        let existing: BTreeSet<String> = ["Proyek".to_string(), "b.txt".to_string()].into();
+        let (jobs, conflicts) = plan_copy("A", &[e("Proyek", true), e("b.txt", false)], "B", "/in", &existing);
+        assert_eq!(jobs.iter().map(|j| (j.name.as_str(), j.is_dir)).collect::<Vec<_>>(), [("Proyek", true), ("b.txt", false)]);
+        assert_eq!(conflicts, ["b.txt"], "an existing folder is merged into, not a conflict");
+    }
 
     fn e(name: &str, dir: bool) -> Entry {
         Entry { name: name.into(), path: format!("/src/{name}"), is_dir: dir, size: 1, modified: None, is_link: false }
     }
 
     #[test]
-    fn folders_are_never_copied_and_existing_names_are_reported() {
+    fn existing_file_names_are_reported() {
         let existing: BTreeSet<String> = ["b.txt".to_string()].into();
         let (jobs, conflicts) = plan_copy("A", &[e("a.txt", false), e("b.txt", false), e("sub", true)], "B", "/in", &existing);
-        assert_eq!(jobs.iter().map(|j| j.name.as_str()).collect::<Vec<_>>(), ["a.txt", "b.txt"]);
+        assert_eq!(jobs.iter().map(|j| j.name.as_str()).collect::<Vec<_>>(), ["a.txt", "b.txt", "sub"]);
         assert_eq!(conflicts, ["b.txt"]);
         assert!(jobs.iter().all(|j| j.src_server == "A" && j.dst_server == "B" && j.dst_dir == "/in" && j.src_path.starts_with("/src/")));
     }

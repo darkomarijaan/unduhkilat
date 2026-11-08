@@ -146,6 +146,7 @@ mod tests {
 
 pub mod sftp;
 pub mod ftp;
+pub mod walk;
 
 // ---- pasting a picture into a remote terminal (Alt+V) -------------------------------------------
 

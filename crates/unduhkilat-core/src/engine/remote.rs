@@ -12,7 +12,7 @@ use super::transfer::{Outcome, TransferCtx};
 use super::EngineEvent;
 use crate::error::{AppError, ErrorCode, Result};
 use crate::repo;
-use crate::server::fs::RemoteFs;
+use crate::server::fs::{parent_remote, RemoteFs};
 use crate::server::secrets::{SecretKind, SecretString};
 use crate::server::service::ServerService;
 use crate::server::ssh::Interact;
@@ -170,6 +170,36 @@ pub async fn run_remote(ctx: &TransferCtx, id: &str, cancel: &CancellationToken,
     result
 }
 
+/// Make sure `dir` exists on the server, creating missing folders from the top down. A name that is
+/// already a file blocks the transfer instead of being replaced. Several transfers may create the
+/// same folder at once, so a failed `mkdir` is fine when the folder exists afterwards.
+pub async fn ensure_remote_dir(fs: &mut dyn RemoteFs, dir: &str) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut cur = dir.trim_end_matches('/').to_string();
+    while !cur.is_empty() {
+        match fs.stat(&cur).await {
+            Ok(e) if e.is_dir => break,
+            Ok(_) => return Err(AppError::new(ErrorCode::ErrNameCollision, format!("{cur} di server adalah berkas, bukan folder."))),
+            Err(e) if e.code == ErrorCode::ErrNotFound => {
+                missing.push(cur.clone());
+                cur = parent_remote(&cur);
+                if cur == "/" {
+                    break;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    for d in missing.into_iter().rev() {
+        if let Err(e) = fs.mkdir(&d).await {
+            if !matches!(fs.stat(&d).await, Ok(x) if x.is_dir) {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Tracks progress: events every 250 ms, durable checkpoints about once a second.
 struct Meter {
     started: Instant,
@@ -296,6 +326,7 @@ async fn upload(ctx: &TransferCtx, id: &str, source: &str, r: &RemoteRef, fs: &m
         Err(e) => return Err(e),
     };
     file.seek(std::io::SeekFrom::Start(offset as u64)).await.map_err(|e| io_err("mencari posisi berkas", e))?;
+    ensure_remote_dir(fs, &parent_remote(&r.path)).await?;
     let mut writer = fs.open_write(&r.path, offset as u64, offset > 0).await?;
     let mut buf = vec![0u8; CHUNK];
     let mut sent = offset;
@@ -383,6 +414,7 @@ async fn copy_stream(ctx: &TransferCtx, id: &str, r: &RemoteRef, dst_path: &str,
         Err(e) => return Err(e),
     };
     let mut reader = src.open_read(&r.path, offset as u64).await?;
+    ensure_remote_dir(dst, &parent_remote(dst_path)).await?;
     let mut writer = dst.open_write(dst_path, offset as u64, offset > 0).await?;
     let mut buf = vec![0u8; CHUNK];
     let mut sent = offset;

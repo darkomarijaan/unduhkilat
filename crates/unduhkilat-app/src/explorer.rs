@@ -134,7 +134,7 @@ pub enum ExDialog {
     /// Names that exist at the destination; replacing them needs a yes. `download` = server to computer.
     ConfirmOverwrite { download: bool, names: Vec<String>, all: Vec<String> },
     /// Copying between two servers: `names` already exist at the destination.
-    ConfirmCopy { names: Vec<String>, jobs: Vec<CopyJob> },
+    ConfirmCopy { names: Vec<String>, jobs: Vec<CopyJob>, src_fs: Option<SharedFs> },
 }
 
 pub enum PvContent {
@@ -346,11 +346,12 @@ impl App {
     /// A download finished: when it landed in the folder an explorer shows on the left, mark it there.
     pub(super) fn highlight_downloaded(&mut self, target: &str) {
         let target = PathBuf::from(target);
-        let (Some(dir), Some(name)) = (target.parent(), target.file_name().map(|n| n.to_string_lossy().into_owned())) else { return };
         for t in self.terminal.tabs.iter_mut() {
             if let Some(ex) = t.explorer.as_mut() {
-                if ex.local_dir == dir {
-                    ex.highlight = Some((name.clone(), 0));
+                // The item directly inside the folder on the left: the file itself, or the folder it is in.
+                let top = target.strip_prefix(&ex.local_dir).ok().and_then(|rel| rel.components().next()).map(|c| c.as_os_str().to_string_lossy().into_owned());
+                if let Some(name) = top {
+                    ex.highlight = Some((name, 0));
                     ex.local_loaded_at = None;
                 }
             }
@@ -586,19 +587,36 @@ impl App {
         }
     }
 
+    /// Queue the named items of the server folder for download into the folder on the left. A folder
+    /// brings every file under it; inside a folder an existing file is reported, never replaced.
     fn explorer_enqueue_downloads(&mut self, ex: &ExplorerState, names: &[String], overwrite: bool) {
         let (m, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
-        let (sid, dir, local) = (ex.server_id.clone(), ex.dir.clone(), ex.local_dir.clone());
-        let names = names.to_vec();
+        let (sid, dir, local, fs) = (ex.server_id.clone(), ex.dir.clone(), ex.local_dir.clone(), ex.fs.clone());
+        let items: Vec<(String, bool)> = names.iter().map(|n| (n.clone(), ex.entries.iter().find(|e| &e.name == n).map(|e| e.is_dir).unwrap_or(false))).collect();
         self.rt.spawn(async move {
             let (mut ok, mut failed) = (0, Vec::new());
-            for n in names {
-                match m.enqueue_remote_download(&sid, &join_remote(&dir, &n), &local, overwrite).await {
+            for (n, is_dir) in items {
+                let path = join_remote(&dir, &n);
+                if is_dir {
+                    let Some(fs) = &fs else { continue };
+                    match fs.lock().await.as_mut() {
+                        Some(f) => match m.enqueue_folder_download(f.as_mut(), &sid, &path, &local, false).await {
+                            Ok(r) => {
+                                ok += r.queued;
+                                failed.extend(r.failed);
+                            }
+                            Err(e) => failed.push(format!("{n}: {}", e.message)),
+                        },
+                        None => failed.push(format!("{n}: sambungan sudah ditutup")),
+                    }
+                    continue;
+                }
+                match m.enqueue_remote_download(&sid, &path, &local, overwrite).await {
                     Ok(_) => ok += 1,
                     Err(e) => failed.push(format!("{n}: {}", e.message)),
                 }
             }
-            let msg = if failed.is_empty() { format!("{ok} unduhan ditambahkan ke antrean.") } else { format!("{ok} ditambahkan; gagal: {}", failed.join("; ")) };
+            let msg = if failed.is_empty() { format!("{ok} unduhan ditambahkan ke antrean.") } else { format!("{ok} ditambahkan; gagal: {}", failed.iter().take(3).cloned().collect::<Vec<_>>().join("; ")) };
             let _ = tx.send(Msg::Notice(msg));
             ctx.request_repaint();
         });
@@ -618,19 +636,31 @@ impl App {
         });
     }
 
+    /// Queue the named items of the folder on the left for upload to the server folder. A folder brings
+    /// every file under it; inside a folder an existing file is reported, never replaced.
     fn explorer_enqueue_uploads(&mut self, ex: &ExplorerState, names: &[String], overwrite: bool) {
         let (m, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
         let (sid, dir, local) = (ex.server_id.clone(), ex.dir.clone(), ex.local_dir.clone());
-        let names = names.to_vec();
+        let items: Vec<(String, bool)> = names.iter().map(|n| (n.clone(), ex.local_entries.iter().find(|e| &e.name == n).map(|e| e.is_dir).unwrap_or(false))).collect();
         self.rt.spawn(async move {
             let (mut ok, mut failed) = (0, Vec::new());
-            for n in names {
+            for (n, is_dir) in items {
+                if is_dir {
+                    match m.enqueue_folder_upload(&sid, &local.join(&n), &dir, false).await {
+                        Ok(r) => {
+                            ok += r.queued;
+                            failed.extend(r.failed);
+                        }
+                        Err(e) => failed.push(format!("{n}: {}", e.message)),
+                    }
+                    continue;
+                }
                 match m.enqueue_remote_upload(&sid, &local.join(&n), &dir, overwrite).await {
                     Ok(_) => ok += 1,
                     Err(e) => failed.push(format!("{n}: {}", e.message)),
                 }
             }
-            let msg = if failed.is_empty() { format!("{ok} unggahan ditambahkan ke antrean.") } else { format!("{ok} ditambahkan; gagal: {}", failed.join("; ")) };
+            let msg = if failed.is_empty() { format!("{ok} unggahan ditambahkan ke antrean.") } else { format!("{ok} ditambahkan; gagal: {}", failed.iter().take(3).cloned().collect::<Vec<_>>().join("; ")) };
             let _ = tx.send(Msg::Notice(msg));
             ctx.request_repaint();
         });
@@ -901,7 +931,7 @@ impl App {
                 if r.double_clicked() && e.is_dir {
                     ex.local_dir = PathBuf::from(&e.path);
                     ex.local_selected.clear();
-                } else if r.clicked() && !e.is_dir {
+                } else if r.clicked() {
                     if ui.input(|i| i.modifiers.command) {
                         if !ex.local_selected.remove(&e.name) {
                             ex.local_selected.insert(e.name.clone());
@@ -997,18 +1027,18 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             let left_ready = ex.left.as_ref().map(|l| l.status == ExStatus::Ready).unwrap_or(false);
             if left_ready {
-                if ui.add_enabled(!files.is_empty(), egui::Button::new("\u{2190} Salin ke kiri")).on_hover_text("Salin berkas terpilih di server ini ke folder di panel kiri, langsung antar server").clicked() {
+                if ui.add_enabled(!chosen.is_empty(), egui::Button::new("\u{2190} Salin ke kiri")).on_hover_text("Salin berkas dan folder terpilih di server ini ke folder di panel kiri, langsung antar server").clicked() {
                     self.pair_copy(ex, true);
                 }
                 let can_right = ex.left.as_ref().map(|l| !l.selected.is_empty()).unwrap_or(false);
-                if ui.add_enabled(can_right, egui::Button::new("Salin ke kanan \u{2192}")).on_hover_text("Salin berkas terpilih di panel kiri ke folder ini, langsung antar server").clicked() {
+                if ui.add_enabled(can_right, egui::Button::new("Salin ke kanan \u{2192}")).on_hover_text("Salin berkas dan folder terpilih di panel kiri ke folder ini, langsung antar server").clicked() {
                     self.pair_copy(ex, false);
                 }
             } else {
-            if ui.add_enabled(!files.is_empty(), egui::Button::new("\u{2190} Unduh")).on_hover_text("Unduh berkas terpilih ke folder di panel kiri").clicked() {
-                let names: Vec<String> = files.iter().map(|e| e.name.clone()).collect();
+            if ui.add_enabled(!chosen.is_empty(), egui::Button::new("\u{2190} Unduh")).on_hover_text("Unduh berkas dan folder terpilih ke folder di panel kiri").clicked() {
+                let names: Vec<String> = chosen.iter().map(|e| e.name.clone()).collect();
                 let existing: BTreeSet<String> = ex.local_entries.iter().map(|e| e.name.clone()).collect();
-                let safe: Vec<String> = names.iter().filter_map(|n| safe_local_name(n)).collect();
+                let safe: Vec<String> = files.iter().filter_map(|e| safe_local_name(&e.name)).collect();
                 let conflicts = overwrite_conflicts(&safe, &existing, true);
                 if conflicts.is_empty() {
                     self.explorer_enqueue_downloads(ex, &names, false);
@@ -1017,9 +1047,10 @@ impl App {
                 }
             }
             let local_files: Vec<String> = ex.local_selected.iter().cloned().collect();
-            if ui.add_enabled(!local_files.is_empty(), egui::Button::new("Unggah \u{2192}")).on_hover_text("Unggah berkas terpilih di panel kiri ke folder ini").clicked() {
+            if ui.add_enabled(!local_files.is_empty(), egui::Button::new("Unggah \u{2192}")).on_hover_text("Unggah berkas dan folder terpilih di panel kiri ke folder ini").clicked() {
                 let existing: BTreeSet<String> = ex.entries.iter().map(|e| e.name.clone()).collect();
-                let conflicts = overwrite_conflicts(&local_files, &existing, false);
+                let local_plain: Vec<String> = local_files.iter().filter(|n| !ex.local_entries.iter().any(|e| &e.name == *n && e.is_dir)).cloned().collect();
+                let conflicts = overwrite_conflicts(&local_plain, &existing, false);
                 if conflicts.is_empty() {
                     self.explorer_enqueue_uploads(ex, &local_files, false);
                 } else {
@@ -1137,7 +1168,7 @@ impl App {
                     None => keep = Some(ExDialog::ConfirmDelete(items)),
                 }
             }
-            ExDialog::ConfirmCopy { names, jobs } => {
+            ExDialog::ConfirmCopy { names, jobs, src_fs } => {
                 let mut act: Option<bool> = None;
                 win("Timpa berkas").frame(frame).show(ctx, |ui| {
                     ui.label(RichText::new("Berkas ini sudah ada di server tujuan").font(theme::bold(15.0)));
@@ -1155,14 +1186,14 @@ impl App {
                     });
                 });
                 match act {
-                    Some(true) => self.pair_enqueue(jobs, names),
+                    Some(true) => self.pair_enqueue(jobs, names, src_fs),
                     Some(false) => {
                         let rest: Vec<CopyJob> = jobs.into_iter().filter(|j| !names.contains(&j.name)).collect();
                         if !rest.is_empty() {
-                            self.pair_enqueue(rest, Vec::new());
+                            self.pair_enqueue(rest, Vec::new(), src_fs);
                         }
                     }
-                    None => keep = Some(ExDialog::ConfirmCopy { names, jobs }),
+                    None => keep = Some(ExDialog::ConfirmCopy { names, jobs, src_fs }),
                 }
             }
             ExDialog::ConfirmOverwrite { download, names, all } => {

@@ -66,6 +66,13 @@ pub struct Manager {
     inner: Arc<Inner>,
 }
 
+/// What queuing a whole folder produced.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FolderQueued {
+    pub queued: usize,
+    pub failed: Vec<String>,
+}
+
 impl Manager {
     /// Build the manager. Crash normalization (FR-010) commits BEFORE this returns,
     /// i.e. before any worker can be scheduled.
@@ -530,6 +537,72 @@ impl Manager {
         // `target_path` is only a label here: nothing is ever written to or removed from this computer.
         let label = format!("server://{dst_server}{dst_path}");
         self.insert_remote(url, PathBuf::from(label), name.to_string(), false).await
+    }
+
+    /// Queue every file under the remote folder `remote_dir` for download into `local_dir`, keeping the
+    /// folder structure (the folder itself is created inside `local_dir`). One queue item per file; a
+    /// file that cannot be queued (for example it already exists) is listed in `failed`.
+    pub async fn enqueue_folder_download(&self, fs: &mut dyn crate::server::fs::RemoteFs, server_id: &str, remote_dir: &str, local_dir: &std::path::Path, overwrite: bool) -> Result<FolderQueued> {
+        let found = crate::server::fs::walk::walk_remote(fs, remote_dir).await?;
+        let mut out = FolderQueued::default();
+        for f in found {
+            let mut dir = local_dir.to_path_buf();
+            let mut safe = true;
+            for part in &f.rel_dir {
+                match crate::server::fs::safe_local_name(part) {
+                    Some(n) => dir.push(n),
+                    None => {
+                        safe = false;
+                        break;
+                    }
+                }
+            }
+            if !safe {
+                out.failed.push(format!("{}: nama folder tidak aman untuk dibuat di komputer ini", f.item.path));
+                continue;
+            }
+            match self.enqueue_remote_download(server_id, &f.item.path, &dir, overwrite).await {
+                Ok(_) => out.queued += 1,
+                Err(e) => out.failed.push(format!("{}: {}", f.item.path, e.message)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Queue every file under the local folder `local_dir` for upload into `remote_dir`, keeping the
+    /// folder structure (missing server folders are created when each file is sent).
+    pub async fn enqueue_folder_upload(&self, server_id: &str, local_dir: &std::path::Path, remote_dir: &str, overwrite: bool) -> Result<FolderQueued> {
+        let root = local_dir.to_path_buf();
+        let found = tokio::task::spawn_blocking(move || crate::server::fs::walk::walk_local(&root)).await.map_err(|_| AppError::internal("pembacaan folder berhenti tiba-tiba"))??;
+        let mut out = FolderQueued::default();
+        for f in found {
+            let dir = f.rel_dir.iter().fold(remote_dir.to_string(), |acc, part| crate::server::fs::join_remote(&acc, part));
+            match self.enqueue_remote_upload(server_id, &f.item, &dir, overwrite).await {
+                Ok(_) => out.queued += 1,
+                Err(e) => out.failed.push(format!("{}: {}", f.item.display(), e.message)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Queue a copy of every file under `src_dir` (read through `src_fs`) into `dst_dir` on another or
+    /// the same server, keeping the folder structure. A folder cannot be copied into itself.
+    pub async fn enqueue_folder_copy(&self, src_fs: &mut dyn crate::server::fs::RemoteFs, src_server: &str, src_dir: &str, dst_server: &str, dst_dir: &str, overwrite: bool) -> Result<FolderQueued> {
+        let src = src_dir.trim_end_matches('/');
+        let dst = dst_dir.trim_end_matches('/');
+        if src_server == dst_server && (dst == src || dst.starts_with(&format!("{src}/"))) {
+            return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Folder tidak bisa disalin ke dalam dirinya sendiri."));
+        }
+        let found = crate::server::fs::walk::walk_remote(src_fs, src_dir).await?;
+        let mut out = FolderQueued::default();
+        for f in found {
+            let dir = f.rel_dir.iter().fold(dst_dir.to_string(), |acc, part| crate::server::fs::join_remote(&acc, part));
+            match self.enqueue_remote_copy(src_server, &f.item.path, dst_server, &dir, overwrite).await {
+                Ok(_) => out.queued += 1,
+                Err(e) => out.failed.push(format!("{}: {}", f.item.path, e.message)),
+            }
+        }
+        Ok(out)
     }
 
     async fn insert_remote(&self, url: String, local: PathBuf, file_name: String, check_target_clash: bool) -> Result<Download> {
