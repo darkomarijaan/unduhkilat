@@ -452,7 +452,7 @@ impl App {
                     Ok(fs) => {
                         ex.fs = Some(Arc::new(Mutex::new(Some(fs))));
                         ex.status = ExStatus::Ready;
-                        // Test aid: `UNDUHKILAT_LEFT=<server name>` shows that server on the left.
+                        // Test aid: `UNDUHKILAT_LEFT=<server name>` shows that server in the second panel.
                         if let (Ok(name), None) = (std::env::var("UNDUHKILAT_LEFT"), ex.left.as_ref()) {
                             if let Some(s) = self.servers.servers.iter().find(|s| s.name == name) {
                                 let (id, n) = (s.id.clone(), s.name.clone());
@@ -867,8 +867,8 @@ impl App {
         }
         if wide {
             ui.columns(2, |cols| {
-                self.local_panel(&mut cols[0], tab_id, ex);
-                self.server_panel(&mut cols[1], tab_id, ex);
+                self.server_panel(&mut cols[0], tab_id, ex);
+                self.local_panel(&mut cols[1], tab_id, ex);
             });
         } else {
             self.server_panel(ui, tab_id, ex);
@@ -958,7 +958,7 @@ impl App {
         let dirs = names.iter().filter(|n| ex.local_entries.iter().any(|e| &e.name == *n && e.is_dir)).count();
         ui.label(RichText::new(selection_summary(dirs, names.len() - dirs)).color(FG_SECONDARY).small());
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(!names.is_empty(), egui::Button::new(format!("Unggah ke {server_name} \u{2192}"))).on_hover_text("Unggah berkas dan folder yang dipilih di panel ini ke folder yang terbuka di server (panel kanan)").clicked() {
+            if ui.add_enabled(!names.is_empty(), egui::Button::new(format!("\u{2190} Unggah ke {server_name}"))).on_hover_text("Unggah berkas dan folder yang dipilih di panel ini ke folder yang terbuka di server (panel kiri)").clicked() {
                 let existing: BTreeSet<String> = ex.entries.iter().map(|e| e.name.clone()).collect();
                 let plain: Vec<String> = names.iter().filter(|n| !ex.local_entries.iter().any(|e| &e.name == *n && e.is_dir)).cloned().collect();
                 let conflicts = overwrite_conflicts(&plain, &existing, false);
@@ -973,7 +973,8 @@ impl App {
 
     fn server_panel(&mut self, ui: &mut Ui, tab_id: u64, ex: &mut ExplorerState) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Server").font(theme::bold(13.0)));
+            let title = self.servers.servers.iter().find(|s| s.id == ex.server_id).map(|s| s.name.clone()).unwrap_or_else(|| "Server".to_string());
+            ui.label(RichText::new(title).font(theme::bold(13.0)));
             if ui.small_button("Muat ulang").clicked() {
                 let d = ex.dir.clone();
                 self.explorer_list(tab_id, ex, &d);
@@ -1057,13 +1058,13 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             match &left_state {
                 Some((name, true)) => {
-                    if ui.add_enabled(!chosen.is_empty(), egui::Button::new(format!("\u{2190} Salin ke {name}"))).on_hover_text("Salin berkas dan folder yang dipilih di panel ini ke folder yang terbuka di panel kiri, langsung antar server").clicked() {
+                    if ui.add_enabled(!chosen.is_empty(), egui::Button::new(format!("Salin ke {name} \u{2192}"))).on_hover_text("Salin berkas dan folder yang dipilih di panel ini ke folder yang terbuka di panel kanan, langsung antar server").clicked() {
                         self.pair_copy(ex, true);
                     }
                 }
                 Some((_, false)) => {}
                 None => {
-                    if ui.add_enabled(!chosen.is_empty(), egui::Button::new("\u{2190} Unduh ke komputer ini")).on_hover_text("Unduh berkas dan folder yang dipilih di panel ini ke folder yang terbuka di panel kiri").clicked() {
+                    if ui.add_enabled(!chosen.is_empty(), egui::Button::new("Unduh ke komputer ini \u{2192}")).on_hover_text("Unduh berkas dan folder yang dipilih di panel ini ke folder yang terbuka di panel kanan").clicked() {
                         let names: Vec<String> = chosen.iter().map(|e| e.name.clone()).collect();
                         let existing: BTreeSet<String> = ex.local_entries.iter().map(|e| e.name.clone()).collect();
                         let safe: Vec<String> = files.iter().filter_map(|e| safe_local_name(&e.name)).collect();

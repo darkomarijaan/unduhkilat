@@ -99,7 +99,7 @@ impl App {
             }
             for s in &self.servers.servers {
                 let on = ex.left.as_ref().map(|l| l.server_id == s.id).unwrap_or(false);
-                if ui.selectable_label(on, &s.name).on_hover_text("Tampilkan server ini di panel kiri untuk menyalin berkas antar server").clicked() && !on {
+                if ui.selectable_label(on, &s.name).on_hover_text("Tampilkan server ini di panel ini untuk menyalin berkas antar server").clicked() && !on {
                     choice = Some(Some((s.id.clone(), s.name.clone())));
                 }
             }
@@ -312,7 +312,7 @@ impl App {
         ui.label(RichText::new(selection_summary(dirs, total - dirs)).color(FG_SECONDARY).small());
         let mut copy = false;
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(total > 0, egui::Button::new(format!("Salin ke {right_name} \u{2192}"))).on_hover_text("Salin berkas dan folder yang dipilih di panel ini ke folder yang terbuka di panel kanan, langsung antar server").clicked() {
+            if ui.add_enabled(total > 0, egui::Button::new(format!("\u{2190} Salin ke {right_name}"))).on_hover_text("Salin berkas dan folder yang dipilih di panel ini ke folder yang terbuka di panel kiri, langsung antar server").clicked() {
                 copy = true;
             }
         });
