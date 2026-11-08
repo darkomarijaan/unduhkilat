@@ -115,7 +115,23 @@
     return entry;
   }
 
-  const api = { RANGE_PARAMS, isHttp, normalizeUrl, classify, isMediaResponse, isTinyMedia, headerMap, sizeFromHeaders, cookieHeader, baseName, fileNameFromUrl, mergeCandidate };
+  // How long after a download starts it still counts as "just started by the user".
+  const FRESH_WINDOW_MS = 60 * 1000;
+
+  /**
+   * True only for a download the user just started. At browser startup Chrome loads its
+   * download history and fires downloads.onCreated for every entry; those (finished,
+   * interrupted, or old ones auto-resumed) must never be handed over or erased.
+   */
+  function isFreshDownload(item, nowMs) {
+    if (!item || item.state !== 'in_progress') return false;
+    if (!item.startTime) return true;
+    const t = Date.parse(item.startTime);
+    if (Number.isNaN(t)) return true;
+    return Math.abs((nowMs == null ? Date.now() : nowMs) - t) <= FRESH_WINDOW_MS;
+  }
+
+  const api = { RANGE_PARAMS, FRESH_WINDOW_MS, isFreshDownload, isHttp, normalizeUrl, classify, isMediaResponse, isTinyMedia, headerMap, sizeFromHeaders, cookieHeader, baseName, fileNameFromUrl, mergeCandidate };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.UK = api;
 })(typeof self !== 'undefined' ? self : globalThis);

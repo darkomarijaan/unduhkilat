@@ -168,6 +168,7 @@ async function handOver(command, fields) {
 async function onDownloadCreated(item) {
   if (!settings.enabled) return;
   if (item.byExtensionId) return; // started by an extension (including ours): leave it alone
+  if (!UK.isFreshDownload(item)) return; // history replayed at browser startup: leave it alone
   const url = item.finalUrl || item.url;
   if (!UK.isHttp(url)) return; // blob:, data:, file: cannot be handed over
 

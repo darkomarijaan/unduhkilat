@@ -71,7 +71,7 @@ const okHost = (m, reply) => {
 
 const downHost = (m, reply) => reply({ status: 'error', id: m.id, error: { code: 'ERR_NATIVE_HOST_NOT_FOUND', message: 'UnduhKilat tidak aktif' } });
 
-const item = (o = {}) => ({ id: 42, url: 'https://files.test/a.zip', finalUrl: 'https://cdn.test/a.zip', referrer: 'https://files.test/page', filename: 'C:\\Users\\x\\Downloads\\a.zip', mime: 'application/zip', totalBytes: 1234, fileSize: 1234, ...o });
+const item = (o = {}) => ({ id: 42, url: 'https://files.test/a.zip', finalUrl: 'https://cdn.test/a.zip', referrer: 'https://files.test/page', filename: 'C:\\Users\\x\\Downloads\\a.zip', mime: 'application/zip', totalBytes: 1234, fileSize: 1234, state: 'in_progress', startTime: new Date().toISOString(), ...o });
 
 test('accepted browser download is handed over with cookies/referer/UA, then cancelled and erased', async () => {
   const e = makeEnv(okHost);
@@ -123,6 +123,18 @@ test('blob/data URLs and extension-initiated downloads are left alone', async ()
   await e.L.dl(item({ byExtensionId: 'someone-else' }));
   assert.ok(!e.posted.some((m) => m.command === 'browser.intercept'));
   assert.deepEqual(e.cancelled, []);
+});
+
+test('old downloads replayed from browser history at startup are NOT handed over or erased', async () => {
+  const e = makeEnv(okHost);
+  await tick();
+  const old = new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
+  await e.L.dl(item({ id: 1, state: 'complete', startTime: old }));
+  await e.L.dl(item({ id: 2, state: 'interrupted', startTime: old }));
+  await e.L.dl(item({ id: 3, state: 'in_progress', startTime: old })); // auto-resumed old download
+  assert.ok(!e.posted.some((m) => m.command === 'browser.intercept'));
+  assert.deepEqual(e.cancelled, []);
+  assert.deepEqual(e.erased, [], 'history entries must never be erased');
 });
 
 test('sniffed media becomes one deduplicated candidate with its size and is pushed to the tab', async () => {

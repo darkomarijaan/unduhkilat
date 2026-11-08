@@ -73,3 +73,15 @@ test('isTinyMedia hides UI sounds but keeps playlists and unknown sizes', () => 
   assert.ok(!UK.isTinyMedia('application/vnd.apple.mpegurl', 'https://a/x', 900), 'playlists are small by nature');
   assert.ok(!UK.isTinyMedia('', 'https://a/stream.m3u8?x=1', 900));
 });
+
+test('isFreshDownload accepts only downloads that just started', () => {
+  const now = Date.parse('2026-11-08T07:00:00Z');
+  const at = (ms) => new Date(now + ms).toISOString();
+  assert.ok(UK.isFreshDownload({ state: 'in_progress', startTime: at(-2000) }, now));
+  assert.ok(UK.isFreshDownload({ state: 'in_progress', startTime: at(1000) }, now), 'small clock skew');
+  assert.ok(UK.isFreshDownload({ state: 'in_progress' }, now), 'no start time: trust the state');
+  assert.ok(!UK.isFreshDownload({ state: 'complete', startTime: at(-1000) }, now));
+  assert.ok(!UK.isFreshDownload({ state: 'interrupted', startTime: at(-1000) }, now));
+  assert.ok(!UK.isFreshDownload({ state: 'in_progress', startTime: at(-10 * 60 * 1000) }, now), 'old item resumed at startup');
+  assert.ok(!UK.isFreshDownload({ state: 'in_progress', startTime: at(10 * 60 * 1000) }, now));
+});

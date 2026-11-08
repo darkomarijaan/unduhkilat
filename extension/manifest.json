@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "UnduhKilat",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Kirim unduhan dan media dari browser ke UnduhKilat. Tidak ada yang diunduh sebelum Anda mengonfirmasi di aplikasi.",
   "minimum_chrome_version": "110",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwbEV7Fzrja+kvIColVUE3WwYyvKzJhyw1hRnvOfInfc4x61J57MG9Pz8BEL2xmxmeeqep72OA+GGqbBUwuuVpQTpgiuULeI9XHXjWtQZZ41EnV56R8OH56IJFmUDkEilMm+PLK+KPtFAnCOdsWE8GXJQXdOKJGUNjbdj2wcdvSkS26033XbwySlAPTRRkDn9W74bY7gMdKEg3M7cqnHwAXxZ/BnQbthVsHLaDvBfHLqaOAY8erL/+YBB6QJqdlqfSjQxg+SbVsHVhqTMoWmlG+4UhmBriYtnuvBEAMCn/XTf0tRWgrFIJlhEQNtM8vpg+XMw31BoaSB/SNc4UMKZXQIDAQAB",
