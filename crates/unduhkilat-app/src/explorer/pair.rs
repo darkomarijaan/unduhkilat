@@ -464,7 +464,7 @@ mod tests {
     }
 
     fn e(name: &str, dir: bool) -> Entry {
-        Entry { name: name.into(), path: format!("/src/{name}"), is_dir: dir, size: 1, modified: None, is_link: false }
+        Entry { name: name.into(), path: format!("/src/{name}"), is_dir: dir, size: 1, modified: None, is_link: false, is_special: false }
     }
 
     #[test]

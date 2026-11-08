@@ -263,6 +263,9 @@ async fn download(ctx: &TransferCtx, id: &str, target: &str, r: &RemoteRef, fs: 
     if entry.is_dir {
         return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Folder tidak bisa diunduh sebagai satu berkas."));
     }
+    if entry.is_special {
+        return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Ini bukan berkas biasa (socket, FIFO, atau perangkat), jadi tidak ada isi yang bisa disalin."));
+    }
     let total = entry.size as i64;
     let (id2, url) = (id.to_string(), make_url(Direction::Download, &r.server_id, &r.path, r.overwrite));
     ctx.db.write(move |c| repo::update_probe_result(c, &id2, &url, total, None, false)).await?;
@@ -390,6 +393,9 @@ async fn copy_between(ctx: &TransferCtx, id: &str, svc: &ServerService, r: &Remo
     let entry = src.stat(&r.path).await?;
     if entry.is_dir {
         return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Folder tidak bisa disalin sebagai satu berkas."));
+    }
+    if entry.is_special {
+        return Err(AppError::new(ErrorCode::ErrInvalidArgument, "Ini bukan berkas biasa (socket, FIFO, atau perangkat), jadi tidak ada isi yang bisa disalin."));
     }
     let total = entry.size as i64;
     let (id2, url) = (id.to_string(), make_copy_url(&r.server_id, &r.path, &dst_id, &dst_path, r.overwrite));

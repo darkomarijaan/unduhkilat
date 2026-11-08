@@ -314,7 +314,7 @@ fn read_local_dir(dir: &Path) -> Vec<Entry> {
                     let m = e.metadata().ok()?;
                     let name = e.file_name().to_string_lossy().into_owned();
                     let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
-                    Some(Entry { path: e.path().to_string_lossy().into_owned(), name, is_dir: m.is_dir(), size: m.len(), modified, is_link: false })
+                    Some(Entry { path: e.path().to_string_lossy().into_owned(), name, is_dir: m.is_dir(), size: m.len(), modified, is_link: false, is_special: false })
                 })
                 .collect()
         })
@@ -1475,7 +1475,7 @@ mod tests {
     }
 
     fn e(name: &str, dir: bool, size: u64) -> Entry {
-        Entry { name: name.into(), path: format!("/{name}"), is_dir: dir, size, modified: None, is_link: false }
+        Entry { name: name.into(), path: format!("/{name}"), is_dir: dir, size, modified: None, is_link: false, is_special: false }
     }
 
     #[test]

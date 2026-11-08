@@ -207,7 +207,7 @@ pub struct FtpFs {
 
 fn to_entry(dir: &str, f: &ListFile) -> Entry {
     let modified = f.modified().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64);
-    Entry { name: f.name().to_string(), path: join_remote(dir, f.name()), is_dir: f.is_directory(), size: f.size() as u64, modified, is_link: f.is_symlink() }
+    Entry { name: f.name().to_string(), path: join_remote(dir, f.name()), is_dir: f.is_directory(), size: f.size() as u64, modified, is_link: f.is_symlink(), is_special: false }
 }
 
 /// An upload: writing goes to the data connection; `shutdown` completes the transfer on the control
@@ -257,11 +257,11 @@ impl RemoteFs for FtpFs {
     async fn stat(&mut self, path: &str) -> Result<Entry> {
         let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path).to_string();
         if let Ok(Ok(size)) = tokio::time::timeout(COMMAND_TIMEOUT, self.ftp.size(path)).await {
-            return Ok(Entry { name, path: path.to_string(), is_dir: false, size: size as u64, modified: None, is_link: false });
+            return Ok(Entry { name, path: path.to_string(), is_dir: false, size: size as u64, modified: None, is_link: false, is_special: false });
         }
         // Not a file with a size: a directory, if the server lets us enter it.
         if within(self.ftp.cwd(path)).await.is_ok() {
-            return Ok(Entry { name, path: path.to_string(), is_dir: true, size: 0, modified: None, is_link: false });
+            return Ok(Entry { name, path: path.to_string(), is_dir: true, size: 0, modified: None, is_link: false, is_special: false });
         }
         // Servers without SIZE: look the name up in the parent folder's listing.
         let parent = super::parent_remote(path);

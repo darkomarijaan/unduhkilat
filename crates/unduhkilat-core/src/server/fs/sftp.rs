@@ -6,7 +6,7 @@ use crate::server::ssh::SshSession;
 use async_trait::async_trait;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use std::io::SeekFrom;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -30,8 +30,25 @@ fn map_err(e: SftpError) -> AppError {
     }
 }
 
-fn to_entry(dir: &str, name: String, a: &FileAttributes, is_link: bool) -> Entry {
-    Entry { path: join_remote(dir, &name), name, is_dir: a.is_dir(), size: a.len(), modified: a.mtime.map(|t| t as i64), is_link }
+/// What `a` is: (folder, link, special). Read from the whole type field of the mode. The bit tests
+/// of russh-sftp (`is_dir()` = "has bit 0x4000") call a socket (0xC000) or a block device (0x6000)
+/// a folder, and listing such a "folder" then fails with "not found". A server that sends no mode
+/// at all gets a plain file, as before.
+fn kind(a: &FileAttributes) -> (bool, bool, bool) {
+    if a.permissions.is_none() {
+        return (false, false, false);
+    }
+    match a.file_type() {
+        FileType::Dir => (true, false, false),
+        FileType::Symlink => (false, true, false),
+        FileType::File => (false, false, false),
+        FileType::Other => (false, false, true),
+    }
+}
+
+fn to_entry(dir: &str, name: String, a: &FileAttributes) -> Entry {
+    let (is_dir, is_link, is_special) = kind(a);
+    Entry { path: join_remote(dir, &name), name, is_dir, size: a.len(), modified: a.mtime.map(|t| t as i64), is_link, is_special }
 }
 
 /// Start the SFTP subsystem on `session`. The returned file system owns the connection.
@@ -53,12 +70,11 @@ impl RemoteFs for SftpFs {
                 continue;
             }
             let attrs = e.metadata();
-            let is_link = attrs.is_symlink();
-            let mut entry = to_entry(dir, name, &attrs, is_link);
-            if is_link {
+            let mut entry = to_entry(dir, name, &attrs);
+            if entry.is_link {
                 // Follow the link so a link to a folder opens like a folder.
                 if let Ok(target) = self.sftp.metadata(entry.path.clone()).await {
-                    entry.is_dir = target.is_dir();
+                    entry.is_dir = kind(&target).0;
                     entry.size = target.len();
                 }
             }
@@ -70,7 +86,9 @@ impl RemoteFs for SftpFs {
     async fn stat(&mut self, path: &str) -> Result<Entry> {
         let a = self.sftp.metadata(path).await.map_err(map_err)?;
         let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path).to_string();
-        Ok(Entry { name, path: path.to_string(), is_dir: a.is_dir(), size: a.len(), modified: a.mtime.map(|t| t as i64), is_link: false })
+        // `metadata` follows links, so what comes back is the target: a folder, a file or something special.
+        let (is_dir, _, is_special) = kind(&a);
+        Ok(Entry { name, path: path.to_string(), is_dir, size: a.len(), modified: a.mtime.map(|t| t as i64), is_link: false, is_special })
     }
 
     async fn mkdir(&mut self, path: &str) -> Result<()> {
@@ -138,5 +156,32 @@ impl RemoteFs for SftpFs {
     async fn close(self: Box<Self>) {
         let _ = self.sftp.close().await;
         self.session.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_mode(mode: Option<u32>) -> FileAttributes {
+        FileAttributes { permissions: mode, ..Default::default() }
+    }
+
+    #[test]
+    fn the_whole_type_field_decides_what_an_entry_is() {
+        // (mode, folder, link, special)
+        let cases = [
+            (0o040755, true, false, false),  // folder
+            (0o100644, false, false, false), // regular file
+            (0o120777, false, true, false),  // symbolic link
+            (0o140755, false, false, true),  // socket: shares bit 0o040000 with a folder
+            (0o060660, false, false, true),  // block device: shares it too
+            (0o010644, false, false, true),  // FIFO
+            (0o020620, false, false, true),  // character device
+        ];
+        for (mode, dir, link, special) in cases {
+            assert_eq!(kind(&with_mode(Some(mode))), (dir, link, special), "mode {mode:o}");
+        }
+        assert_eq!(kind(&with_mode(None)), (false, false, false), "no mode reported: a plain file");
     }
 }

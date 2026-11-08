@@ -34,8 +34,11 @@ pub async fn walk_remote(fs: &mut dyn RemoteFs, root: &str) -> Result<Vec<Found<
         if rel.len() > MAX_DEPTH {
             return Err(too_many());
         }
-        for e in fs.list(&dir).await? {
-            if e.is_link {
+        // Name the folder that failed: a bare "tidak ditemukan" does not say which one inside a big tree.
+        let listing = fs.list(&dir).await.map_err(|e| AppError::new(e.code, format!("{dir}: {}", e.message)))?;
+        for e in listing {
+            // Links are not followed; sockets, FIFOs and devices have nothing to copy.
+            if e.is_link || e.is_special {
                 continue;
             }
             if e.is_dir {
@@ -97,7 +100,7 @@ mod tests {
     struct Tree(BTreeMap<String, Vec<Entry>>);
 
     fn e(dir: &str, name: &str, is_dir: bool, is_link: bool) -> Entry {
-        Entry { name: name.into(), path: join_remote(dir, name), is_dir, size: 1, modified: None, is_link }
+        Entry { name: name.into(), path: join_remote(dir, name), is_dir, size: 1, modified: None, is_link, is_special: false }
     }
 
     #[async_trait]
@@ -133,6 +136,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sockets_fifos_and_devices_are_skipped_not_walked_into() {
+        let mut sock = e("/p/app", "daemon.sock", false, false);
+        sock.is_special = true;
+        let mut m = BTreeMap::new();
+        m.insert("/p/app".to_string(), vec![e("/p/app", "main.rs", false, false), sock]);
+        let found = walk_remote(&mut Tree(m), "/p/app").await.unwrap();
+        let names: Vec<&str> = found.iter().map(|f| f.item.name.as_str()).collect();
+        assert_eq!(names, ["main.rs"]);
+    }
+
+    #[tokio::test]
     async fn walk_lists_files_under_the_folder_with_relative_folders_and_skips_links() {
         let mut m = BTreeMap::new();
         m.insert("/data/Photos".to_string(), vec![e("/data/Photos", "a.jpg", false, false), e("/data/Photos", "2024", true, false), e("/data/Photos", "loop", true, true), e("/data/Photos", "shortcut.jpg", false, true)]);
@@ -141,6 +155,15 @@ mod tests {
         let found = walk_remote(&mut Tree(m), "/data/Photos").await.unwrap();
         let got: Vec<(String, String)> = found.iter().map(|f| (f.rel_dir.join("/"), f.item.name.clone())).collect();
         assert_eq!(got, [("Photos".to_string(), "a.jpg".to_string()), ("Photos/2024".to_string(), "b.jpg".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_cannot_be_listed_is_named_in_the_error() {
+        let mut m = BTreeMap::new();
+        m.insert("/data/Photos".to_string(), vec![e("/data/Photos", "2024", true, false)]);
+        let err = walk_remote(&mut Tree(m), "/data/Photos").await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::ErrNotFound);
+        assert!(err.message.contains("/data/Photos/2024"), "{}", err.message);
     }
 
     #[tokio::test]

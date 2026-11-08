@@ -14,6 +14,9 @@ pub struct Entry {
     /// Seconds since the Unix epoch, when the server reports it.
     pub modified: Option<i64>,
     pub is_link: bool,
+    /// Neither a regular file, a folder nor a link: a socket, FIFO or device. It has no content to
+    /// copy (opening a FIFO can even block), so folder transfers skip it.
+    pub is_special: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +121,7 @@ mod tests {
     use super::*;
 
     fn e(name: &str, dir: bool, size: u64) -> Entry {
-        Entry { name: name.into(), path: format!("/x/{name}"), is_dir: dir, size, modified: None, is_link: false }
+        Entry { name: name.into(), path: format!("/x/{name}"), is_dir: dir, size, modified: None, is_link: false, is_special: false }
     }
 
     #[test]
