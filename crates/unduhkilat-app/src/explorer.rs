@@ -66,6 +66,13 @@ pub fn view_of(entries: &[Entry], key: SortKey, ascending: bool, filter: &str) -
     v
 }
 
+/// How often the folder on this computer is read again while the explorer is open.
+pub const LOCAL_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub fn local_is_stale(age: std::time::Duration) -> bool {
+    age >= LOCAL_REFRESH
+}
+
 /// Names that already exist at the destination: the user must confirm replacing them.
 pub fn overwrite_conflicts(names: &[String], existing: &BTreeSet<String>, case_insensitive: bool) -> Vec<String> {
     let lower: BTreeSet<String> = existing.iter().map(|e| e.to_lowercase()).collect();
@@ -161,6 +168,7 @@ pub struct ExplorerState {
     pub local_dir: PathBuf,
     pub local_entries: Vec<Entry>,
     pub local_loaded: Option<PathBuf>,
+    pub local_loaded_at: Option<std::time::Instant>,
     pub local_selected: BTreeSet<String>,
     pub dialog: Option<ExDialog>,
     pub preview: Option<PreviewView>,
@@ -189,6 +197,7 @@ impl ExplorerState {
             local_dir,
             local_entries: Vec::new(),
             local_loaded: None,
+            local_loaded_at: None,
             local_selected: BTreeSet::new(),
             dialog: None,
             preview: None,
@@ -774,7 +783,12 @@ impl App {
     }
 
     fn local_panel(&mut self, ui: &mut Ui, ex: &mut ExplorerState) {
-        ui.label(RichText::new("Komputer ini").font(theme::bold(13.0)));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Komputer ini").font(theme::bold(13.0)));
+            if ui.small_button("Muat ulang").clicked() {
+                ex.local_loaded_at = None;
+            }
+        });
         ui.horizontal_wrapped(|ui| {
             for (label, path) in crumbs_local(&ex.local_dir) {
                 if ui.small_button(&label).clicked() {
@@ -783,10 +797,16 @@ impl App {
                 }
             }
         });
-        if ex.local_loaded.as_deref() != Some(ex.local_dir.as_path()) {
+        let reload = ex.local_loaded.as_deref() != Some(ex.local_dir.as_path()) || ex.local_loaded_at.map(|t| local_is_stale(t.elapsed())).unwrap_or(true);
+        if reload {
             ex.local_entries = read_local_dir(&ex.local_dir);
             ex.local_loaded = Some(ex.local_dir.clone());
+            ex.local_loaded_at = Some(std::time::Instant::now());
+            let names: BTreeSet<&String> = ex.local_entries.iter().map(|e| &e.name).collect();
+            ex.local_selected.retain(|n| names.contains(n));
         }
+        // New files (a finished download) show up without clicking anything.
+        ui.ctx().request_repaint_after(LOCAL_REFRESH);
         let h = (ui.available_height() - 40.0).max(120.0);
         let rows = ex.local_entries.len() + 1;
         egui::ScrollArea::vertical().id_salt("local-list").max_height(h).auto_shrink([false, false]).show_rows(ui, 22.0, rows, |ui, range| {
@@ -1256,6 +1276,12 @@ fn blocks_ui(ui: &mut Ui, blocks: &[Block]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_listing_refreshes_after_a_short_while() {
+        assert!(!local_is_stale(std::time::Duration::from_millis(500)));
+        assert!(local_is_stale(std::time::Duration::from_secs(2)));
+    }
 
     fn e(name: &str, dir: bool, size: u64) -> Entry {
         Entry { name: name.into(), path: format!("/{name}"), is_dir: dir, size, modified: None, is_link: false }
