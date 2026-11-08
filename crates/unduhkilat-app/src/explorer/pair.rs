@@ -362,35 +362,40 @@ impl App {
     /// Queue the jobs; the files named in `overwrite` replace what is already at the destination.
     /// `src_fs` is the connection to the source server, used to list the files of folders.
     pub(super) fn pair_enqueue(&mut self, jobs: Vec<CopyJob>, overwrite: Vec<String>, src_fs: Option<SharedFs>) {
+        let dst = jobs.first().and_then(|j| self.servers.servers.iter().find(|s| s.id == j.dst_server)).map(|s| s.name.clone()).unwrap_or_else(|| "server tujuan".to_string());
+        let title = match jobs.as_slice() {
+            [j] => format!("Menyalin {} ke {dst}", j.name),
+            _ => format!("Menyalin {} item ke {dst}", jobs.len()),
+        };
+        let run = self.copy_run_start(title);
         let (m, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
-            let (mut ok, mut failed) = (0, Vec::new());
+            // Each step reports what it queued, so the pop-up can show progress while a big folder is still being read.
+            let report = |ids: Vec<String>, failed: Vec<String>, finished: bool| {
+                let _ = tx.send(Msg::CopyQueued { run, ids, failed, finished });
+                ctx.request_repaint();
+            };
             for j in jobs {
                 if j.is_dir {
                     let Some(fs) = &src_fs else {
-                        failed.push(format!("{}: sambungan sumber tidak tersedia", j.name));
+                        report(Vec::new(), vec![format!("{}: sambungan sumber tidak tersedia", j.name)], false);
                         continue;
                     };
                     match fs.lock().await.as_mut() {
                         Some(f) => match m.enqueue_folder_copy(f.as_mut(), &j.src_server, &j.src_path, &j.dst_server, &j.dst_dir, false).await {
-                            Ok(r) => {
-                                ok += r.queued;
-                                failed.extend(r.failed);
-                            }
-                            Err(e) => failed.push(format!("{}: {}", j.name, e.message)),
+                            Ok(r) => report(r.ids, r.failed, false),
+                            Err(e) => report(Vec::new(), vec![format!("{}: {}", j.name, e.message)], false),
                         },
-                        None => failed.push(format!("{}: sambungan sumber sudah ditutup", j.name)),
+                        None => report(Vec::new(), vec![format!("{}: sambungan sumber sudah ditutup", j.name)], false),
                     }
                     continue;
                 }
                 match m.enqueue_remote_copy(&j.src_server, &j.src_path, &j.dst_server, &j.dst_dir, overwrite.contains(&j.name)).await {
-                    Ok(_) => ok += 1,
-                    Err(e) => failed.push(format!("{}: {}", j.name, e.message)),
+                    Ok(d) => report(vec![d.id], Vec::new(), false),
+                    Err(e) => report(Vec::new(), vec![format!("{}: {}", j.name, e.message)], false),
                 }
             }
-            let msg = if failed.is_empty() { format!("{ok} salinan ditambahkan ke antrean.") } else { format!("{ok} ditambahkan; gagal: {}", failed.iter().take(3).cloned().collect::<Vec<_>>().join("; ")) };
-            let _ = tx.send(Msg::Notice(msg));
-            ctx.request_repaint();
+            report(Vec::new(), Vec::new(), true);
         });
     }
 

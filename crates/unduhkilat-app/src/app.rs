@@ -178,6 +178,8 @@ enum Msg {
     UpdateStaged(std::result::Result<(), String>),
     Servers(servers::ServersMsg),
     Explorer(explorer::ExplorerMsg),
+    /// Items of a copy were added to the queue; `finished` = that was the last of them.
+    CopyQueued { run: u64, ids: Vec<String>, failed: Vec<String>, finished: bool },
 }
 
 #[derive(Clone)]
@@ -204,6 +206,11 @@ pub struct App {
     segments: Vec<Segment>,
     last_refresh: Instant,
     live: HashMap<String, (u64, u32)>,
+    /// Bytes done so far per running item, newer than what the database holds.
+    live_bytes: HashMap<String, i64>,
+    /// Copies between servers that the pop-up is following.
+    copies: Vec<explorer::CopyRun>,
+    copy_seq: u64,
     torrent: Option<(String, TorrentInfo)>,
     torrent_poll: Instant,
     grab: GrabState,
@@ -254,7 +261,7 @@ impl App {
         let mut app = App {
             rt, manager, paths, log_tail, ctx, tray, open_settings, bridge, proposals_rx, pending: VecDeque::new(),
             downloads: Vec::new(), categories: Vec::new(), segments: Vec::new(),
-            last_refresh: Instant::now() - Duration::from_secs(10), live: HashMap::new(), torrent: None, torrent_poll: Instant::now() - Duration::from_secs(10), grab: GrabState::default(), search: SearchState::default(), clip_rx, clip_enabled, events,
+            last_refresh: Instant::now() - Duration::from_secs(10), live: HashMap::new(), live_bytes: HashMap::new(), copies: Vec::new(), copy_seq: 0, torrent: None, torrent_poll: Instant::now() - Duration::from_secs(10), grab: GrabState::default(), search: SearchState::default(), clip_rx, clip_enabled, events,
             selected: None, checked: HashSet::new(), filter: Filter::All, sort: (SortKey::None, true),
             screen: Screen::Downloads, dock_open: false, dock_height: DOCK_HEIGHT, add: None, settings: None,
             log_level: 0, close_to_tray: true, sized: false, tx, rx, notice: None, update: UpdState::None, servers: servers::ServersState::default(), terminal: terminal::TerminalState::default(), start_hidden: false,
@@ -415,12 +422,14 @@ impl App {
     fn drain(&mut self) {
         while let Ok(ev) = self.events.try_recv() {
             match ev {
-                EngineEvent::Progress { id, current_speed_bps, active_connections, .. } => {
+                EngineEvent::Progress { id, downloaded_bytes, current_speed_bps, active_connections, .. } => {
+                    self.live_bytes.insert(id.clone(), downloaded_bytes);
                     self.live.insert(id, (current_speed_bps, active_connections));
                 }
                 EngineEvent::StateChanged { id, state, .. } => {
                     if state != DownloadState::Running {
                         self.live.remove(&id);
+                        self.live_bytes.remove(&id);
                     }
                     self.last_refresh = Instant::now() - Duration::from_secs(10);
                     if state == DownloadState::Completed {
@@ -448,6 +457,7 @@ impl App {
                 },
                 Msg::Servers(m) => self.servers_msg(m),
                 Msg::Explorer(m) => self.explorer_msg(m),
+                Msg::CopyQueued { run, ids, failed, finished } => self.copy_run_update(run, ids, failed, finished),
                 Msg::UpdateStaged(r) => match r {
                     Ok(()) => self.apply_update(),
                     Err(e) => {
@@ -935,6 +945,8 @@ impl eframe::App for App {
                 self.checked.clear();
             }
         }
+
+        self.copy_windows(ctx);
 
         let width = ctx.content_rect().width();
         let compact = width < 1000.0;

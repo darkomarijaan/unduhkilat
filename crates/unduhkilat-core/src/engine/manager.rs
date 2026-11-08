@@ -70,6 +70,8 @@ pub struct Manager {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FolderQueued {
     pub queued: usize,
+    /// The queue items created, so a caller can follow their progress.
+    pub ids: Vec<String>,
     pub failed: Vec<String>,
 }
 
@@ -562,7 +564,10 @@ impl Manager {
                 continue;
             }
             match self.enqueue_remote_download(server_id, &f.item.path, &dir, overwrite).await {
-                Ok(_) => out.queued += 1,
+                Ok(d) => {
+                    out.queued += 1;
+                    out.ids.push(d.id);
+                }
                 Err(e) => out.failed.push(format!("{}: {}", f.item.path, e.message)),
             }
         }
@@ -578,7 +583,10 @@ impl Manager {
         for f in found {
             let dir = f.rel_dir.iter().fold(remote_dir.to_string(), |acc, part| crate::server::fs::join_remote(&acc, part));
             match self.enqueue_remote_upload(server_id, &f.item, &dir, overwrite).await {
-                Ok(_) => out.queued += 1,
+                Ok(d) => {
+                    out.queued += 1;
+                    out.ids.push(d.id);
+                }
                 Err(e) => out.failed.push(format!("{}: {}", f.item.display(), e.message)),
             }
         }
@@ -598,7 +606,10 @@ impl Manager {
         for f in found {
             let dir = f.rel_dir.iter().fold(dst_dir.to_string(), |acc, part| crate::server::fs::join_remote(&acc, part));
             match self.enqueue_remote_copy(src_server, &f.item.path, dst_server, &dir, overwrite).await {
-                Ok(_) => out.queued += 1,
+                Ok(d) => {
+                    out.queued += 1;
+                    out.ids.push(d.id);
+                }
                 Err(e) => out.failed.push(format!("{}: {}", f.item.path, e.message)),
             }
         }

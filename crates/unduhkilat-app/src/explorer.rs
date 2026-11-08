@@ -16,9 +16,12 @@ use unduhkilat_core::server::fs::{join_remote, parent_remote, safe_local_name, s
 
 #[path = "explorer/pair.rs"]
 mod pair;
+#[path = "explorer/progress.rs"]
+mod progress;
 #[path = "explorer/table.rs"]
 mod table;
 use pair::{CopyJob, LeftServer, PairMsg};
+pub use progress::CopyRun;
 pub use pair::LEFT_BIT;
 
 pub type SharedFs = Arc<Mutex<Option<Box<dyn RemoteFs>>>>;
