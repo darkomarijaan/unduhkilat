@@ -16,6 +16,8 @@ use unduhkilat_core::server::fs::{join_remote, parent_remote, safe_local_name, s
 
 #[path = "explorer/pair.rs"]
 mod pair;
+#[path = "explorer/table.rs"]
+mod table;
 use pair::{CopyJob, LeftServer, PairMsg};
 pub use pair::LEFT_BIT;
 
@@ -190,6 +192,7 @@ pub struct ExplorerState {
     pub highlight: Option<(String, u8)>,
     pub local_scroll_to: Option<usize>,
     pub local_selected: BTreeSet<String>,
+    pub local_sort: (SortKey, bool),
     pub dialog: Option<ExDialog>,
     pub preview: Option<PreviewView>,
     pub max_preview_mb: u64,
@@ -226,6 +229,7 @@ impl ExplorerState {
             highlight: None,
             local_scroll_to: None,
             local_selected: BTreeSet::new(),
+            local_sort: (SortKey::Name, true),
             dialog: None,
             preview: None,
             max_preview_mb,
@@ -902,6 +906,7 @@ impl App {
         let reload = ex.local_loaded.as_deref() != Some(ex.local_dir.as_path()) || ex.local_loaded_at.map(|t| local_is_stale(t.elapsed())).unwrap_or(true);
         if reload {
             ex.local_entries = read_local_dir(&ex.local_dir);
+            sort_entries(&mut ex.local_entries, ex.local_sort.0, ex.local_sort.1);
             ex.local_loaded = Some(ex.local_dir.clone());
             ex.local_loaded_at = Some(std::time::Instant::now());
             let names: BTreeSet<&String> = ex.local_entries.iter().map(|e| &e.name).collect();
@@ -918,39 +923,46 @@ impl App {
         }
         // New files (a finished download) show up without clicking anything.
         ui.ctx().request_repaint_after(LOCAL_REFRESH);
-        let h = (ui.available_height() - 74.0).max(120.0);
+        let outer_h = (ui.available_height() - 74.0).max(150.0);
         let rows = ex.local_entries.len() + 1;
-        let mut area = egui::ScrollArea::vertical().id_salt("local-list").max_height(h).auto_shrink([false, false]);
-        if let Some(row) = ex.local_scroll_to.take() {
-            let step = 22.0 + ui.spacing().item_spacing.y;
-            area = area.vertical_scroll_offset((row as f32 * step - h / 2.0).max(0.0));
-        }
-        area.show_rows(ui, 22.0, rows, |ui, range| {
-            if range.start == 0 && ui.selectable_label(false, "\u{2191}  ..").clicked() {
-                if let Some(p) = ex.local_dir.parent() {
-                    ex.local_dir = p.to_path_buf();
-                    ex.local_selected.clear();
-                }
+        let scroll_row = ex.local_scroll_to.take();
+        table::scrolled_x(ui, "local", outer_h, |ui| {
+            if table::header(ui, "local", &mut ex.local_sort) {
+                sort_entries(&mut ex.local_entries, ex.local_sort.0, ex.local_sort.1);
             }
-            for i in range.start.saturating_sub(1)..range.end.saturating_sub(1).min(ex.local_entries.len()) {
-                let e = ex.local_entries[i].clone();
-                let sel = ex.local_selected.contains(&e.name);
-                let slash = if e.is_dir { "/" } else { "" };
-                let size = if e.is_dir { String::new() } else { format::bytes(e.size as i64) };
-                let r = ui.selectable_label(sel, format!("{}{slash}    {size}", e.name));
-                if r.double_clicked() && e.is_dir {
-                    ex.local_dir = PathBuf::from(&e.path);
-                    ex.local_selected.clear();
-                } else if r.clicked() {
-                    if ui.input(|i| i.modifiers.command) {
-                        if !ex.local_selected.remove(&e.name) {
-                            ex.local_selected.insert(e.name.clone());
+            let h = (ui.available_height() - 18.0).max(100.0);
+            let mut area = egui::ScrollArea::vertical().id_salt("local-list").max_height(h).auto_shrink([false, false]);
+            if let Some(row) = scroll_row {
+                area = area.vertical_scroll_offset((row as f32 * table::ROW_H - h / 2.0).max(0.0));
+            }
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                area.show_rows(ui, table::ROW_H, rows, |ui, range| {
+                    if range.start == 0 && table::up_row(ui).clicked() {
+                        if let Some(p) = ex.local_dir.parent() {
+                            ex.local_dir = p.to_path_buf();
+                            ex.local_selected.clear();
                         }
-                    } else {
-                        ex.local_selected = [e.name.clone()].into();
                     }
-                }
-            }
+                    for i in range.start.saturating_sub(1)..range.end.saturating_sub(1).min(ex.local_entries.len()) {
+                        let e = ex.local_entries[i].clone();
+                        let sel = ex.local_selected.contains(&e.name);
+                        let r = table::row(ui, &e, sel);
+                        if r.double_clicked() && e.is_dir {
+                            ex.local_dir = PathBuf::from(&e.path);
+                            ex.local_selected.clear();
+                        } else if r.clicked() {
+                            if ui.input(|i| i.modifiers.command) {
+                                if !ex.local_selected.remove(&e.name) {
+                                    ex.local_selected.insert(e.name.clone());
+                                }
+                            } else {
+                                ex.local_selected = [e.name.clone()].into();
+                            }
+                        }
+                    }
+                });
+            });
         });
         // This panel's own buttons: they act on what is chosen here.
         let server_name = self.servers.servers.iter().find(|s| s.id == ex.server_id).map(|s| s.name.clone()).unwrap_or_else(|| "server".to_string());
@@ -983,6 +995,9 @@ impl App {
                 ex.dialog = Some(ExDialog::NewFolder(String::new()));
             }
             ui.add(egui::TextEdit::singleline(&mut ex.filter).hint_text("Saring nama...").desired_width(140.0));
+            if ex.loading {
+                ui.spinner();
+            }
         });
         ui.horizontal_wrapped(|ui| {
             for (label, path) in crumbs(&ex.dir) {
@@ -991,64 +1006,57 @@ impl App {
                 }
             }
         });
-        ui.horizontal(|ui| {
-            for (label, key) in [("Nama", SortKey::Name), ("Ukuran", SortKey::Size), ("Diubah", SortKey::Modified)] {
-                let on = ex.sort.0 == key;
-                let arrow = if on { if ex.sort.1 { " \u{25B2}" } else { " \u{25BC}" } } else { "" };
-                if ui.selectable_label(on, format!("{label}{arrow}")).clicked() {
-                    ex.sort = (key, if on { !ex.sort.1 } else { true });
-                }
-            }
-            if ex.loading {
-                ui.spinner();
-            }
-        });
         if let Some(e) = &ex.error {
             ui.label(RichText::new(e).color(DANGER));
         }
-        let h = (ui.available_height() - 74.0).max(120.0);
+        let outer_h = (ui.available_height() - 74.0).max(150.0);
         let key = (ex.gen, ex.sort.0, ex.sort.1, ex.filter.clone());
         if ex.view_cache.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             ex.view_cache = Some((key, view_of(&ex.entries, ex.sort.0, ex.sort.1, &ex.filter)));
         }
         let view: Vec<Entry> = ex.view_cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default();
         let up_row = usize::from(ex.dir != "/");
-        let mut area = egui::ScrollArea::vertical().id_salt("server-list").max_height(h).auto_shrink([false, false]);
-        if let Some(p) = ex.scroll_to.take() {
-            if let Some(i) = view.iter().position(|e| e.path == p) {
-                let step = 22.0 + ui.spacing().item_spacing.y;
-                area = area.vertical_scroll_offset((((i + up_row) as f32) * step - h / 2.0).max(0.0));
+        let scroll_to = ex.scroll_to.take().and_then(|p| view.iter().position(|e| e.path == p));
+        table::scrolled_x(ui, "server", outer_h, |ui| {
+            if table::header(ui, "server", &mut ex.sort) {
+                ui.ctx().request_repaint();
             }
-        }
-        area.show_rows(ui, 22.0, view.len() + up_row, |ui, range| {
-            if up_row == 1 && range.start == 0 && ui.selectable_label(false, "\u{2191}  ..").clicked() {
-                let p = parent_remote(&ex.dir);
-                self.explorer_list(tab_id, ex, &p);
+            let h = (ui.available_height() - 18.0).max(100.0);
+            let mut area = egui::ScrollArea::vertical().id_salt("server-list").max_height(h).auto_shrink([false, false]);
+            if let Some(i) = scroll_to {
+                area = area.vertical_scroll_offset((((i + up_row) as f32) * table::ROW_H - h / 2.0).max(0.0));
             }
-            for e in view.iter().skip(range.start.saturating_sub(up_row)).take(range.len()) {
-                let sel = ex.selected.contains(&e.path);
-                let slash = if e.is_dir { "/" } else { "" };
-                let size = if e.is_dir { String::new() } else { format::bytes(e.size as i64) };
-                let r = ui.selectable_label(sel, format!("{}{slash}    {size}", e.name));
-                if r.double_clicked() {
-                    if e.is_dir {
-                        self.explorer_list(tab_id, ex, &e.path);
-                    } else {
-                        self.explorer_start_preview(tab_id, ex, e.clone(), 1024 * 1024);
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                area.show_rows(ui, table::ROW_H, view.len() + up_row, |ui, range| {
+                    if up_row == 1 && range.start == 0 && table::up_row(ui).clicked() {
+                        let p = parent_remote(&ex.dir);
+                        self.explorer_list(tab_id, ex, &p);
                     }
-                } else if r.clicked() {
-                    if ui.input(|i| i.modifiers.command) {
-                        if !ex.selected.remove(&e.path) {
-                            ex.selected.insert(e.path.clone());
+                    for e in view.iter().skip(range.start.saturating_sub(up_row)).take(range.len()) {
+                        let sel = ex.selected.contains(&e.path);
+                        let r = table::row(ui, e, sel);
+                        if r.double_clicked() {
+                            if e.is_dir {
+                                self.explorer_list(tab_id, ex, &e.path);
+                            } else {
+                                self.explorer_start_preview(tab_id, ex, e.clone(), 1024 * 1024);
+                            }
+                        } else if r.clicked() {
+                            if ui.input(|i| i.modifiers.command) {
+                                if !ex.selected.remove(&e.path) {
+                                    ex.selected.insert(e.path.clone());
+                                }
+                            } else {
+                                ex.selected = [e.path.clone()].into();
+                            }
                         }
-                    } else {
-                        ex.selected = [e.path.clone()].into();
                     }
-                }
-            }
-            if view.is_empty() && !ex.loading {
-                ui.label(RichText::new("Folder kosong.").color(FG_SECONDARY));
-            }
+                    if view.is_empty() && !ex.loading {
+                        ui.label(RichText::new("Folder kosong.").color(FG_SECONDARY));
+                    }
+                });
+            });
         });
         let chosen: Vec<Entry> = ex.entries.iter().filter(|e| ex.selected.contains(&e.path)).cloned().collect();
         let files: Vec<&Entry> = chosen.iter().filter(|e| !e.is_dir).collect();

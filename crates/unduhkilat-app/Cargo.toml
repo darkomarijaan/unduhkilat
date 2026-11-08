@@ -12,6 +12,7 @@ unduhkilat-core = { path = "../unduhkilat-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tokio-util = "0.7"
 arboard = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures-util = "0.3"
 serde_json = "1"
 tracing = "0.1"

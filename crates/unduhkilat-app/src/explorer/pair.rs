@@ -44,6 +44,7 @@ pub struct LeftServer {
     pub loading: bool,
     pub error: Option<String>,
     pub gen: u64,
+    pub sort: (SortKey, bool),
     /// A file that just arrived here: select it and scroll to it once the folder is listed.
     pub reveal: Option<String>,
     pub scroll_row: Option<usize>,
@@ -63,6 +64,7 @@ impl LeftServer {
             loading: false,
             error: None,
             gen: 0,
+            sort: (SortKey::Name, true),
             reveal: None,
             scroll_row: None,
         }
@@ -208,7 +210,7 @@ impl App {
                 left.loading = false;
                 match result {
                     Ok(mut v) => {
-                        sort_entries(&mut v, SortKey::Name, true);
+                        sort_entries(&mut v, left.sort.0, left.sort.1);
                         left.dir = dir;
                         left.entries = v;
                         left.selected.clear();
@@ -272,38 +274,45 @@ impl App {
             if let Some(e) = &left.error {
                 ui.label(RichText::new(e).color(DANGER));
             }
-            let h = (ui.available_height() - 74.0).max(120.0);
+            let outer_h = (ui.available_height() - 74.0).max(150.0);
             let up = usize::from(left.dir != "/");
-            let mut area = egui::ScrollArea::vertical().id_salt("left-server-list").max_height(h).auto_shrink([false, false]);
-            if let Some(row) = left.scroll_row.take() {
-                let step = 22.0 + ui.spacing().item_spacing.y;
-                area = area.vertical_scroll_offset((row as f32 * step - h / 2.0).max(0.0));
-            }
             let rows = left.entries.len() + up;
-            area.show_rows(ui, 22.0, rows, |ui, range| {
-                if up == 1 && range.start == 0 && ui.selectable_label(false, "\u{2191}  ..").clicked() {
-                    go = Some(parent_remote(&left.dir));
+            let scroll_row = left.scroll_row.take();
+            table::scrolled_x(ui, "second-server", outer_h, |ui| {
+                if table::header(ui, "second-server", &mut left.sort) {
+                    sort_entries(&mut left.entries, left.sort.0, left.sort.1);
                 }
-                for e in left.entries.iter().skip(range.start.saturating_sub(up)).take(range.len()) {
-                    let sel = left.selected.contains(&e.path);
-                    let slash = if e.is_dir { "/" } else { "" };
-                    let size = if e.is_dir { String::new() } else { format::bytes(e.size as i64) };
-                    let r = ui.selectable_label(sel, format!("{}{slash}    {size}", e.name));
-                    if r.double_clicked() && e.is_dir {
-                        go = Some(e.path.clone());
-                    } else if r.clicked() {
-                        if ui.input(|i| i.modifiers.command) {
-                            if !left.selected.remove(&e.path) {
-                                left.selected.insert(e.path.clone());
-                            }
-                        } else {
-                            left.selected = [e.path.clone()].into();
+                let h = (ui.available_height() - 18.0).max(100.0);
+                let mut area = egui::ScrollArea::vertical().id_salt("left-server-list").max_height(h).auto_shrink([false, false]);
+                if let Some(row) = scroll_row {
+                    area = area.vertical_scroll_offset((row as f32 * table::ROW_H - h / 2.0).max(0.0));
+                }
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    area.show_rows(ui, table::ROW_H, rows, |ui, range| {
+                        if up == 1 && range.start == 0 && table::up_row(ui).clicked() {
+                            go = Some(parent_remote(&left.dir));
                         }
-                    }
-                }
-                if left.entries.is_empty() && !left.loading {
-                    ui.label(RichText::new("Folder kosong.").color(FG_SECONDARY));
-                }
+                        for e in left.entries.iter().skip(range.start.saturating_sub(up)).take(range.len()) {
+                            let sel = left.selected.contains(&e.path);
+                            let r = table::row(ui, e, sel);
+                            if r.double_clicked() && e.is_dir {
+                                go = Some(e.path.clone());
+                            } else if r.clicked() {
+                                if ui.input(|i| i.modifiers.command) {
+                                    if !left.selected.remove(&e.path) {
+                                        left.selected.insert(e.path.clone());
+                                    }
+                                } else {
+                                    left.selected = [e.path.clone()].into();
+                                }
+                            }
+                        }
+                        if left.entries.is_empty() && !left.loading {
+                            ui.label(RichText::new("Folder kosong.").color(FG_SECONDARY));
+                        }
+                    });
+                });
             });
         }
         // This panel's own buttons: they act on what is chosen here.

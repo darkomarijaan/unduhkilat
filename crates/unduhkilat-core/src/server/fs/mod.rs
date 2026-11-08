@@ -21,6 +21,8 @@ pub enum SortKey {
     Name,
     Size,
     Modified,
+    /// By file extension (the "Jenis" column).
+    Type,
 }
 
 pub type RemoteReader = Box<dyn AsyncRead + Send + Unpin>;
@@ -69,12 +71,21 @@ pub fn safe_local_name(remote_name: &str) -> Option<String> {
 }
 
 /// Folders first, then by `key`; ties by name (case-insensitive).
+/// The lower-case extension of a file name; none for `README` and for dot files like `.bashrc`.
+pub fn extension_of(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => ext.to_lowercase(),
+        _ => String::new(),
+    }
+}
+
 pub fn sort_entries(v: &mut [Entry], key: SortKey, ascending: bool) {
     v.sort_by(|a, b| {
         let primary = match key {
             SortKey::Name => std::cmp::Ordering::Equal,
             SortKey::Size => a.size.cmp(&b.size),
             SortKey::Modified => a.modified.cmp(&b.modified),
+            SortKey::Type => extension_of(&a.name).cmp(&extension_of(&b.name)),
         };
         let primary = if ascending { primary } else { primary.reverse() };
         let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
@@ -131,6 +142,15 @@ mod tests {
         assert_eq!(v.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["alpha", "Zeta", "a.txt", "b.txt"]);
         sort_entries(&mut v, SortKey::Size, false);
         assert_eq!(v.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["alpha", "Zeta", "a.txt", "b.txt"].map(|s| s), "folders stay first; larger files first");
+    }
+
+    #[test]
+    fn sort_by_type_groups_extensions_and_keeps_folders_first() {
+        let mut v = vec![e("b.zip", false, 1), e("a.PDF", false, 1), e("Dir", true, 0), e("c.pdf", false, 1), e("README", false, 1)];
+        sort_entries(&mut v, SortKey::Type, true);
+        assert_eq!(v.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["Dir", "README", "a.PDF", "c.pdf", "b.zip"], "no extension first, then by extension, then by name");
+        sort_entries(&mut v, SortKey::Type, false);
+        assert_eq!(v.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["Dir", "b.zip", "a.PDF", "c.pdf", "README"]);
     }
 
     #[test]
