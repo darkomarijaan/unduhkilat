@@ -239,11 +239,11 @@ impl Manager {
     /// Enqueue the links the user ticked. Each becomes an ordinary queue item, so the
     /// concurrency limit, priority/FIFO dispatch, category routing and speed limits all
     /// apply (FR-047). Failures (e.g. a name collision) are reported per link and do not
-    /// stop the rest.
-    pub async fn enqueue_batch(&self, urls: Vec<String>, priority: i32, category_id: Option<String>) -> BatchOutcome {
+    /// stop the rest. `referer` is the scanned page: hotlink-protected hosts answer 403 without it.
+    pub async fn enqueue_batch(&self, urls: Vec<String>, priority: i32, category_id: Option<String>, referer: Option<String>) -> BatchOutcome {
         let mut out = BatchOutcome::default();
         for url in urls {
-            let req = NewDownload { url: url.clone(), priority, category_id: category_id.clone(), start_immediately: true, ..Default::default() };
+            let req = NewDownload { url: url.clone(), priority, category_id: category_id.clone(), referer: referer.clone(), start_immediately: true, ..Default::default() };
             match self.create(req).await {
                 Ok(d) => out.created.push(d.id),
                 Err(e) => out.failed.push((url, format!("{}: {}", e.code, e.message))),

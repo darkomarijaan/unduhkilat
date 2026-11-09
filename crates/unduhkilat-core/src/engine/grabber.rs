@@ -188,15 +188,16 @@ async fn fetch_page(client: &reqwest::Client, url: &str) -> Result<String> {
 }
 
 /// Real sizes via HEAD (best effort, a few at a time, short timeout).
-async fn fill_sizes(client: &reqwest::Client, items: &mut [Candidate]) {
+async fn fill_sizes(client: &reqwest::Client, items: &mut [Candidate], referer: &str) {
     let sizes: Vec<Option<i64>> = futures_util::stream::iter(items.iter().map(|c| c.url.clone()).collect::<Vec<String>>())
         .map(|u| {
             let client = client.clone();
+            let referer = referer.to_string();
             async move {
                 if !u.starts_with("http") {
                     return None;
                 }
-                let r = tokio::time::timeout(Duration::from_secs(8), client.head(&u).send()).await.ok()?.ok()?;
+                let r = tokio::time::timeout(Duration::from_secs(8), client.head(&u).header(reqwest::header::REFERER, referer).send()).await.ok()?.ok()?;
                 if !r.status().is_success() {
                     return None;
                 }
@@ -234,7 +235,7 @@ pub async fn scan_page(client: &reqwest::Client, page_url: &str, pattern: &str, 
         })
         .collect();
     if with_sizes {
-        fill_sizes(client, &mut candidates).await;
+        fill_sizes(client, &mut candidates, page_url).await;
     }
     Ok(ScanResult { candidates, truncated, links_on_page: links.len() })
 }

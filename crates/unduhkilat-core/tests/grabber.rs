@@ -90,7 +90,7 @@ async fn only_ticked_links_are_enqueued_as_ordinary_items_and_obey_concurrency()
     let env = Env::with_cfg(|c| c.default_concurrency = 2).await;
     let found = env.manager.scan_links(&format!("{base}/page"), "*.pdf").await.unwrap();
     let ticked: Vec<String> = found.candidates.iter().take(3).map(|c| c.url.clone()).collect();
-    let out = env.manager.enqueue_batch(ticked.clone(), 5, None).await;
+    let out = env.manager.enqueue_batch(ticked.clone(), 5, None, None).await;
     assert_eq!(out.created.len(), 3);
     assert!(out.failed.is_empty());
     for id in &out.created {
@@ -101,7 +101,7 @@ async fn only_ticked_links_are_enqueued_as_ordinary_items_and_obey_concurrency()
     let all = env.manager.db().read(|c| unduhkilat_core::repo::list_downloads(c, None)).unwrap();
     assert_eq!(all.len(), 3, "the 7 unticked links were never queued");
     // A repeat of the same links collides instead of overwriting; the rest still go through.
-    let again = env.manager.enqueue_batch(vec![ticked[0].clone(), found.candidates[5].url.clone()], 0, None).await;
+    let again = env.manager.enqueue_batch(vec![ticked[0].clone(), found.candidates[5].url.clone()], 0, None, None).await;
     assert_eq!(again.failed.len(), 1);
     assert!(again.failed[0].1.contains("ERR_NAME_COLLISION"));
     assert_eq!(again.created.len(), 1);

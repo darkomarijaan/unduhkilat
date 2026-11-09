@@ -2192,7 +2192,7 @@ impl App {
                 Some(r) => r.candidates.iter().zip(&self.grab.checked).filter(|(_, on)| **on).map(|(c, _)| c.url.clone()).collect(),
                 None => Vec::new(),
             };
-            let out = self.rt.block_on(self.manager.clone().enqueue_batch(urls, 0, None));
+            let out = self.rt.block_on(self.manager.clone().enqueue_batch(urls, 0, None, Some(self.grab.url.trim().to_string()).filter(|u| !u.is_empty())));
             let mut msg = format!("{} berkas diantrikan.", out.created.len());
             if let Some((u, e)) = out.failed.first() {
                 msg += &format!(" {} gagal (mis. {u}: {e}).", out.failed.len());

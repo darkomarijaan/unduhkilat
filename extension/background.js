@@ -244,8 +244,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ list: [...candidatesFor(tabId).values()], connected });
   } else if (msg.type === 'send-media') {
     (async () => {
-      const c = candidatesFor(tabId).get(UK.normalizeUrl(msg.url));
-      if (!c || c.kind === 'manifest') return sendResponse({ ok: false, error: 'Aliran HLS/DASH belum dapat diunduh sebagai satu berkas.' });
+      const key = UK.normalizeUrl(msg.url);
+      if (!key) return sendResponse({ ok: false, error: 'Alamat video tidak valid.' });
+      let c = candidatesFor(tabId).get(key);
+      if (!c) {
+        // Service worker MV3 tidur dan kehilangan peta kandidat, padahal panel di halaman masih
+        // menampilkannya: pulihkan dari data yang dikirim panel, lalu klasifikasi ulang.
+        c = UK.mergeCandidate(candidatesFor(tabId), { url: msg.url, mime: msg.mime || '', size: msg.size == null ? null : msg.size, sources: ['page'] });
+      }
+      if (!c) return sendResponse({ ok: false, error: 'Alamat video tidak valid.' });
+      if (c.kind === 'manifest') return sendResponse({ ok: false, error: 'Aliran HLS/DASH belum dapat diunduh sebagai satu berkas.' });
       let referer = '';
       try { referer = (await chrome.tabs.get(tabId)).url || ''; } catch (e) { /* tab gone */ }
       try {

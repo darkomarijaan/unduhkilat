@@ -108,7 +108,7 @@
       go.className = 'go'; go.textContent = 'Unduh Berkas'; go.disabled = c.kind === 'manifest';
       go.addEventListener('click', async () => {
         go.disabled = true;
-        const r = await chrome.runtime.sendMessage({ type: 'send-media', url: c.url }).catch(() => ({ ok: false, error: 'Tidak dapat menghubungi ekstensi.' }));
+        const r = await chrome.runtime.sendMessage({ type: 'send-media', url: c.url, mime: c.mime, size: c.size }).catch(() => ({ ok: false, error: 'Tidak dapat menghubungi ekstensi.' }));
         flash = r && r.ok ? 'Terkirim. Konfirmasi di jendela UnduhKilat untuk mulai mengunduh.' : '!' + ((r && r.error) || 'Gagal mengirim.');
         render();
       });
