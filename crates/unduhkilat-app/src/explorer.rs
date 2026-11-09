@@ -350,6 +350,21 @@ impl App {
         self.screen = super::Screen::Terminal;
     }
 
+    /// "Unggah ke server" from a local tab's file pane: open that server's file tab with the local
+    /// panel already on this folder and these items chosen, so the person only picks the
+    /// destination folder on the server and presses Unggah.
+    pub(super) fn upload_from_local(&mut self, server_id: &str, dir: PathBuf, names: Vec<String>) {
+        let Some(server_name) = self.servers.servers.iter().find(|s| s.id == server_id).map(|s| s.name.clone()) else { return };
+        self.open_files_tab(server_id);
+        let mut ex = self.new_explorer(server_id);
+        ex.local_dir = dir;
+        ex.local_selected = names.into_iter().collect();
+        if let Some(tab) = self.terminal.tabs.last_mut() {
+            tab.explorer = Some(ex);
+        }
+        self.notice = Some((format!("Buka folder tujuan di {server_name}, lalu tekan \u{2190} Unggah ke {server_name}."), std::time::Instant::now()));
+    }
+
     pub(super) fn new_explorer(&mut self, server_id: &str) -> ExplorerState {
         static CLEANED: std::sync::Once = std::sync::Once::new();
         CLEANED.call_once(clean_preview_temp);

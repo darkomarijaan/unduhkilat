@@ -749,7 +749,8 @@ pub struct TermTab {
     show_files: bool,
     cwd: PathBuf,
     files_dir: PathBuf,
-    selected_file: Option<PathBuf>,
+    /// Items chosen in the local files pane (click selects, Ctrl+click adds, double-click opens a folder).
+    selected_files: std::collections::BTreeSet<PathBuf>,
     /// Cancels a connection attempt that is still in progress (SSH tabs).
     cancel: Option<tokio_util::sync::CancellationToken>,
     /// File explorer of an SSH or server tab; created the first time it is shown.
@@ -786,7 +787,7 @@ impl TermTab {
             show_files: true,
             cwd: PathBuf::new(),
             files_dir: PathBuf::new(),
-            selected_file: None,
+            selected_files: Default::default(),
             cancel: None,
             explorer: None,
         }
@@ -866,7 +867,7 @@ impl App {
                     show_files: false,
                     files_dir: cwd.clone(),
                     cwd,
-                    selected_file: None,
+                    selected_files: Default::default(),
                     cancel: None,
                     explorer: None,
                 });
@@ -896,7 +897,7 @@ impl App {
             show_files: false,
             cwd: PathBuf::new(),
             files_dir: PathBuf::new(),
-            selected_file: None,
+            selected_files: Default::default(),
             cancel: None,
             explorer: None,
         });
@@ -1071,8 +1072,9 @@ impl App {
             }
         }
         let maximized = self.terminal.maximized;
+        let servers: Vec<(String, String)> = self.servers.servers.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
         tab.view.alt_v_image = matches!(tab.kind, TabKind::Ssh { .. });
-        draw_tab(ui, &mut tab, &settings, maximized, &mut outcome, &mut |ui: &mut egui::Ui| {
+        draw_tab(ui, &mut tab, &settings, &servers, maximized, &mut outcome, &mut |ui: &mut egui::Ui| {
             if let Some(ex) = ex.as_mut() {
                 self.explorer_ui(ui, id, ex);
             }
@@ -1112,6 +1114,9 @@ impl App {
                 }
                 Err(e) => self.notice = Some((e.message, Instant::now())),
             }
+        }
+        if let Some((server_id, dir, names)) = outcome.upload.take() {
+            self.upload_from_local(&server_id, dir, names);
         }
         if outcome.close {
             self.close_tab(id);
@@ -1187,10 +1192,12 @@ struct TabOutcome {
     toggle_max: bool,
     notice: Option<String>,
     close: bool,
+    /// Upload these items of a local folder: (server id, folder, names).
+    upload: Option<(String, PathBuf, Vec<String>)>,
 }
 
 /// One tab's toolbar, banner, terminal, and files pane, in the chosen layout.
-fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, maximized: bool, out: &mut TabOutcome, explorer_ui: &mut dyn FnMut(&mut egui::Ui)) {
+fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, servers: &[(String, String)], maximized: bool, out: &mut TabOutcome, explorer_ui: &mut dyn FnMut(&mut egui::Ui)) {
     let local = matches!(tab.kind, TabKind::Local(_));
     if matches!(tab.kind, TabKind::Files { .. }) {
         ui.horizontal(|ui| {
@@ -1277,7 +1284,7 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, maxim
         TerminalLayout::A => {
             if tab.show_files {
                 if local {
-                    files_pane(ui, tab, &session, local, out);
+                    files_pane(ui, tab, &session, local, servers, out);
                 } else {
                     explorer_ui(ui);
                 }
@@ -1293,7 +1300,7 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, maxim
                 ui.separator();
                 ui.allocate_ui_with_layout(Vec2::new((total.x - left - 16.0).max(120.0), total.y), Layout::top_down(Align::Min), |ui| {
                     if local {
-                        files_pane(ui, tab, &session, local, out);
+                        files_pane(ui, tab, &session, local, servers, out);
                     } else {
                         explorer_ui(ui);
                     }
@@ -1304,7 +1311,7 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, maxim
 }
 
 /// Local folder listing next to (or instead of) the terminal. Servers get theirs with SFTP (a later part).
-fn files_pane(ui: &mut egui::Ui, tab: &mut TermTab, session: &TermSession, local: bool, out: &mut TabOutcome) {
+fn files_pane(ui: &mut egui::Ui, tab: &mut TermTab, session: &TermSession, local: bool, servers: &[(String, String)], out: &mut TabOutcome) {
     if !local {
         ui.add_space(20.0);
         ui.label(RichText::new("Segera hadir").font(theme::bold(14.0)));
@@ -1315,7 +1322,7 @@ fn files_pane(ui: &mut egui::Ui, tab: &mut TermTab, session: &TermSession, local
         if ui.small_button("\u{2191}").on_hover_text("Folder induk").clicked() {
             if let Some(p) = tab.files_dir.parent() {
                 tab.files_dir = p.to_path_buf();
-                tab.selected_file = None;
+                tab.selected_files.clear();
             }
         }
         ui.label(RichText::new(tab.files_dir.display().to_string()).font(theme::mono(11.5)).color(FG_SECONDARY));
@@ -1325,25 +1332,38 @@ fn files_pane(ui: &mut egui::Ui, tab: &mut TermTab, session: &TermSession, local
         .map(|rd| rd.filter_map(|e| e.ok()).take(MAX_FILES).map(|e| (e.path(), e.file_type().map(|t| t.is_dir()).unwrap_or(false))).collect())
         .unwrap_or_default();
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.file_name().map(|n| n.to_ascii_lowercase()).cmp(&b.0.file_name().map(|n| n.to_ascii_lowercase()))));
-    let list_h = (ui.available_height() - 40.0).max(80.0);
+    // Forget chosen items that are no longer in this folder (deleted or renamed outside the app).
+    tab.selected_files.retain(|p| entries.iter().any(|(e, _)| e == p));
+    let list_h = (ui.available_height() - 64.0).max(80.0);
     egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
         if entries.is_empty() {
             ui.label(RichText::new("Folder kosong.").color(FG_SECONDARY));
         }
         for (path, is_dir) in &entries {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let selected = tab.selected_file.as_ref() == Some(path);
+            let selected = tab.selected_files.contains(path);
             let icon = if *is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
-            if ui.selectable_label(selected, format!("{icon} {name}")).clicked() {
-                if *is_dir {
-                    tab.files_dir = path.clone();
-                    tab.selected_file = None;
+            let r = ui.selectable_label(selected, format!("{icon} {name}"));
+            let r = if *is_dir { r.on_hover_text("Klik dua kali untuk membuka folder") } else { r };
+            // Same as the server explorer: one click chooses, a double click opens a folder.
+            if r.double_clicked() && *is_dir {
+                tab.files_dir = path.clone();
+                tab.selected_files.clear();
+                break;
+            } else if r.clicked() {
+                if ui.input(|i| i.modifiers.command) {
+                    if !tab.selected_files.remove(path) {
+                        tab.selected_files.insert(path.clone());
+                    }
                 } else {
-                    tab.selected_file = Some(path.clone());
+                    tab.selected_files = [path.clone()].into();
                 }
             }
         }
     });
+    let chosen: Vec<String> = entries.iter().filter(|(p, _)| tab.selected_files.contains(p)).filter_map(|(p, _)| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+    let dirs = entries.iter().filter(|(p, d)| *d && tab.selected_files.contains(p)).count();
+    ui.label(RichText::new(super::explorer::selection_summary(dirs, chosen.len() - dirs)).color(FG_SECONDARY).small());
     ui.horizontal(|ui| {
         let can_cd = matches!(tab.kind, TabKind::Local(ShellKind::PowerShell | ShellKind::Cmd)) && session.status() == SessionStatus::Running;
         if ui.add_enabled(can_cd, egui::Button::new("Buka di terminal")).on_disabled_hover_text("Tersedia untuk PowerShell dan CMD yang sedang berjalan").clicked() {
@@ -1360,6 +1380,19 @@ fn files_pane(ui: &mut egui::Ui, tab: &mut TermTab, session: &TermSession, local
         if ui.button("Folder Windows").clicked() {
             super::reveal_in_explorer(&tab.files_dir.display().to_string());
         }
+        let hint = if servers.is_empty() { "Simpan server dulu di layar Server" } else { "Pilih berkas atau folder dulu (klik sekali; Ctrl+klik untuk beberapa)" };
+        ui.add_enabled_ui(!chosen.is_empty() && !servers.is_empty(), |ui| {
+            ui.menu_button("Unggah ke server\u{2026}", |ui| {
+                for (id, name) in servers {
+                    if ui.button(name).clicked() {
+                        out.upload = Some((id.clone(), tab.files_dir.clone(), chosen.clone()));
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_disabled_hover_text(hint);
+        });
     });
 }
 
