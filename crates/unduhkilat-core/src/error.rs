@@ -55,6 +55,8 @@ pub enum ErrorCode {
     ErrPreviewTooLarge,
     /// The file type or content cannot be previewed.
     ErrPreviewUnsupported,
+    /// Unduhan browser ini termasuk jenis berkas yang dikecualikan pengguna; browser yang mengunduh.
+    ErrCaptureSkipped,
 }
 
 impl ErrorCode {
@@ -99,6 +101,7 @@ impl ErrorCode {
             ErrRemoteFs => "ERR_REMOTE_FS",
             ErrPreviewTooLarge => "ERR_PREVIEW_TOO_LARGE",
             ErrPreviewUnsupported => "ERR_PREVIEW_UNSUPPORTED",
+            ErrCaptureSkipped => "ERR_CAPTURE_SKIPPED",
         }
     }
 }

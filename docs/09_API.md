@@ -243,6 +243,7 @@ The following error codes are authoritative across all UI error handling, logs, 
 | `ERR_NOT_FOUND` | State Store | Requested entity UUIDv4 does not exist in SQLite tables. | DATABASE.md |
 | `ERR_ALREADY_EXISTS` | State Store | Unique constraint violation on category name or credential host, port, username, and protocol identity. | DATABASE.md |
 | `ERR_INTERNAL` | Runtime | Unhandled Tokio async task panic or low-level SQLite driver fault. | FR-058 |
+| `ERR_CAPTURE_SKIPPED` | Browser IPC | `browser.intercept` refused because the file type is in the user's `browser_skip_extensions` list; the extension leaves the download to the browser. `ping` returns the same list as `skip_extensions`. | DEC-014 |
 
 ## 3. API Endpoints / Endpoint API
 

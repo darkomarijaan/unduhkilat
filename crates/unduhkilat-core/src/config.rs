@@ -51,6 +51,8 @@ pub mod keys {
     /// FR-040. Default OFF: reading the clipboard is opt-in.
     pub const CLIPBOARD_MONITOR: &str = "clipboard_monitor_enabled";
     pub const UPDATE_CHECK: &str = "update_check_enabled";
+    /// Ekstensi yang dibiarkan diunduh browser, mis. `pdf, jpg` (lihat `capture_filter`). Bawaan kosong.
+    pub const BROWSER_SKIP_EXTENSIONS: &str = "browser_skip_extensions";
     pub const TERMINAL_SHELL: &str = "terminal_shell";
     pub const TERMINAL_START_DIR: &str = "terminal_start_dir";
     pub const TERMINAL_FONT_SIZE: &str = "terminal_font_size";

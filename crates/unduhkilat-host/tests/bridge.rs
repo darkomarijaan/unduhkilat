@@ -298,3 +298,29 @@ async fn a_second_bridge_on_the_same_pipe_is_refused() {
     let err = Bridge::start(&tokio::runtime::Handle::current(), rig.manager.clone(), &rig.paths, tx, Arc::new(|| {})).err().expect("second bridge must fail");
     assert_eq!(err.code, ErrorCode::ErrStorageInitFailed);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn excluded_file_types_stay_in_the_browser() {
+    let rig = Rig::new().await;
+    rig.manager
+        .db()
+        .write(|c| unduhkilat_core::repo::set_setting(c, unduhkilat_core::config::keys::BROWSER_SKIP_EXTENSIONS, "pdf, jpg"))
+        .await
+        .unwrap();
+    let mut h = rig.spawn_host(&allowed_origin());
+
+    // The extension learns the list from ping so it can skip without asking the app.
+    let Response::Ok { data, .. } = h.call("p1", "ping", json!({})).await else { panic!() };
+    assert_eq!(data["skip_extensions"], json!(["pdf", "jpg"]));
+
+    // Link without an extension, recognised by MIME (the Tokopedia invoice case).
+    let r = h.call("x1", "browser.intercept", json!({ "url": "https://www.tokopedia.com/digital/invoice?id=1", "mime_type": "application/pdf" })).await;
+    assert_eq!(err_code(&r), ErrorCode::ErrCaptureSkipped);
+    let r = h.call("x2", "browser.intercept", json!({ "url": "https://a.test/get", "file_name": "Foto.JPG" })).await;
+    assert_eq!(err_code(&r), ErrorCode::ErrCaptureSkipped);
+    assert!(rig.proposals.try_recv().is_err(), "skipped downloads never reach the UI");
+
+    // Other types are still captured, and an explicit "send to app" ignores the list.
+    assert!(matches!(h.call("x3", "browser.intercept", json!({ "url": "https://a.test/setup.exe" })).await, Response::Ok { .. }));
+    assert!(matches!(h.call("x4", "media.send_to_app", json!({ "url": "https://a.test/a.pdf", "mime_type": "application/pdf" })).await, Response::Ok { .. }));
+}

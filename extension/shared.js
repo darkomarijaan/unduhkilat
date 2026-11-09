@@ -131,7 +131,54 @@
     return Math.abs((nowMs == null ? Date.now() : nowMs) - t) <= FRESH_WINDOW_MS;
   }
 
-  const api = { RANGE_PARAMS, FRESH_WINDOW_MS, isFreshDownload, isHttp, normalizeUrl, classify, isMediaResponse, isTinyMedia, headerMap, sizeFromHeaders, cookieHeader, baseName, fileNameFromUrl, mergeCandidate };
+  // ---- jenis berkas yang dibiarkan diunduh browser ----------------------------------------
+  // Kembar dengan crates/unduhkilat-core/src/capture_filter.rs; ubah keduanya bersamaan.
+  const SKIP_MIME_EXTS = {
+    'application/pdf': ['pdf'], 'application/x-pdf': ['pdf'],
+    'application/zip': ['zip'], 'application/x-zip-compressed': ['zip'],
+    'application/vnd.rar': ['rar'], 'application/x-rar-compressed': ['rar'],
+    'application/x-7z-compressed': ['7z'], 'application/gzip': ['gz'], 'application/x-gzip': ['gz'], 'application/x-tar': ['tar'],
+    'application/x-msdownload': ['exe'], 'application/x-msdos-program': ['exe'], 'application/vnd.microsoft.portable-executable': ['exe'],
+    'application/x-msi': ['msi'], 'application/x-ms-installer': ['msi'], 'application/x-iso9660-image': ['iso'],
+    'application/vnd.android.package-archive': ['apk'], 'application/x-bittorrent': ['torrent'], 'application/epub+zip': ['epub'],
+    'application/msword': ['doc'], 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['docx'],
+    'application/vnd.ms-excel': ['xls'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['xlsx'],
+    'application/vnd.ms-powerpoint': ['ppt'], 'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['pptx'],
+    'text/csv': ['csv'], 'text/plain': ['txt'],
+    'image/jpeg': ['jpg', 'jpeg'], 'image/png': ['png'], 'image/gif': ['gif'], 'image/webp': ['webp'], 'image/svg+xml': ['svg'],
+    'video/mp4': ['mp4'], 'video/webm': ['webm'], 'video/x-matroska': ['mkv'], 'audio/mpeg': ['mp3'],
+  };
+
+  /** "PDF, *.jpg; .zip" -> ['pdf','jpg','zip']. Accepts an array too (as sent by the app). */
+  function parseSkipList(v) {
+    const parts = Array.isArray(v) ? v : String(v || '').split(/[,;\s]+/);
+    const out = [];
+    for (const raw of parts) {
+      const e = String(raw).trim().replace(/^\*/, '').replace(/^\./, '').toLowerCase();
+      if (e && /^[a-z0-9]+$/.test(e) && !out.includes(e)) out.push(e);
+    }
+    return out;
+  }
+
+  function extOf(name) {
+    const base = String(name || '').split(/[\\/]/).pop();
+    const m = base.match(/^(.+)\.([A-Za-z0-9]{1,10})$/);
+    return m ? m[2].toLowerCase() : null;
+  }
+
+  /** True if this browser download is a type the user wants the browser to keep. */
+  function shouldSkipCapture(list, fileName, url, mime) {
+    if (!list || !list.length) return false;
+    const exts = [];
+    const fe = extOf(fileName);
+    if (fe) exts.push(fe);
+    try { const ue = extOf(new URL(url).pathname); if (ue) exts.push(ue); } catch (e) { /* no URL ext */ }
+    const m = String(mime || '').split(';')[0].trim().toLowerCase();
+    for (const e of SKIP_MIME_EXTS[m] || []) exts.push(e);
+    return exts.some((e) => list.includes(e));
+  }
+
+  const api = { parseSkipList, shouldSkipCapture, RANGE_PARAMS, FRESH_WINDOW_MS, isFreshDownload, isHttp, normalizeUrl, classify, isMediaResponse, isTinyMedia, headerMap, sizeFromHeaders, cookieHeader, baseName, fileNameFromUrl, mergeCandidate };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.UK = api;
 })(typeof self !== 'undefined' ? self : globalThis);

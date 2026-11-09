@@ -21,17 +21,26 @@ let connected = false;
 const tabCandidates = new Map();
 // download id -> { requestId, fileName, state, downloaded, total }
 let tracked = new Map();
-let settings = { enabled: true };
+let settings = { enabled: true, skip: [] };
 
 // ---- storage (the worker is torn down after ~30 s idle; keep what matters) -------------
 
 async function loadState() {
   try {
-    const s = await chrome.storage.local.get({ enabled: true });
+    const s = await chrome.storage.local.get({ enabled: true, skip: [] });
     settings.enabled = s.enabled !== false;
+    settings.skip = UK.parseSkipList(s.skip);
     const t = await chrome.storage.session.get({ tracked: [] });
     tracked = new Map(t.tracked);
   } catch (e) { /* storage unavailable: run with defaults */ }
+}
+
+// The app sends its "jenis berkas yang tidak ditangkap" list with every ping; cache it so
+// excluded downloads are left alone even while the app is closed (and never start it).
+function applyPing(data) {
+  if (!data || !Array.isArray(data.skip_extensions)) return;
+  settings.skip = UK.parseSkipList(data.skip_extensions);
+  try { chrome.storage.local.set({ skip: settings.skip }); } catch (e) { /* ignore */ }
 }
 
 function saveTracked() {
@@ -171,6 +180,7 @@ async function onDownloadCreated(item) {
   if (!UK.isFreshDownload(item)) return; // history replayed at browser startup: leave it alone
   const url = item.finalUrl || item.url;
   if (!UK.isHttp(url)) return; // blob:, data:, file: cannot be handed over
+  if (UK.shouldSkipCapture(settings.skip, UK.baseName(item.filename), url, item.mime)) return; // user wants the browser to keep this type
 
   let accepted = false;
   try {
@@ -277,13 +287,13 @@ chrome.tabs.onUpdated.addListener((id, info) => {
 chrome.alarms.create('unduhkilat-heartbeat', { periodInMinutes: 0.4 });
 chrome.alarms.onAlarm.addListener(async (a) => {
   if (a.name !== 'unduhkilat-heartbeat') return;
-  try { await call('ping', {}, 5000); setConnected(true); await requery(); } catch (e) { setConnected(false); }
+  try { applyPing(await call('ping', {}, 5000)); setConnected(true); await requery(); } catch (e) { setConnected(false); }
 });
 
 async function boot() {
   await loadState();
   updateBadge();
-  call('ping', {}, 5000).then(() => { setConnected(true); requery(); }).catch(() => setConnected(false));
+  call('ping', {}, 5000).then((d) => { applyPing(d); setConnected(true); requery(); }).catch(() => setConnected(false));
 }
 chrome.runtime.onStartup.addListener(boot);
 chrome.runtime.onInstalled.addListener(boot);

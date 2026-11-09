@@ -8,7 +8,7 @@ const vm = require('node:vm');
 const EXT = path.join(__dirname, '..');
 const tick = () => new Promise((r) => setImmediate(r));
 
-function makeEnv(hostBehavior, { enabled = true } = {}) {
+function makeEnv(hostBehavior, { enabled = true, skip = [] } = {}) {
   const L = {};
   const posted = [];
   const cancelled = [];
@@ -31,7 +31,7 @@ function makeEnv(hostBehavior, { enabled = true } = {}) {
     },
     action: { setBadgeBackgroundColor() {}, setBadgeText() {}, setTitle() {} },
     storage: {
-      local: { get: async (d) => ({ ...d, enabled }), set: async () => {} },
+      local: { get: async (d) => ({ ...d, enabled, skip }), set: async () => {} },
       session: { get: async (d) => d, set: async () => {} },
     },
     cookies: { getAll: async () => [{ name: 'sid', value: 'abc' }, { name: 'k', value: 'v' }] },
@@ -205,4 +205,27 @@ test('tiny media (UI sounds) is not offered as a candidate', async () => {
   e.L.headers({ tabId: 9, url: 'https://www.youtube.com/s/sound/click.mp3', type: 'media', statusCode: 200, responseHeaders: [{ name: 'content-type', value: 'audio/mpeg' }, { name: 'content-length', value: '6800' }] });
   const r = await e.ask({ type: 'get-candidates' }, 9);
   assert.equal(r.list.length, 0);
+});
+
+const skipPdfHost = (m, reply) => {
+  if (m.command === 'ping') return reply({ status: 'ok', id: m.id, data: { pong: true, skip_extensions: ['pdf'] } });
+  return okHost(m, reply);
+};
+
+test('types excluded by the app (sent with ping) stay in the browser; others are still captured', async () => {
+  const e = makeEnv(skipPdfHost);
+  await tick(); await tick();
+  await e.L.dl(item({ id: 7, url: 'https://www.tokopedia.com/digital/invoice?id=1', finalUrl: '', filename: '', mime: 'application/pdf' }));
+  assert.equal(e.posted.filter((m) => m.command === 'browser.intercept').length, 0);
+  assert.deepEqual(e.cancelled, []);
+  await e.L.dl(item());
+  assert.equal(e.posted.filter((m) => m.command === 'browser.intercept').length, 1);
+  assert.deepEqual(e.cancelled, [42]);
+});
+
+test('cached exclusion list applies while the app is down (no host call, app not started)', async () => {
+  const e = makeEnv(downHost, { skip: ['pdf'] });
+  await tick(); await tick();
+  await e.L.dl(item({ url: 'https://a.test/doc.pdf', finalUrl: '', filename: '', mime: '' }));
+  assert.equal(e.posted.filter((m) => m.command === 'browser.intercept').length, 0);
 });

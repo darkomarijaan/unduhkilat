@@ -85,3 +85,26 @@ test('isFreshDownload accepts only downloads that just started', () => {
   assert.ok(!UK.isFreshDownload({ state: 'in_progress', startTime: at(-10 * 60 * 1000) }, now), 'old item resumed at startup');
   assert.ok(!UK.isFreshDownload({ state: 'in_progress', startTime: at(10 * 60 * 1000) }, now));
 });
+
+test('parseSkipList accepts common spellings and the app array', () => {
+  assert.deepEqual(UK.parseSkipList(' PDF, *.jpg; .zip  mp4,,pdf '), ['pdf', 'jpg', 'zip', 'mp4']);
+  assert.deepEqual(UK.parseSkipList(['pdf', 'JPG']), ['pdf', 'jpg']);
+  assert.deepEqual(UK.parseSkipList(''), []);
+  assert.deepEqual(UK.parseSkipList(undefined), []);
+});
+
+test('shouldSkipCapture matches by file name, URL path, or MIME', () => {
+  const l = ['pdf'];
+  assert.ok(UK.shouldSkipCapture(l, 'Laporan.PDF', 'https://a.test/x', ''));
+  assert.ok(UK.shouldSkipCapture(l, '', 'https://a.test/files/report.pdf?dl=1', ''));
+  assert.ok(UK.shouldSkipCapture(l, '', 'https://www.tokopedia.com/digital/invoice?id=3240614950', 'application/pdf'));
+  assert.ok(UK.shouldSkipCapture(l, 'C:\\Users\\a\\Downloads\\x.pdf', 'https://a.test/get', ''));
+  assert.ok(UK.shouldSkipCapture(['jpg'], '', 'https://a.test/img', 'image/jpeg'));
+});
+
+test('shouldSkipCapture keeps capturing other types and with an empty list', () => {
+  assert.ok(!UK.shouldSkipCapture(['pdf'], 'setup.exe', 'https://a.test/setup.exe', 'application/x-msdownload'));
+  assert.ok(!UK.shouldSkipCapture([], 'a.pdf', 'https://a.test/a.pdf', 'application/pdf'));
+  assert.ok(!UK.shouldSkipCapture(['pdf'], '', 'https://a.test/pdf', ''));
+  assert.ok(!UK.shouldSkipCapture(['pdf'], '.pdf', 'https://a.test/x', ''));
+});

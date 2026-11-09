@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod autostart;
 pub mod bridge;
+pub mod capture_filter;
 pub mod category;
 pub mod clipboard;
 pub mod config;

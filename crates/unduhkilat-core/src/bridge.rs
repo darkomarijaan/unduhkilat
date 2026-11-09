@@ -254,14 +254,24 @@ fn trimmed(d: &Download) -> Value {
     })
 }
 
+fn skip_list(inner: &Inner) -> Vec<String> {
+    let text = inner.manager.db().read(|c| crate::repo::get_setting(c, crate::config::keys::BROWSER_SKIP_EXTENSIONS)).ok().flatten().unwrap_or_default();
+    crate::capture_filter::parse_list(&text)
+}
+
 async fn dispatch(inner: &Arc<Inner>, req: Request) -> Result<Value> {
     match req.command.as_str() {
-        "ping" => Ok(json!({ "pong": true })),
+        // The extension caches `skip_extensions` so excluded types never reach (or start) the app.
+        "ping" => Ok(json!({ "pong": true, "skip_extensions": skip_list(inner) })),
         "browser.intercept" | "media.send_to_app" => {
             let p: ProposalPayload = serde_json::from_value(req.payload).map_err(|e| AppError::new(ErrorCode::ErrPayloadCorrupt, e.to_string()))?;
             let scheme = url::Url::parse(&p.url).map(|u| u.scheme().to_string()).map_err(|_| AppError::new(ErrorCode::ErrInvalidUrlScheme, format!("not a valid URL: {}", p.url)))?;
             if !matches!(scheme.as_str(), "http" | "https" | "ftp") {
                 return Err(AppError::new(ErrorCode::ErrInvalidUrlScheme, format!("{scheme} is not supported")));
+            }
+            // Only automatic capture honours the list; "send to app" from the media panel is explicit.
+            if req.command == "browser.intercept" && crate::capture_filter::should_skip(&skip_list(inner), p.file_name.as_deref(), &p.url, p.mime_type.as_deref()) {
+                return Err(AppError::new(ErrorCode::ErrCaptureSkipped, "jenis berkas ini dibiarkan diunduh browser"));
             }
             if inner.pending.load(Ordering::SeqCst) >= MAX_PENDING {
                 return Err(AppError::internal("too many proposals are waiting for confirmation"));

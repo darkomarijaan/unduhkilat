@@ -146,6 +146,8 @@ struct SettingsState {
     cred_pass: String,
     browser: Vec<(native::Browser, native::Status)>,
     browser_note: Option<String>,
+    /// Ekstensi yang dibiarkan diunduh browser (capture_filter), teks bebas `pdf, jpg`.
+    skip_exts: String,
     tab: SettingsTab,
     concurrency: u32,
     server_concurrency: u32,
@@ -279,6 +281,12 @@ impl App {
         // Test aid: open straight on a screen (settings, search, grabber, diagnostics, add).
         match std::env::var("UNDUHKILAT_START_SCREEN").ok().as_deref() {
             Some("settings") => app.open_settings_screen(),
+            Some("settings-browser") => {
+                app.open_settings_screen();
+                if let Some(s) = app.settings.as_mut() {
+                    s.tab = SettingsTab::Browser;
+                }
+            }
             Some("search") => app.screen = Screen::Search,
             Some("servers") => app.screen = Screen::Servers,
             Some("terminal-max") => {
@@ -1203,6 +1211,7 @@ impl App {
             cred_pass: String::new(),
             browser: browser_status(&self.paths),
             browser_note: None,
+            skip_exts: get(keys::BROWSER_SKIP_EXTENSIONS).unwrap_or_default(),
             tab: SettingsTab::Engine,
             concurrency: get(keys::CONCURRENCY_LIMIT).and_then(|v| v.parse().ok()).unwrap_or(cfg.default_concurrency as u32),
             server_concurrency: get(keys::SERVER_CONCURRENCY_LIMIT).and_then(|v| v.parse().ok()).unwrap_or(unduhkilat_core::server::pool::PER_SERVER as u32),
@@ -1901,6 +1910,10 @@ impl App {
                             }
                         }
                         if let Some(n) = &s.browser_note { ui.label(RichText::new(n).color(FG_SECONDARY)); }
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("Jenis berkas yang tidak ditangkap").font(theme::bold(14.0)));
+                        ui.label(RichText::new("Unduhan browser dengan ekstensi ini tetap diunduh oleh browser, tidak lewat UnduhKilat. Pisahkan dengan koma, mis. pdf, jpg, png. Dikenali dari nama berkas, alamat, atau tipe MIME. Kosongkan untuk menangkap semua.").color(FG_SECONDARY));
+                        ui.add(egui::TextEdit::singleline(&mut s.skip_exts).desired_width(420.0).font(theme::mono(12.0)).hint_text("pdf, jpg, png"));
                         ui.add_space(8.0);
                         let ext_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("extension"))).map(|p| p.display().to_string()).unwrap_or_default();
                         ui.label(RichText::new("Pasang ekstensi: buka chrome://extensions (atau edge://extensions, brave://extensions), aktifkan Mode pengembang, lalu Muat yang belum dipaketkan dan pilih folder:").color(FG_SECONDARY));
@@ -1987,6 +2000,8 @@ impl App {
             self.clip_enabled.store(s.clip, Ordering::Relaxed);
             let clip = s.clip;
             let upd = s.upd;
+            s.skip_exts = unduhkilat_core::capture_filter::normalize(&s.skip_exts);
+            let skip_exts = s.skip_exts.clone();
             // The registry is the source of truth, so write it only when the box actually changed.
             if s.autostart != unduhkilat_core::autostart::is_enabled() {
                 let r = std::env::current_exe().map_err(|e| unduhkilat_core::AppError::internal(e.to_string())).and_then(|exe| unduhkilat_core::autostart::set_enabled(s.autostart, &exe));
@@ -2008,6 +2023,7 @@ impl App {
                     repo::set_setting(conn, keys::CLOSE_TO_TRAY, if tray { "1" } else { "0" })?;
                     repo::set_setting(conn, keys::CLIPBOARD_MONITOR, if clip { "1" } else { "0" })?;
                     repo::set_setting(conn, keys::UPDATE_CHECK, if upd { "1" } else { "0" })?;
+                    repo::set_setting(conn, keys::BROWSER_SKIP_EXTENSIONS, &skip_exts)?;
                     repo::set_setting(conn, keys::TORRENT_SEEDING, if t_seed { "1" } else { "0" })?;
                     repo::set_setting(conn, keys::TORRENT_SEED_RATIO, &t_ratio.to_string())?;
                     repo::set_setting(conn, keys::TORRENT_DHT, if t_dht { "1" } else { "0" })?;
