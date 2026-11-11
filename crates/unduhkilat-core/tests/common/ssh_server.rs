@@ -384,6 +384,33 @@ fn shell_words(cmd: &str) -> Vec<String> {
 
 /// Runs `tar -C <dir> -cf - .`, `tar -C <dir> -xf -` and `command -v tar` against the SFTP root.
 async fn fake_exec(mut ch: Channel<Msg>, root: std::path::PathBuf, cmd: String) {
+    // The server-stats script (`server::stats::SCRIPT`): answer like a small Linux box.
+    if cmd.contains("echo @stat;") {
+        let out = "@stat
+cpu  100 0 50 800 50 0 0 0
+@mem
+MemTotal: 2000000 kB
+MemAvailable: 500000 kB
+@load
+0.1 0.1 0.1 1/99 7
+@up
+7200.5 1.0
+@user
+eko
+@who
+eko
+@df
+41%
+@tcp
+00000000:0016 0A
+0100007F:0016 01
+";
+        let _ = ch.data_bytes(out.as_bytes().to_vec()).await;
+        let _ = ch.exit_status(0).await;
+        let _ = ch.eof().await;
+        let _ = ch.close().await;
+        return;
+    }
     let words = shell_words(&cmd);
     let local = |dir: &str| root.join(dir.trim_start_matches('/'));
     let w: Vec<&str> = words.iter().map(String::as_str).collect();

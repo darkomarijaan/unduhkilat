@@ -46,7 +46,7 @@ pub enum ServersMsg {
     Deleted(Result<(), String>),
     TestDone { result: Result<TestReport, unduhkilat_core::AppError> },
     Forgotten(Result<(), String>),
-    ShellReady { tab_id: u64, result: unduhkilat_core::Result<(unduhkilat_core::term::source::SourceIo, Vec<String>)> },
+    ShellReady { tab_id: u64, result: unduhkilat_core::Result<unduhkilat_core::server::service::OpenedTerminal> },
     HostKey { host: String, port: u16, key_type: String, fingerprint: String, reply: oneshot::Sender<bool> },
     Secret { server_name: String, kind: SecretKind, reply: oneshot::Sender<Option<String>> },
 }

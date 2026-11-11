@@ -146,3 +146,40 @@ async fn non_shell_server_gives_a_clear_error() {
     assert!(e.message.contains("shell"), "the message is in Indonesian and says what failed: {}", e.message);
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_stats_are_read_over_the_shell_connection() {
+    use unduhkilat_core::server::shell::open_shell_with_stats;
+    use unduhkilat_core::server::stats::StatsState;
+    let root = std::env::temp_dir().join(format!("uk-stats-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let ssh = TestSsh::start_with_sftp(shell_server(true), root.clone()).await;
+    ssh.enable_tar();
+    let (sess, dir) = session(&ssh).await;
+    let (io, stats) = open_shell_with_stats(sess, 80, 24, true).await.unwrap();
+    let mut rx = stats.expect("asked for stats");
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| matches!(s, StatsState::Ready(_)))).await.expect("stats arrive").unwrap().clone();
+    let StatsState::Ready(s) = got else { unreachable!() };
+    assert_eq!((s.mem_total_kb, s.mem_used_kb, s.procs_total, s.user.as_str(), s.disk_root_pct), (2_000_000, 1_500_000, 99, "eko", Some(41)));
+    assert_eq!(s.conns, vec![(22, 1)]);
+    io.control.close();
+    eventually("the shell channel closed", || ssh.open_shells() == 0).await;
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_without_exec_hides_the_stats() {
+    use unduhkilat_core::server::shell::open_shell_with_stats;
+    use unduhkilat_core::server::stats::StatsState;
+    let ssh = TestSsh::start(shell_server(true)).await;
+    let (sess, dir) = session(&ssh).await;
+    let (io, stats) = open_shell_with_stats(sess, 80, 24, true).await.unwrap();
+    let mut rx = stats.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| *s == StatsState::Unsupported)).await.expect("gives up").unwrap();
+    io.control.write(b"halo\n").unwrap();
+    let mut io = io;
+    assert_eq!(read_until(&mut io, "halo").await, None, "the shell still works");
+    io.control.close();
+    std::fs::remove_dir_all(dir).ok();
+}

@@ -12,6 +12,13 @@ use crate::server::store;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// A shell opened by [`ServerService::open_terminal`].
+pub struct OpenedTerminal {
+    pub io: crate::term::source::SourceIo,
+    pub hops: Vec<String>,
+    pub stats: Option<tokio::sync::watch::Receiver<crate::server::stats::StatsState>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestReport {
     pub rtt_ms: u64,
@@ -83,14 +90,15 @@ impl ServerService {
     }
 
     /// Connect through the whole chain and open an interactive shell on the target. Returns the
-    /// shell's I/O and the names of every server traversed (ending with the target).
-    pub async fn open_terminal(&self, id: &str, interact: Arc<dyn Interact>, cancel: CancellationToken, cols: u16, rows: u16) -> Result<(crate::term::source::SourceIo, Vec<String>)> {
+    /// shell's I/O, the names of every server traversed (ending with the target), and, with `stats`,
+    /// the server's system info read over the same connection.
+    pub async fn open_terminal(&self, id: &str, interact: Arc<dyn Interact>, cancel: CancellationToken, cols: u16, rows: u16, stats: bool) -> Result<OpenedTerminal> {
         let opts = ConnectOptions { proxy: (self.proxy)(), ..Default::default() };
         let session = connect(&self.db, id, interact, opts, cancel).await?;
         let target_id = session.target.id.clone();
         let hop_names = self.db.read(|c| store::chain_for(c, &target_id))?.into_iter().map(|s| s.name).collect();
-        let io = crate::server::shell::open_shell(session, cols, rows).await?;
-        Ok((io, hop_names))
+        let (io, stats) = crate::server::shell::open_shell_with_stats(session, cols, rows, stats).await?;
+        Ok(OpenedTerminal { io, hops: hop_names, stats })
     }
 
     /// Connect through the whole chain, report, and disconnect. Nothing else is done on the server.

@@ -545,6 +545,8 @@ use std::time::Instant;
 use unduhkilat_core::config::keys;
 use unduhkilat_core::repo;
 use unduhkilat_core::term::local::{detect_shells, spawn_local, ShellKind, ShellOptions};
+use unduhkilat_core::server::service::OpenedTerminal;
+use unduhkilat_core::server::stats::{ServerStats, StatsState};
 use unduhkilat_core::term::session::SessionStatus;
 
 // ---- pure helpers (unit tested) ---------------------------------------------------------------
@@ -665,6 +667,8 @@ pub struct TermSettings {
     pub layout: TerminalLayout,
     /// Largest file the server preview fetches whole, in MB.
     pub preview_max_mb: u32,
+    /// Info bar (CPU, RAM, connections, ...) under SSH terminals.
+    pub server_stats: bool,
 }
 
 impl TermSettings {
@@ -677,6 +681,7 @@ impl TermSettings {
             ctrl_v_pastes: get(keys::TERMINAL_CTRL_V_PASTES).map(|v| v != "0").unwrap_or(true),
             layout: TerminalLayout::from_setting(get(keys::TERMINAL_LAYOUT).as_deref()),
             preview_max_mb: preview_mb_from_setting(get(keys::PREVIEW_MAX_MB).as_deref()),
+            server_stats: get(keys::TERMINAL_SERVER_STATS).map(|v| v != "0").unwrap_or(true),
         }
     }
 }
@@ -688,6 +693,7 @@ impl TermSettings {
         set(keys::TERMINAL_FONT_SIZE, &self.font_size.to_string())?;
         set(keys::TERMINAL_CTRL_V_PASTES, if self.ctrl_v_pastes { "1" } else { "0" })?;
         set(keys::PREVIEW_MAX_MB, &self.preview_max_mb.to_string())?;
+        set(keys::TERMINAL_SERVER_STATS, if self.server_stats { "1" } else { "0" })?;
         set(keys::TERMINAL_LAYOUT, self.layout.as_setting())
     }
 }
@@ -720,6 +726,9 @@ pub fn settings_ui(ui: &mut egui::Ui, s: &mut TermSettings) {
     ui.label(RichText::new("Tata letak").font(theme::bold(13.0)));
     ui.radio_value(&mut s.layout, TerminalLayout::A, "A: Terminal dan Berkas bergantian");
     ui.radio_value(&mut s.layout, TerminalLayout::B, "B: Terminal dan Berkas berdampingan");
+    ui.add_space(8.0);
+    ui.checkbox(&mut s.server_stats, "Tampilkan info server di bawah terminal SSH");
+    ui.label(RichText::new("CPU, RAM, koneksi, proses, uptime, pengguna, dan isi disk /, dibaca tiap 3 detik lewat sambungan SSH yang sama. Hanya server Linux; berlaku untuk sambungan berikutnya.").color(FG_SECONDARY));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -755,6 +764,8 @@ pub struct TermTab {
     cancel: Option<tokio_util::sync::CancellationToken>,
     /// File explorer of an SSH or server tab; created the first time it is shown.
     pub explorer: Option<super::explorer::ExplorerState>,
+    /// System info of the server (SSH tabs with the info bar on).
+    stats: Option<tokio::sync::watch::Receiver<StatsState>>,
 }
 
 #[derive(Default)]
@@ -790,6 +801,7 @@ impl TermTab {
             selected_files: Default::default(),
             cancel: None,
             explorer: None,
+            stats: None,
         }
     }
 }
@@ -870,6 +882,7 @@ impl App {
                     selected_files: Default::default(),
                     cancel: None,
                     explorer: None,
+                    stats: None,
                 });
                 self.terminal.active = self.terminal.tabs.len() - 1;
                 self.screen = Screen::Terminal;
@@ -900,6 +913,7 @@ impl App {
             selected_files: Default::default(),
             cancel: None,
             explorer: None,
+            stats: None,
         });
         self.terminal.active = self.terminal.tabs.len() - 1;
         self.screen = Screen::Terminal;
@@ -915,23 +929,34 @@ impl App {
         tab.status = TabStatus::Connecting;
         tab.session = None;
         self.servers.shell_waiters.insert(tab_id);
+        let stats = self.term_settings().server_stats;
         let (svc, tx, ctx) = (self.manager.servers(), self.tx.clone(), self.ctx.clone());
         let interact = Arc::new(super::servers::UiInteract { tx: tx.clone(), ctx: ctx.clone() });
         self.rt.spawn(async move {
-            let result = svc.open_terminal(&server_id, interact, cancel, 100, 30).await;
+            let result = svc.open_terminal(&server_id, interact, cancel, 100, 30, stats).await;
             let _ = tx.send(super::Msg::Servers(super::servers::ServersMsg::ShellReady { tab_id, result }));
             ctx.request_repaint();
         });
     }
 
     /// The connection attempt of an SSH tab finished.
-    pub(super) fn terminal_ssh_ready(&mut self, tab_id: u64, result: unduhkilat_core::Result<(unduhkilat_core::term::source::SourceIo, Vec<String>)>) {
+    pub(super) fn terminal_ssh_ready(&mut self, tab_id: u64, result: unduhkilat_core::Result<OpenedTerminal>) {
         let Some(idx) = self.terminal.tabs.iter().position(|t| t.id == tab_id) else { return };
         match result {
-            Ok((io, _names)) => {
+            Ok(opened) => {
                 let ctx = self.ctx.clone();
-                let session = TermSession::start(io, 100, 30, SCROLLBACK, Arc::new(move || ctx.request_repaint()), &self.rt);
+                let session = TermSession::start(opened.io, 100, 30, SCROLLBACK, Arc::new(move || ctx.request_repaint()), &self.rt);
+                // New numbers arrive every few seconds even when the terminal is quiet: redraw for them.
+                if let Some(mut rx) = opened.stats.clone() {
+                    let ctx = self.ctx.clone();
+                    self.rt.spawn(async move {
+                        while rx.changed().await.is_ok() {
+                            ctx.request_repaint();
+                        }
+                    });
+                }
                 let tab = &mut self.terminal.tabs[idx];
+                tab.stats = opened.stats;
                 tab.session = Some(session);
                 tab.status = TabStatus::Running;
                 tab.view = TerminalView::default();
@@ -1276,8 +1301,19 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, serve
     let Some(session) = tab.session.clone() else { return };
     let (font, ctrl_v) = (settings.font_size, settings.ctrl_v_pastes);
     let show_terminal = |ui: &mut egui::Ui, tab: &mut TermTab, out: &mut TabOutcome| {
-        if let Some(text) = tab.view.show(ui, &session, font, ctrl_v) {
-            out.paste_confirm = Some(text);
+        let stats = match tab.stats.as_ref().map(|rx| rx.borrow().clone()) {
+            Some(StatsState::Ready(s)) if tab.status == TabStatus::Running => Some(s),
+            _ => None,
+        };
+        let avail = ui.available_size();
+        let bar_h = if stats.is_some() { STATS_BAR_H } else { 0.0 };
+        ui.allocate_ui_with_layout(Vec2::new(avail.x, (avail.y - bar_h).max(40.0)), Layout::top_down(Align::Min), |ui| {
+            if let Some(text) = tab.view.show(ui, &session, font, ctrl_v) {
+                out.paste_confirm = Some(text);
+            }
+        });
+        if let Some(s) = stats {
+            stats_bar(ui, &s);
         }
     };
     match settings.layout {
@@ -1306,6 +1342,53 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, serve
                     }
                 });
             });
+        }
+    }
+}
+
+const STATS_BAR_H: f32 = 24.0;
+
+/// Text of each part of the server info bar, its hover explanation, and whether it needs attention.
+pub fn stats_parts(s: &ServerStats) -> Vec<(String, &'static str, bool)> {
+    let gb = |kb: u64| format!("{:.2} GB", kb as f64 / 1024.0 / 1024.0);
+    let mut v = Vec::new();
+    let cpu = s.cpu_pct.map(|p| format!("CPU {p:.0}%")).unwrap_or_else(|| "CPU \u{2026}".into());
+    v.push((cpu, "Pemakaian CPU server selama beberapa detik terakhir", s.cpu_pct.map(|p| p >= 90.0).unwrap_or(false)));
+    let mem_hot = s.mem_total_kb > 0 && s.mem_used_kb * 100 / s.mem_total_kb >= 90;
+    v.push((format!("RAM {} / {}", gb(s.mem_used_kb), gb(s.mem_total_kb)), "Memori terpakai / total (cache yang bisa dilepas tidak dihitung)", mem_hot));
+    let conns = if s.conns.is_empty() {
+        "Koneksi: 0".to_string()
+    } else {
+        let parts: Vec<String> = s.conns.iter().take(3).map(|(p, n)| format!("{n} (port {p})")).collect();
+        let more = if s.conns.len() > 3 { ", \u{2026}" } else { "" };
+        format!("Koneksi: {}{more}", parts.join(", "))
+    };
+    v.push((conns, "Koneksi TCP tersambung ke port layanan yang didengarkan server", false));
+    v.push((format!("Proses {}/{}", s.procs_running, s.procs_total), "Proses yang sedang berjalan / seluruh proses dan thread", false));
+    v.push((format!("Uptime {}", unduhkilat_core::server::stats::format_uptime(s.uptime_secs)), "Lama server menyala sejak dinyalakan ulang", false));
+    if !s.user.is_empty() {
+        v.push((format!("{} (x{})", s.user, s.user_sessions.max(1)), "Pengguna Anda di server dan jumlah sesi login-nya", false));
+    }
+    if let Some(d) = s.disk_root_pct {
+        v.push((format!("Disk /: {d}%"), "Isi sistem berkas / (root)", d >= 90));
+    }
+    v
+}
+
+/// The strip under an SSH terminal, like MobaXterm's.
+fn stats_bar(ui: &mut egui::Ui, s: &ServerStats) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), STATS_BAR_H), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(0x22, 0x1F, 0x1B));
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(8.0, 0.0))).layout(Layout::left_to_right(Align::Center)));
+    child.set_clip_rect(rect);
+    child.spacing_mut().item_spacing.x = 6.0;
+    let parts = stats_parts(s);
+    let last = parts.len().saturating_sub(1);
+    for (i, (text, hint, hot)) in parts.into_iter().enumerate() {
+        let color = if hot { Color32::from_rgb(0xFF, 0x8A, 0x5B) } else { Color32::from_rgb(0xD8, 0xD2, 0xC9) };
+        child.add(egui::Label::new(RichText::new(text).font(theme::mono(11.0)).color(color)).extend()).on_hover_text(hint);
+        if i < last {
+            child.label(RichText::new("\u{2502}").font(theme::mono(11.0)).color(Color32::from_rgb(0x5B, 0x55, 0x4E)));
         }
     }
 }
@@ -1636,5 +1719,27 @@ mod tests {
         assert_eq!(preview_mb_from_setting(Some("0")), 1);
         assert_eq!(preview_mb_from_setting(Some("9999")), 500);
         assert_eq!(preview_mb_from_setting(Some(" 40 ")), 40);
+    }
+}
+
+#[cfg(test)]
+mod stats_bar_tests {
+    use super::stats_parts;
+    use unduhkilat_core::server::stats::ServerStats;
+
+    #[test]
+    fn reads_like_the_mobaxterm_bar() {
+        let s = ServerStats { cpu_pct: Some(6.2), mem_used_kb: 3_733_000, mem_total_kb: 7_800_000, conns: vec![(443, 4), (2477, 3)], procs_running: 2, procs_total: 1185, uptime_secs: 16 * 86_400, user: "ekohadi".into(), user_sessions: 3, disk_root_pct: Some(77) };
+        let text: Vec<String> = stats_parts(&s).into_iter().map(|p| p.0).collect();
+        assert_eq!(text, vec!["CPU 6%", "RAM 3.56 GB / 7.44 GB", "Koneksi: 4 (port 443), 3 (port 2477)", "Proses 2/1185", "Uptime 16 hari", "ekohadi (x3)", "Disk /: 77%"]);
+    }
+
+    #[test]
+    fn full_disk_and_memory_stand_out() {
+        let s = ServerStats { mem_used_kb: 95, mem_total_kb: 100, disk_root_pct: Some(93), ..Default::default() };
+        let parts = stats_parts(&s);
+        assert!(parts[1].2, "RAM at 95% is highlighted");
+        assert!(parts.last().unwrap().2, "disk at 93% is highlighted");
+        assert_eq!(parts[0].0, "CPU \u{2026}", "first reading has no CPU percentage yet");
     }
 }

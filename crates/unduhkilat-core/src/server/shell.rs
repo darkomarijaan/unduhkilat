@@ -6,7 +6,10 @@ use crate::term::source::{SourceControl, SourceEvent, SourceIo};
 use russh::ChannelMsg;
 use std::sync::Arc;
 use std::time::Duration;
+use crate::server::stats::StatsState;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 enum Ctl {
     Write(Vec<u8>),
@@ -64,6 +67,12 @@ async fn expect_reply(ch: &mut russh::Channel<russh::client::Msg>, what: &str) -
 /// Open a shell with a `xterm-256color` PTY of the given size. Takes the session: it stays open as long
 /// as the shell does and is closed with it.
 pub async fn open_shell(session: SshSession, cols: u16, rows: u16) -> Result<SourceIo> {
+    Ok(open_shell_with_stats(session, cols, rows, false).await?.0)
+}
+
+/// Like [`open_shell`]; with `stats`, also reads the server's system info over the same connection
+/// (see [`crate::server::stats`]) until the shell ends.
+pub async fn open_shell_with_stats(session: SshSession, cols: u16, rows: u16, stats: bool) -> Result<(SourceIo, Option<watch::Receiver<StatsState>>)> {
     let (cols, rows) = (cols.max(1), rows.max(1));
     let mut ch = session
         .handle()
@@ -75,6 +84,14 @@ pub async fn open_shell(session: SshSession, cols: u16, rows: u16) -> Result<Sou
     ch.request_shell(true).await.map_err(|_| gone())?;
     expect_reply(&mut ch, "permintaan shell").await?;
 
+    let session = Arc::new(session);
+    let stop = CancellationToken::new();
+    let (stats_rx, monitor) = if stats {
+        let (rx, task) = crate::server::stats::spawn_monitor(session.clone(), stop.clone());
+        (Some(rx), Some(task))
+    } else {
+        (None, None)
+    };
     let (tx, rx) = unbounded_channel();
     let (ctl_tx, mut ctl_rx) = unbounded_channel::<Ctl>();
     tokio::spawn(async move {
@@ -111,7 +128,13 @@ pub async fn open_shell(session: SshSession, cols: u16, rows: u16) -> Result<Sou
         ctl_rx.close();
         drop(ctl_rx);
         let _ = tx.send(SourceEvent::Closed(exit));
-        session.close().await;
+        stop.cancel();
+        if let Some(t) = monitor {
+            let _ = t.await;
+        }
+        if let Ok(session) = Arc::try_unwrap(session) {
+            session.close().await;
+        }
     });
-    Ok(SourceIo { rx, control: Arc::new(ShellControl { tx: ctl_tx }) })
+    Ok((SourceIo { rx, control: Arc::new(ShellControl { tx: ctl_tx }) }, stats_rx))
 }
