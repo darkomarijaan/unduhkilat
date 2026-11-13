@@ -82,6 +82,13 @@ pub fn install(ctx: &egui::Context) {
     }
     mono_names.extend(fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default());
     fonts.families.insert(FontFamily::Name("telemetry".into()), mono_names);
+    // Segoe UI Symbol as the last fallback: symbols such as ☆ ★ that Segoe UI lacks.
+    if let Some((n, d)) = load_system_font("segoe-symbol", &["seguisym.ttf"]) {
+        fonts.font_data.insert(n.clone(), d);
+        for fam in fonts.families.values_mut() {
+            fam.push(n.clone());
+        }
+    }
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.global_style()).clone();

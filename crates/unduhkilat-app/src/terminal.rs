@@ -547,6 +547,7 @@ use unduhkilat_core::repo;
 use unduhkilat_core::term::local::{detect_shells, spawn_local, ShellKind, ShellOptions};
 use unduhkilat_core::server::service::OpenedTerminal;
 use unduhkilat_core::server::stats::{ServerStats, StatsState};
+use unduhkilat_core::term::folders::{self, SavedFolder};
 use unduhkilat_core::term::session::SessionStatus;
 
 // ---- pure helpers (unit tested) ---------------------------------------------------------------
@@ -782,6 +783,10 @@ pub struct TerminalState {
     /// Terminal fills the window (no header, sidebar, or status bar).
     pub maximized: bool,
     settings: Option<TermSettings>,
+    /// Saved folders (loaded from the settings table the first time they are needed).
+    saved: Option<Vec<SavedFolder>>,
+    /// Working copy while the "Kelola folder" window is open.
+    manage_folders: Option<Vec<SavedFolder>>,
 }
 
 impl TermTab {
@@ -843,6 +848,154 @@ impl App {
         let db = self.manager.db();
         let get = |k: &str| db.read(|c| repo::get_setting(c, k)).ok().flatten();
         self.terminal.settings = Some(TermSettings::load(get));
+    }
+
+    fn saved_folders(&mut self) -> &Vec<SavedFolder> {
+        if self.terminal.saved.is_none() {
+            let db = self.manager.db();
+            let json = db.read(|c| repo::get_setting(c, keys::TERMINAL_SAVED_FOLDERS)).ok().flatten();
+            self.terminal.saved = Some(folders::parse(json.as_deref()));
+        }
+        self.terminal.saved.as_ref().expect("loaded above")
+    }
+
+    /// Replace the saved folders and store them.
+    fn set_saved_folders(&mut self, list: Vec<SavedFolder>) {
+        let json = folders::to_json(&list);
+        self.terminal.saved = Some(list);
+        let m = self.manager.clone();
+        self.run(async move { m.db().write(move |conn| repo::set_setting(conn, keys::TERMINAL_SAVED_FOLDERS, &json)).await });
+    }
+
+    /// Save the folder if it is not saved yet, otherwise remove it (the ☆/★ button of a tab).
+    fn toggle_saved_folder(&mut self, dir: &Path) {
+        let path = dir.display().to_string();
+        let mut list = self.saved_folders().clone();
+        let msg = if folders::remove(&mut list, &path) {
+            format!("{} dihapus dari folder tersimpan.", folders::default_name(&path))
+        } else if folders::add(&mut list, &path) {
+            format!("{} disimpan. Buka lagi lewat + Baru.", folders::default_name(&path))
+        } else {
+            format!("Folder tersimpan sudah penuh ({} folder).", folders::MAX_SAVED)
+        };
+        self.set_saved_folders(list);
+        self.notice = Some((msg, Instant::now()));
+    }
+
+    /// "Kelola folder…": rename, reorder, pick a shell, change, remove, add. Edits a copy; Selesai stores it.
+    fn saved_folders_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut list) = self.terminal.manage_folders.take() else { return };
+        let shells = detect_shells();
+        let mut done: Option<bool> = None;
+        dialog_window("Folder tersimpan", 720.0).frame(dialog_frame(ctx)).show(ctx, |ui| {
+            ui.label(RichText::new("Folder tersimpan").font(theme::bold(16.0)));
+            ui.label(RichText::new("Muncul di + Baru. Sekali klik membuka terminal langsung di folder itu.").color(FG_SECONDARY));
+            ui.add_space(8.0);
+            if list.is_empty() {
+                ui.label(RichText::new("Belum ada folder. Tambahkan di bawah, atau tekan \u{2606} Simpan folder pada sebuah tab terminal.").color(FG_SECONDARY));
+            }
+            let mut action: Option<(usize, i32)> = None; // (row, -1 up / +1 down / 0 remove)
+            let n = list.len();
+            // The window has no fixed height: ask for room for every row (up to the cap), then scroll.
+            let rows_height = list.iter().map(|f| if Path::new(&f.path).is_dir() { 76.0 } else { 98.0 }).sum::<f32>().min(380.0);
+            egui::ScrollArea::vertical().max_height(380.0).min_scrolled_height(rows_height).auto_shrink([false, true]).show(ui, |ui| {
+                for (i, f) in list.iter_mut().enumerate() {
+                    egui::Frame::new().fill(SURFACE_RAISED).corner_radius(6).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(i > 0, egui::Button::new("\u{2191}").small()).on_hover_text("Naikkan").clicked() {
+                                action = Some((i, -1));
+                            }
+                            if ui.add_enabled(i + 1 < n, egui::Button::new("\u{2193}").small()).on_hover_text("Turunkan").clicked() {
+                                action = Some((i, 1));
+                            }
+                            ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("Nama").desired_width(220.0));
+                            let current = f.shell.as_deref().map(|s| ShellKind::from_setting(Some(s)).label()).unwrap_or("Shell bawaan");
+                            egui::ComboBox::from_id_salt(("saved-shell", i)).selected_text(current).width(130.0).show_ui(ui, |ui| {
+                                if ui.selectable_label(f.shell.is_none(), "Shell bawaan").clicked() {
+                                    f.shell = None;
+                                }
+                                for k in &shells {
+                                    if ui.selectable_label(f.shell.as_deref() == Some(k.as_setting()), k.label()).clicked() {
+                                        f.shell = Some(k.as_setting().to_string());
+                                    }
+                                }
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.add(egui::Button::new(RichText::new("Hapus").color(DANGER)).small()).clicked() {
+                                    action = Some((i, 0));
+                                }
+                                if ui.small_button("Ubah\u{2026}").on_hover_text("Pilih folder lain").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new().set_directory(&f.path).pick_folder() {
+                                        f.path = p.display().to_string();
+                                    }
+                                }
+                            });
+                        });
+                        ui.add(egui::Label::new(RichText::new(&f.path).font(theme::mono(11.5)).color(FG_SECONDARY)).truncate()).on_hover_text(&f.path);
+                        if !Path::new(&f.path).is_dir() {
+                            ui.label(RichText::new("Folder tidak ditemukan (drive mungkin sedang tidak terpasang).").color(DANGER));
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+            match action {
+                Some((i, 0)) => {
+                    list.remove(i);
+                }
+                Some((i, d)) => list.swap(i, (i as i32 + d) as usize),
+                None => {}
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(list.len() < folders::MAX_SAVED, egui::Button::new("+ Tambah folder\u{2026}")).clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        folders::add(&mut list, &p.display().to_string());
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(primary_button("Selesai")).clicked() {
+                        done = Some(true);
+                    }
+                    if ui.button("Batal").clicked() {
+                        done = Some(false);
+                    }
+                });
+            });
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            done = Some(false);
+        }
+        match done {
+            Some(true) => {
+                for f in &mut list {
+                    if f.name.trim().is_empty() {
+                        f.name = folders::default_name(&f.path);
+                    }
+                }
+                self.set_saved_folders(list);
+            }
+            Some(false) => {}
+            None => self.terminal.manage_folders = Some(list),
+        }
+    }
+
+    /// Open the "Kelola folder…" window.
+    pub(super) fn terminal_manage_folders(&mut self) {
+        let list = self.saved_folders().clone();
+        self.terminal.manage_folders = Some(list);
+    }
+
+    /// Open a terminal in a saved folder, with its own shell when it has one.
+    fn open_saved_folder(&mut self, f: &SavedFolder) {
+        let dir = PathBuf::from(&f.path);
+        if !dir.is_dir() {
+            self.notice = Some((format!("Folder tidak ditemukan: {}. Periksa lewat + Baru \u{2192} Kelola folder.", f.path), Instant::now()));
+            return;
+        }
+        let kind = f.shell.as_deref().map(|s| ShellKind::from_setting(Some(s)));
+        self.open_local_terminal(dir, kind);
     }
 
     /// Whether the terminal currently holds the keyboard (app shortcuts must stay out of the way).
@@ -976,6 +1129,15 @@ impl App {
             if let SessionStatus::Ended(code) = s.status() {
                 tab.status = TabStatus::Ended(code);
             }
+            // Local shells report their folder after each command: keep the tab's name and folder current.
+            if let (TabKind::Local(_), Some(dir)) = (&tab.kind, s.cwd()) {
+                let dir = PathBuf::from(dir);
+                if dir != tab.cwd {
+                    tab.base_title = folders::default_name(&dir.display().to_string());
+                    tab.subtitle = dir.display().to_string();
+                    tab.cwd = dir;
+                }
+            }
         }
     }
 
@@ -1019,6 +1181,9 @@ impl App {
         let mut select: Option<usize> = None;
         let mut close: Option<u64> = None;
         let mut new_tab: Option<ShellKind> = None;
+        let saved = self.saved_folders().clone();
+        let mut open_saved: Option<SavedFolder> = None;
+        let mut manage = false;
 
         ui.horizontal_wrapped(|ui| {
             for (i, tab) in self.terminal.tabs.iter().enumerate() {
@@ -1048,11 +1213,37 @@ impl App {
                 });
             }
             ui.menu_button("+ Baru", |ui| {
+                ui.set_min_width(380.0);
+                let section = |ui: &mut egui::Ui, t: &str| {
+                    ui.label(RichText::new(t.to_uppercase()).font(theme::bold(10.5)).color(FG_SECONDARY));
+                };
+                section(ui, "Folder tersimpan");
+                if saved.is_empty() {
+                    ui.label(RichText::new("Belum ada. Tekan \u{2606} Simpan folder di samping alamat folder sebuah tab.").color(FG_SECONDARY));
+                }
+                for f in &saved {
+                    let name = match f.shell.as_deref() {
+                        Some(sh) => format!("{}  \u{00B7} {}", f.name, ShellKind::from_setting(Some(sh)).label()),
+                        None => f.name.clone(),
+                    };
+                    let btn = egui::Button::new(name).shortcut_text(RichText::new(&f.path).font(theme::mono(11.0)));
+                    if ui.add(btn).on_hover_text(format!("Buka terminal di {}", f.path)).clicked() {
+                        open_saved = Some(f.clone());
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                section(ui, "Terminal baru di folder awal");
                 for k in detect_shells() {
-                    if ui.button(format!("Terminal baru: {}", k.label())).clicked() {
+                    if ui.button(k.label()).clicked() {
                         new_tab = Some(k);
                         ui.close();
                     }
+                }
+                ui.separator();
+                if ui.button("Kelola folder\u{2026}").clicked() {
+                    manage = true;
+                    ui.close();
                 }
             });
         });
@@ -1068,6 +1259,12 @@ impl App {
             let dir = settings.start_dir.clone();
             self.open_local_terminal(dir, Some(k));
         }
+        if let Some(f) = open_saved.take() {
+            self.open_saved_folder(&f);
+        }
+        if manage {
+            self.terminal.manage_folders = Some(saved.clone());
+        }
 
         if self.terminal.tabs.is_empty() {
             ui.add_space(30.0);
@@ -1078,9 +1275,23 @@ impl App {
                 if ui.add(primary_button("Terminal baru")).clicked() {
                     new_tab = Some(settings.shell);
                 }
+                if !saved.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Atau buka di folder tersimpan:").color(FG_SECONDARY));
+                    ui.horizontal_wrapped(|ui| {
+                        for f in &saved {
+                            if ui.button(&f.name).on_hover_text(&f.path).clicked() {
+                                open_saved = Some(f.clone());
+                            }
+                        }
+                    });
+                }
             });
             if let Some(k) = new_tab {
                 self.open_local_terminal(settings.start_dir.clone(), Some(k));
+            }
+            if let Some(f) = open_saved {
+                self.open_saved_folder(&f);
             }
             return;
         }
@@ -1099,7 +1310,8 @@ impl App {
         let maximized = self.terminal.maximized;
         let servers: Vec<(String, String)> = self.servers.servers.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
         tab.view.alt_v_image = matches!(tab.kind, TabKind::Ssh { .. });
-        draw_tab(ui, &mut tab, &settings, &servers, maximized, &mut outcome, &mut |ui: &mut egui::Ui| {
+        let is_saved = matches!(tab.kind, TabKind::Local(_)) && folders::position(&saved, &tab.cwd.display().to_string()).is_some();
+        draw_tab(ui, &mut tab, &settings, &servers, maximized, is_saved, &mut outcome, &mut |ui: &mut egui::Ui| {
             if let Some(ex) = ex.as_mut() {
                 self.explorer_ui(ui, id, ex);
             }
@@ -1114,6 +1326,10 @@ impl App {
         self.terminal.captured = self.terminal.tabs[idx].view.has_focus();
         if let Some(text) = outcome.paste_confirm {
             self.terminal.confirm_paste = Some((id, text));
+        }
+        if outcome.toggle_saved {
+            let dir = self.terminal.tabs[idx].cwd.clone();
+            self.toggle_saved_folder(&dir);
         }
         if outcome.toggle_max {
             self.terminal.maximized = !self.terminal.maximized;
@@ -1150,6 +1366,7 @@ impl App {
 
     /// Confirmation windows of the Terminal screen.
     pub(super) fn terminal_dialogs(&mut self, ctx: &egui::Context) {
+        self.saved_folders_dialog(ctx);
         if let Some((tab_id, text)) = self.terminal.confirm_paste.clone() {
             let lines = text.lines().count();
             let mut answer: Option<bool> = None;
@@ -1219,10 +1436,13 @@ struct TabOutcome {
     close: bool,
     /// Upload these items of a local folder: (server id, folder, names).
     upload: Option<(String, PathBuf, Vec<String>)>,
+    /// The ☆/★ button: save or forget the tab's current folder.
+    toggle_saved: bool,
 }
 
 /// One tab's toolbar, banner, terminal, and files pane, in the chosen layout.
-fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, servers: &[(String, String)], maximized: bool, out: &mut TabOutcome, explorer_ui: &mut dyn FnMut(&mut egui::Ui)) {
+#[allow(clippy::too_many_arguments)]
+fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, servers: &[(String, String)], maximized: bool, saved: bool, out: &mut TabOutcome, explorer_ui: &mut dyn FnMut(&mut egui::Ui)) {
     let local = matches!(tab.kind, TabKind::Local(_));
     if matches!(tab.kind, TabKind::Files { .. }) {
         ui.horizontal(|ui| {
@@ -1248,6 +1468,16 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, serve
             ui.label(RichText::new(k.label()).font(theme::mono(11.5)).color(FG_SECONDARY));
         }
         ui.label(RichText::new(&tab.subtitle).font(theme::mono(11.5)).color(FG_SECONDARY));
+        if local && !tab.cwd.as_os_str().is_empty() {
+            let (text, hint) = if saved {
+                (RichText::new("\u{2605} Tersimpan").color(ACCENT_TEXT), "Folder ini ada di + Baru. Klik untuk menghapusnya dari folder tersimpan.")
+            } else {
+                (RichText::new("\u{2606} Simpan folder"), "Simpan folder ini agar bisa dibuka lagi lewat + Baru tanpa cd")
+            };
+            if ui.add(egui::Button::new(text.font(theme::bold(12.0))).small()).on_hover_text(hint).clicked() {
+                out.toggle_saved = true;
+            }
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let label = if maximized { "Keluar layar penuh" } else { "Layar penuh" };
             if ui.button(label).on_hover_text("Sembunyikan menu dan bilah lain agar terminal memenuhi jendela").clicked() {

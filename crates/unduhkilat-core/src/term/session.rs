@@ -25,6 +25,8 @@ struct Inner {
     control: Arc<dyn SourceControl>,
     status: Mutex<SessionStatus>,
     title: Mutex<Option<String>>,
+    /// Folder the shell last reported (OSC 9;9 / OSC 7).
+    cwd: Mutex<Option<String>>,
     clipboard: Mutex<Vec<String>>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
@@ -46,6 +48,7 @@ impl TermSession {
             control,
             status: Mutex::new(SessionStatus::Running),
             title: Mutex::new(None),
+            cwd: Mutex::new(None),
             clipboard: Mutex::new(Vec::new()),
             wake,
         });
@@ -63,6 +66,7 @@ impl TermSession {
                                     }
                                     TermEvent::ClipboardStore(text) => task.clipboard.lock().unwrap().push(text),
                                     TermEvent::Title(t) => *task.title.lock().unwrap() = t,
+                                    TermEvent::Cwd(dir) => *task.cwd.lock().unwrap() = Some(dir),
                                     TermEvent::Bell => {}
                                 }
                             }
@@ -127,6 +131,11 @@ impl TermSession {
 
     pub fn title(&self) -> Option<String> {
         self.inner.title.lock().unwrap().clone()
+    }
+
+    /// The folder the shell last reported, when it reports one (local shells started by `spawn_local`).
+    pub fn cwd(&self) -> Option<String> {
+        self.inner.cwd.lock().unwrap().clone()
     }
 
     /// Text programs asked to put in the clipboard (OSC 52). Returns each request once.
@@ -238,6 +247,8 @@ mod tests {
         let r = rig(80, 24, 100);
         r.tx.send(SourceEvent::Data(b"\x1b]0;mijn titel\x07".to_vec())).unwrap();
         eventually("title", || r.session.title().as_deref() == Some("mijn titel")).await;
+        r.tx.send(SourceEvent::Data(b"\x1b]9;9;D:\\Werk\x1b\\".to_vec())).unwrap();
+        eventually("cwd", || r.session.cwd().as_deref() == Some(r"D:\Werk")).await;
     }
 
     #[tokio::test]

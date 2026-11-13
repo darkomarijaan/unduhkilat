@@ -7,3 +7,4 @@ pub mod paste;
 pub mod source;
 pub mod local;
 pub mod session;
+pub mod folders;

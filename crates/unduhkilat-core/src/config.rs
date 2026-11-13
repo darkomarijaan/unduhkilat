@@ -55,6 +55,8 @@ pub mod keys {
     pub const BROWSER_SKIP_EXTENSIONS: &str = "browser_skip_extensions";
     pub const TERMINAL_SHELL: &str = "terminal_shell";
     pub const TERMINAL_START_DIR: &str = "terminal_start_dir";
+    /// Folder tersimpan untuk terminal lokal (JSON, lihat `term::folders`).
+    pub const TERMINAL_SAVED_FOLDERS: &str = "terminal_saved_folders";
     pub const TERMINAL_FONT_SIZE: &str = "terminal_font_size";
     pub const TERMINAL_CTRL_V_PASTES: &str = "terminal_ctrl_v_pastes";
     pub const TERMINAL_LAYOUT: &str = "terminal_layout";

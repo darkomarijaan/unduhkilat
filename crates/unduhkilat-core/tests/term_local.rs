@@ -22,8 +22,9 @@ fn plain(s: &str) -> String {
                     }
                 }
                 Some(']') => {
-                    for n in it.by_ref() {
-                        if n == '\u{7}' {
+                    // Ends with BEL or ST (ESC \).
+                    while let Some(n) = it.next() {
+                        if n == '\u{7}' || (n == '\u{1b}' && it.next_if_eq(&'\\').is_some()) {
                             break;
                         }
                     }
@@ -155,6 +156,55 @@ async fn extreme_sizes_do_not_panic() {
     }
     io.control.close();
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// Read raw output (escape sequences kept) until it contains `needle`.
+async fn read_raw_until(io: &mut SourceIo, needle: &str, secs: u64) -> String {
+    let mut raw = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, io.rx.recv()).await {
+            Ok(Some(SourceEvent::Data(b))) => {
+                let chunk = String::from_utf8_lossy(&b).to_string();
+                if chunk.contains("\u{1b}[6n") {
+                    io.control.write(b"\x1b[1;1R").unwrap();
+                }
+                raw.push_str(&chunk);
+                if raw.contains(needle) {
+                    return raw;
+                }
+            }
+            _ => return raw,
+        }
+    }
+}
+
+/// The shell reports its folder (OSC 9;9) at start and again after `cd`.
+async fn reports_folder_after_cd(kind: ShellKind, cd_line: &[u8]) {
+    let dir = temp_dir("uk-cwd \u{fc}");
+    let sub = dir.join("sub dir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut io = spawn_local(ShellOptions { kind, cwd: dir.clone(), cols: 120, rows: 30 }).unwrap();
+    let first = format!("\u{1b}]9;9;{}", dir.display());
+    let raw = read_raw_until(&mut io, &first, 20).await;
+    assert!(raw.contains(&first), "{kind:?} reports its starting folder: {raw:?}");
+    io.control.write(cd_line).unwrap();
+    let next = format!("\u{1b}]9;9;{}", sub.display());
+    let raw = read_raw_until(&mut io, &next, 20).await;
+    assert!(raw.contains(&next), "{kind:?} reports the folder after cd: {raw:?}");
+    io.control.close();
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cmd_reports_its_folder() {
+    reports_folder_after_cd(ShellKind::Cmd, b"cd \"sub dir\"\r\n").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn powershell_reports_its_folder() {
+    reports_folder_after_cd(ShellKind::PowerShell, b"cd 'sub dir'\r\n").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

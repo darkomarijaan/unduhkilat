@@ -297,6 +297,11 @@ impl App {
                 let dir = std::env::current_dir().unwrap_or_default();
                 app.open_local_terminal(dir, None);
             }
+            Some("terminal-folders") => {
+                let dir = std::env::current_dir().unwrap_or_default();
+                app.open_local_terminal(dir, None);
+                app.terminal_manage_folders();
+            }
             Some("servers-new") => {
                 app.screen = Screen::Servers;
                 app.servers_open_new_dialog();

@@ -48,6 +48,8 @@ pub enum TermEvent {
     PtyWrite(Vec<u8>),
     Title(Option<String>),
     Bell,
+    /// The shell reported its current folder (OSC 9;9 or OSC 7), as a Windows path.
+    Cwd(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +190,129 @@ pub struct TermEngine {
     parser: Processor,
     events: Arc<Mutex<Vec<TermEvent>>>,
     size: Arc<Mutex<(u16, u16)>>,
+    cwd_scan: CwdScan,
+}
+
+/// Longest OSC payload kept while looking for a folder report; longer ones are ignored.
+const OSC_MAX: usize = 4096;
+
+/// Finds folder reports (OSC 9;9 and OSC 7) in the byte stream. The emulator ignores both, so they
+/// are picked out here; a report may be split across `feed` calls.
+#[derive(Default)]
+struct CwdScan {
+    state: ScanState,
+    buf: Vec<u8>,
+    too_long: bool,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum ScanState {
+    #[default]
+    Ground,
+    Esc,
+    Osc,
+    OscEsc,
+}
+
+impl CwdScan {
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<TermEvent>) {
+        for &b in bytes {
+            match self.state {
+                ScanState::Ground => {
+                    if b == 0x1b {
+                        self.state = ScanState::Esc;
+                    }
+                }
+                ScanState::Esc => self.after_esc(b),
+                ScanState::Osc => match b {
+                    0x07 => self.finish(out),
+                    0x1b => self.state = ScanState::OscEsc,
+                    // CAN and SUB cancel the sequence.
+                    0x18 | 0x1a => self.state = ScanState::Ground,
+                    _ => self.push(b),
+                },
+                ScanState::OscEsc => {
+                    if b == b'\\' {
+                        self.finish(out);
+                    } else {
+                        // ESC that is not ST: the OSC was cut off and this ESC starts something new.
+                        self.after_esc(b);
+                    }
+                }
+            }
+        }
+    }
+
+    fn after_esc(&mut self, b: u8) {
+        self.state = match b {
+            b']' => {
+                self.buf.clear();
+                self.too_long = false;
+                ScanState::Osc
+            }
+            0x1b => ScanState::Esc,
+            _ => ScanState::Ground,
+        };
+    }
+
+    fn push(&mut self, b: u8) {
+        if self.buf.len() < OSC_MAX {
+            self.buf.push(b);
+        } else {
+            self.too_long = true;
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<TermEvent>) {
+        self.state = ScanState::Ground;
+        if self.too_long {
+            return;
+        }
+        if let Some(dir) = std::str::from_utf8(&self.buf).ok().and_then(cwd_from_osc) {
+            out.push(TermEvent::Cwd(dir));
+        }
+    }
+}
+
+/// The Windows folder in an OSC payload (without `ESC ]` and the terminator), if it is a folder report.
+pub fn cwd_from_osc(payload: &str) -> Option<String> {
+    let dir = if let Some(rest) = payload.strip_prefix("9;9;") {
+        let rest = rest.trim();
+        rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(rest).to_string()
+    } else {
+        // OSC 7: file://host/C:/path, percent-encoded.
+        let rest = payload.strip_prefix("7;")?.trim().strip_prefix("file://")?;
+        let path = percent_decode(&rest[rest.find('/')?..])?;
+        let path = path.strip_prefix('/').filter(|p| is_drive_path(p)).map(str::to_string).unwrap_or(path);
+        if !is_drive_path(&path) {
+            return None; // a Linux path (WSL): not a folder on this computer
+        }
+        path.replace('/', "\\")
+    };
+    let ok = (is_drive_path(&dir) || dir.starts_with(r"\\")) && !dir.chars().any(char::is_control);
+    ok.then_some(dir)
+}
+
+fn is_drive_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 impl TermEngine {
@@ -199,13 +324,15 @@ impl TermEngine {
         cfg.scrolling_history = scrollback;
         cfg.kitty_keyboard = true;
         let term = Term::new(cfg, &Size { cols: cols as usize, rows: rows as usize }, Collector { events: events.clone(), size: size.clone() });
-        TermEngine { term, parser: Processor::default(), events, size }
+        TermEngine { term, parser: Processor::default(), events, size, cwd_scan: CwdScan::default() }
     }
 
     /// Feed bytes from the program. Returns what the emulator wants done about them.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TermEvent> {
         self.parser.advance(&mut self.term, bytes);
-        std::mem::take(&mut *self.events.lock().unwrap())
+        let mut out = std::mem::take(&mut *self.events.lock().unwrap());
+        self.cwd_scan.feed(bytes, &mut out);
+        out
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -425,6 +552,44 @@ mod tests {
         let mut e = TermEngine::new(80, 24, 100);
         let events = e.feed(b"\x1b]52;c;SGVsbG8=\x07");
         assert!(events.contains(&TermEvent::ClipboardStore("Hello".into())), "{events:?}");
+    }
+
+    #[test]
+    fn folder_reports_become_cwd_events() {
+        let mut e = TermEngine::new(80, 24, 100);
+        let ev = e.feed("\x1b]9;9;C:\\Users\\x y\x1b\\C:\\Users\\x y>".as_bytes());
+        assert!(ev.contains(&TermEvent::Cwd(r"C:\Users\x y".into())), "{ev:?}");
+        assert_eq!(row_text(&e, 0).trim_end(), r"C:\Users\x y>", "the report itself is not drawn");
+        let ev = e.feed(b"\x1b]7;file://host/D:/Rust%20Projects\x07");
+        assert!(ev.contains(&TermEvent::Cwd(r"D:\Rust Projects".into())), "OSC 7 ended by BEL: {ev:?}");
+    }
+
+    #[test]
+    fn a_folder_report_split_across_feeds_is_found() {
+        let mut e = TermEngine::new(80, 24, 100);
+        let all = "\x1b]9;9;D:\\\u{fc}ber\x1b\\".as_bytes();
+        let mut ev = Vec::new();
+        for b in all {
+            ev.extend(e.feed(std::slice::from_ref(b)));
+        }
+        assert_eq!(ev, vec![TermEvent::Cwd("D:\\\u{fc}ber".into())]);
+    }
+
+    #[test]
+    fn other_or_broken_osc_is_not_a_folder() {
+        assert_eq!(cwd_from_osc("0;title"), None);
+        assert_eq!(cwd_from_osc("9;4;1;50"), None, "progress report");
+        assert_eq!(cwd_from_osc(r"9;9;relative\path"), None);
+        assert_eq!(cwd_from_osc("7;file://host/home/me"), None, "Linux path from WSL");
+        assert_eq!(cwd_from_osc(r#"9;9;"C:\a b""#), Some(r"C:\a b".into()), "quotes are removed");
+        assert_eq!(cwd_from_osc(r"9;9;\\srv\share"), Some(r"\\srv\share".into()), "UNC");
+        let mut e = TermEngine::new(80, 24, 100);
+        // Cut off by a new escape sequence, then an oversized one: no event, no panic.
+        assert!(e.feed(b"\x1b]9;9;C:\\x\x1b[31m").is_empty());
+        let mut big = b"\x1b]9;9;C:\\".to_vec();
+        big.extend(std::iter::repeat_n(b'a', OSC_MAX + 10));
+        big.push(0x07);
+        assert!(e.feed(&big).iter().all(|x| !matches!(x, TermEvent::Cwd(_))));
     }
 
     #[test]
