@@ -997,6 +997,21 @@ impl Manager {
     }
 
     pub async fn clear_finished_in(&self, scope: Scope) -> Result<usize> {
+        // A finished torrent usually keeps seeding, and its live handle holds the files
+        // open (on Windows that blocks renaming and deleting the folder). Forget it
+        // BEFORE the cascade removes the torrents row — same ordering as `delete`.
+        // `delete_files=false`: the toolbar's contract is that files stay on disk.
+        let sql = format!(
+            "SELECT d.id FROM torrents AS t JOIN downloads AS d ON d.id = t.download_id \
+             WHERE d.state IN ('completed','cancelled') AND ({})",
+            scope.sql()
+        );
+        let ids: Vec<String> = self.db().read(|c| {
+            c.prepare(&sql)?.query_map([], |r| r.get(0))?.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        })?;
+        for id in &ids {
+            self.inner.ctx.torrent.forget(id, false).await?;
+        }
         let sql = format!("DELETE FROM downloads WHERE state IN ('completed','cancelled') AND {}", scope.sql());
         self.db().write(move |c| Ok(c.execute(&sql, [])?)).await
     }

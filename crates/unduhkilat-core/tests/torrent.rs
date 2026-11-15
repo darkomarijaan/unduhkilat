@@ -328,6 +328,38 @@ async fn multi_file_torrent_lands_in_its_own_folder() {
     env.manager.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
+// Toolbar "Bersihkan selesai" drops the record, but the seeding session must also
+// let go of the files: on Windows a held handle keeps the folder un-renameable
+// ("Folder In Use") for as long as the app runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clear_finished_releases_the_folder_so_it_can_be_renamed() {
+    let s = seeder_pack("Stuck Pack 1.0").await;
+    let env = env().await;
+    let dl = env.manager.create(NewDownload { url: magnet(&s, "Stuck%20Pack%201.0"), start_immediately: true, ..Default::default() }).await.unwrap();
+    wait(&env, &dl.id, DownloadState::Completed, 60).await;
+    let info = env.manager.torrent_info(&dl.id).await.unwrap().unwrap();
+    assert_eq!(info.seed_state, "seeding", "the repro needs an active seeding handle");
+    let folder = out_file(&env, "Stuck Pack 1.0");
+    assert!(folder.is_dir());
+
+    use unduhkilat_core::engine::manager::Scope;
+    assert_eq!(env.manager.clear_finished_in(Scope::Downloads).await.unwrap(), 1);
+    assert!(env.manager.get(&dl.id).is_err(), "the record is gone");
+
+    let renamed = folder.with_file_name("Stuck Pack 1.0 (renamed)");
+    let mut ok = false;
+    for _ in 0..50 {
+        if std::fs::rename(&folder, &renamed).is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ok, "the folder must be renameable once clearing released the torrent's handles");
+    std::fs::rename(&renamed, &folder).ok();
+    env.manager.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn output_folder_rules() {
     use std::path::Path;
