@@ -57,6 +57,12 @@ pub enum ErrorCode {
     ErrPreviewUnsupported,
     /// Unduhan browser ini termasuk jenis berkas yang dikecualikan pengguna; browser yang mengunduh.
     ErrCaptureSkipped,
+    /// Komponen video (yt-dlp/ffmpeg) belum terpasang atau ditolak pengguna.
+    ErrVideoToolsMissing,
+    /// Konten video butuh login atau privat; versi ini hanya mendukung konten publik.
+    ErrVideoLoginRequired,
+    /// yt-dlp gagal mengekstrak/mengunduh video (detail di pesan).
+    ErrVideoExtractFailed,
 }
 
 impl ErrorCode {
@@ -102,6 +108,9 @@ impl ErrorCode {
             ErrPreviewTooLarge => "ERR_PREVIEW_TOO_LARGE",
             ErrPreviewUnsupported => "ERR_PREVIEW_UNSUPPORTED",
             ErrCaptureSkipped => "ERR_CAPTURE_SKIPPED",
+            ErrVideoToolsMissing => "ERR_VIDEO_TOOLS_MISSING",
+            ErrVideoLoginRequired => "ERR_VIDEO_LOGIN_REQUIRED",
+            ErrVideoExtractFailed => "ERR_VIDEO_EXTRACT_FAILED",
         }
     }
 }
@@ -199,6 +208,9 @@ mod tests {
             (ErrRemoteFs, "ERR_REMOTE_FS"),
             (ErrPreviewTooLarge, "ERR_PREVIEW_TOO_LARGE"),
             (ErrPreviewUnsupported, "ERR_PREVIEW_UNSUPPORTED"),
+            (ErrVideoToolsMissing, "ERR_VIDEO_TOOLS_MISSING"),
+            (ErrVideoLoginRequired, "ERR_VIDEO_LOGIN_REQUIRED"),
+            (ErrVideoExtractFailed, "ERR_VIDEO_EXTRACT_FAILED"),
         ];
         for (code, text) in cases {
             assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{text}\""));

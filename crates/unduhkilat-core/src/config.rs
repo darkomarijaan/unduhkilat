@@ -22,6 +22,13 @@ pub struct EngineConfig {
     pub read_timeout: Duration,
     pub connect_timeout: Duration,
     pub user_agent: String,
+    /// Folder komponen video (`yt-dlp.exe`, `ffmpeg.exe`, `ffprobe.exe`). `None` = fitur
+    /// video mati (semua item video gagal `ERR_VIDEO_TOOLS_MISSING`). Diisi aplikasi:
+    /// `<data>/tools`.
+    pub tools_dir: Option<std::path::PathBuf>,
+    /// HANYA UNTUK TEST: nama berkas yt-dlp di `tools_dir` (default `yt-dlp.exe`), agar
+    /// test integrasi bisa men-spawn skrip `.cmd` palsu.
+    pub video_ytdlp_name: String,
 }
 
 impl Default for EngineConfig {
@@ -33,7 +40,20 @@ impl Default for EngineConfig {
             read_timeout: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(30),
             user_agent: format!("UnduhKilat/{}", env!("CARGO_PKG_VERSION")),
+            tools_dir: None,
+            video_ytdlp_name: "yt-dlp.exe".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_dir_default_is_none() {
+        assert!(EngineConfig::default().tools_dir.is_none());
+        assert_eq!(keys::VIDEO_TOOLS_LAST_CHECK, "video_tools_last_check");
     }
 }
 
@@ -51,6 +71,8 @@ pub mod keys {
     /// FR-040. Default OFF: reading the clipboard is opt-in.
     pub const CLIPBOARD_MONITOR: &str = "clipboard_monitor_enabled";
     pub const UPDATE_CHECK: &str = "update_check_enabled";
+    /// Waktu (epoch detik) cek pembaruan yt-dlp terakhir; jeda minimum 24 jam.
+    pub const VIDEO_TOOLS_LAST_CHECK: &str = "video_tools_last_check";
     /// Ekstensi yang dibiarkan diunduh browser, mis. `pdf, jpg` (lihat `capture_filter`). Bawaan kosong.
     pub const BROWSER_SKIP_EXTENSIONS: &str = "browser_skip_extensions";
     pub const TERMINAL_SHELL: &str = "terminal_shell";
