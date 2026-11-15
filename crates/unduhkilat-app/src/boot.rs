@@ -26,7 +26,9 @@ pub async fn boot() -> Result<Boot, Box<dyn std::error::Error>> {
     let db = Db::open(paths.db_path())?;
     let root = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| paths.data_dir.clone()).join("Downloads");
     category::seed_defaults(&db, &root)?;
-    let manager = Manager::start(db, EngineConfig::default()).await?;
+    // DEC-015: komponen video (yt-dlp, ffmpeg) tinggal di `<data>/tools`.
+    let cfg = EngineConfig { tools_dir: Some(paths.data_dir.join("tools")), ..EngineConfig::default() };
+    let manager = Manager::start(db, cfg).await?;
     // Finished server transfers are not shown in the download list, and their pop-ups do not outlive
     // the app, so nothing would ever clear them: drop them here.
     if let Err(e) = manager.clear_finished_in(Scope::ServerTransfers).await {

@@ -364,8 +364,6 @@ async fn run_once(
     let mut sum_downloaded = 0i64; // jumlah berkas-berkas yang sudah selesai (video lalu audio)
     let mut prev_part = 0i64; // downloaded berkas yang sedang berjalan
     let mut last_total = -1i64;
-    let mut speed: u64 = 0;
-    let mut total: i64 = -1;
     let mut cancelled = false;
     loop {
         tokio::select! {
@@ -378,16 +376,13 @@ async fn run_once(
                 let Some(p) = sample else { break }; // pipa tutup: proses hampir selesai
                 if last_total >= 0 && p.total >= 0 && p.total != last_total && p.downloaded < prev_part {
                     sum_downloaded += prev_part; // berkas baru mulai (video -> audio)
-                    prev_part = 0;
                 }
                 last_total = p.total;
                 prev_part = p.downloaded;
-                speed = p.speed;
-                let done = sum_downloaded + prev_part;
-                total = if p.total > 0 { sum_downloaded + p.total } else { -1 };
+                let total = if p.total > 0 { sum_downloaded + p.total } else { -1 };
                 let _ = ctx.events.send(super::EngineEvent::Progress {
-                    id: id.to_string(), downloaded_bytes: done, total_bytes: total,
-                    current_speed_bps: speed, active_connections: 1, phase: None,
+                    id: id.to_string(), downloaded_bytes: sum_downloaded + prev_part, total_bytes: total,
+                    current_speed_bps: p.speed, active_connections: 1, phase: None,
                 });
             }
         }

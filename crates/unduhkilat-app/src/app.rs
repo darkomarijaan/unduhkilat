@@ -85,6 +85,7 @@ enum SettingsTab {
     Browser,
     Network,
     Torrent,
+    Video,
     Terminal,
 }
 
@@ -105,6 +106,23 @@ struct AddDialog {
     origin: Option<String>,
     /// A `.torrent` chosen from disk (DEC-008); used instead of the URL list.
     torrent_file: Option<(String, Vec<u8>)>,
+    /// DEC-015: link video — bentuk hasil dan kualitas yang dipilih.
+    video: Option<VideoChoice>,
+    /// Catatan komponen video (unduh berjalan / selesai / ditolak).
+    tools_note: Option<String>,
+    /// "Coba sebagai video": link bukan host video yang dipaksa lewat yt-dlp.
+    forced_video: bool,
+    /// Periksa HTTP menemukan halaman HTML: tawarkan "Coba sebagai video".
+    offer_video: bool,
+}
+
+/// Pilihan bentuk unduhan video di dialog Tambah (DEC-015 §5.3).
+#[derive(Clone)]
+struct VideoChoice {
+    is_audio: bool,
+    /// `None` = kualitas terbaik; `Some(h)` = batas tinggi piksel.
+    max_height: Option<u32>,
+    kbps: u32,
 }
 
 /// File search screen state (DEC-009).
@@ -167,11 +185,18 @@ struct SettingsState {
     t_upnp: bool,
     t_port: u32,
     t_net_orig: (bool, bool, u32),
+    /// DEC-015: versi komponen video `(yt-dlp, ffmpeg)` saat Pengaturan dibuka.
+    video_versions: (Option<String>, Option<String>),
+    video_note: Option<String>,
 }
 
 enum Msg {
     Notice(String),
     Probe(String, Option<String>),
+    /// DEC-015: hasil `yt-dlp -J` untuk tombol Periksa pada link video.
+    VideoProbe(std::result::Result<unduhkilat_core::engine::ytdlp::VideoMeta, String>),
+    /// DEC-015: status pengunduhan komponen video (byte terunduh atau pesan akhir).
+    ToolsNote(Option<String>),
     Torrent(String, Option<TorrentInfo>),
     Scan(std::result::Result<ScanResult, String>),
     Search(std::result::Result<SearchOutcome, String>),
@@ -277,6 +302,17 @@ impl App {
         let check_on = app.manager.db().read(|c| repo::get_setting(c, keys::UPDATE_CHECK)).ok().flatten().map(|v| v != "0").unwrap_or(true);
         if check_on && std::env::var_os("UNDUHKILAT_NO_UPDATE_CHECK").is_none() {
             app.check_updates(false);
+            // DEC-015: yt-dlp diperbarui otomatis (paling sering sekali per 24 jam), hanya bila terpasang.
+            if let Some(dir) = app.video_tools() {
+                let (db, client) = (app.manager.db().clone(), app.manager.client());
+                app.rt.spawn(async move {
+                    match unduhkilat_core::tools::maybe_auto_update(&db, &client, &dir, false).await {
+                        Ok(true) => tracing::info!("yt-dlp updated"),
+                        Ok(false) => {}
+                        Err(e) => tracing::info!(error = %e.message, "yt-dlp update check failed"),
+                    }
+                });
+            }
         }
         // Test aid: open straight on a screen (settings, search, grabber, diagnostics, add).
         match std::env::var("UNDUHKILAT_START_SCREEN").ok().as_deref() {
@@ -309,6 +345,7 @@ impl App {
             Some("grabber") => app.screen = Screen::Grabber,
             Some("diagnostics") => app.screen = Screen::Diagnostics,
             Some("add") => app.open_add_dialog("https://releases.ubuntu.com/24.04.1/ubuntu-24.04.1-desktop-amd64.iso"),
+            Some("add-video") => app.open_add_dialog("https://www.youtube.com/watch?v=DjJbAHis1uQ"),
             _ => {}
         }
         app
@@ -316,10 +353,54 @@ impl App {
 
     pub fn open_add_dialog(&mut self, url: &str) {
         let connections = self.manager.db().read(|c| repo::get_setting(c, keys::DEFAULT_CONNECTIONS)).ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(EngineConfig::default().default_connections);
+        let video = unduhkilat_core::engine::ytdlp::is_video_host(url).then_some(VideoChoice { is_audio: false, max_height: None, kbps: 192 });
         self.add = Some(AddDialog {
             urls: url.to_string(), file_name: String::new(), category: None, destination: String::new(), connections,
             priority: 0, referer: String::new(), cookies: String::new(), user_agent: String::new(), probe: String::new(), err: None,
-            origin: None, torrent_file: None,
+            origin: None, torrent_file: None, video, tools_note: None, forced_video: false, offer_video: false,
+        });
+    }
+
+    /// DEC-015: jalankan `yt-dlp -J` untuk link video di dialog Tambah.
+    fn probe_video(&mut self, url: &str) {
+        let Some(tools) = self.video_tools() else {
+            if let Some(a) = self.add.as_mut() {
+                a.probe = "Komponen video belum terpasang.".into();
+            }
+            return;
+        };
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let exe = tools.join("yt-dlp.exe");
+        let url = url.to_string();
+        self.rt.spawn(async move {
+            let r = unduhkilat_core::engine::ytdlp::probe_metadata(&exe, &url).await.map_err(|e| format!("{}: {}", e.code, e.message));
+            let _ = tx.send(Msg::VideoProbe(r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Folder komponen video bila komponen utamanya sudah ada.
+    fn video_tools(&self) -> Option<std::path::PathBuf> {
+        let dir = self.paths.data_dir.join("tools");
+        dir.join("yt-dlp.exe").exists().then_some(dir)
+    }
+
+    /// DEC-015: tawarkan pengunduhan komponen video (~90 MB) lalu pasang.
+    fn install_video_tools(&mut self) {
+        let (tx, ctx, client) = (self.tx.clone(), self.ctx.clone(), self.manager.client());
+        let dir = self.paths.data_dir.join("tools");
+        self.rt.spawn(async move {
+            let tools = unduhkilat_core::tools::Tools::new(dir);
+            let note = |n: u64| {
+                let _ = tx.send(Msg::ToolsNote(Some(format!("Mengunduh komponen video... {}", crate::format::bytes(n as i64)))));
+            };
+            let r = tools.install(&client, &note).await;
+            let msg = match r {
+                Ok(()) => Some("Komponen video siap — klik Periksa atau Mulai lagi.".to_string()),
+                Err(e) => Some(format!("Komponen video gagal: {}: {}", e.code, e.message)),
+            };
+            let _ = tx.send(Msg::ToolsNote(msg));
+            ctx.request_repaint();
         });
     }
 
@@ -517,12 +598,42 @@ impl App {
                 }
                 Msg::Probe(text, name) => {
                     if let Some(a) = self.add.as_mut() {
+                        a.offer_video = text.contains("(text/html)");
                         a.probe = text;
                         if a.file_name.is_empty() {
                             if let Some(n) = name {
                                 a.file_name = n;
                             }
                         }
+                    }
+                }
+                Msg::VideoProbe(r) => {
+                    if let Some(a) = self.add.as_mut() {
+                        match r {
+                            Ok(m) => {
+                                let dur = m.duration.filter(|d| *d > 0).map(|d| format!("{}:{:02}", d / 60, d % 60)).unwrap_or_default();
+                                let best = m.heights.first().map(|h| format!("{h}p")).unwrap_or_else(|| "terbaik".into());
+                                a.probe = format!("Video  |  \"{}\"  |  {dur}  |  sampai {best}", m.title);
+                                if a.file_name.is_empty() {
+                                    let kind = unduhkilat_core::engine::ytdlp::VideoKind::Video { max_height: None };
+                                    a.file_name = unduhkilat_core::engine::ytdlp::final_name(&m.title, &kind);
+                                    if let Some(a) = self.add.as_mut() {
+                                        if let Some(v) = a.video.as_mut() {
+                                            // Nama mengikuti format: MP3 mengganti ekstensi.
+                                            if v.is_audio {
+                                                a.file_name = a.file_name.trim_end_matches(".mp4").to_string() + ".mp3";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => a.probe = e,
+                        }
+                    }
+                }
+                Msg::ToolsNote(note) => {
+                    if let Some(a) = self.add.as_mut() {
+                        a.tools_note = note;
                     }
                 }
             }
@@ -1240,6 +1351,9 @@ impl App {
                 get(keys::TORRENT_UPNP).map(|v| v == "1").unwrap_or(false),
                 get(keys::TORRENT_PORT).and_then(|v| v.parse().ok()).unwrap_or(0),
             ),
+            // Versi dibaca sekali saat Pengaturan dibuka (menjalankan exe lokal, tanpa jaringan).
+            video_versions: self.rt.block_on(unduhkilat_core::tools::Tools::new(self.paths.data_dir.join("tools")).versions()),
+            video_note: None,
         });
         self.screen = Screen::Settings;
     }
@@ -1563,6 +1677,10 @@ impl App {
         let mut close = false;
         let mut submit: Option<bool> = None; // Some(start_immediately)
         let mut reject_all = false;
+        // DEC-015: aksi yang butuh `&mut self` dijalankan setelah jendela digambar.
+        let mut video_probe_url: Option<String> = None;
+        let mut want_tools = false;
+        let tools_ready = self.video_tools().is_some();
         // Browser proposals still waiting behind this one (shown one at a time, FR-039).
         let waiting = if a.origin.is_some() { self.pending.len() } else { 0 };
         let cats = self.categories.clone();
@@ -1586,16 +1704,62 @@ impl App {
                 });
                 ui.label(RichText::new("Tentukan parameter segmen koneksi, kategori berkas, dan folder tujuan.").color(FG_SECONDARY));
                 ui.add_space(8.0);
-                ui.label("Tautan Sumber (HTTP/HTTPS/FTP/magnet):");
+                ui.label("Tautan Sumber (HTTP/HTTPS/FTP/magnet/video YouTube dll.):");
                 let urls_edit = ui.add(egui::TextEdit::multiline(&mut a.urls).desired_rows(3).desired_width(f32::INFINITY).font(theme::mono(12.0)).hint_text("Satu tautan per baris, atau tautan magnet:?xt=..."));
                 // With nothing focused, Ctrl+V reached no widget: focus the link box so paste works at once.
                 if ctx.memory(|m| m.focused().is_none()) {
                     urls_edit.request_focus();
                 }
                 let urls: Vec<String> = a.urls.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                // Deteksi ulang saat link diketik/ditempel: host video memunculkan pilihan format.
+                let is_video_link = urls.len() == 1 && unduhkilat_core::engine::ytdlp::is_video_host(&urls[0]);
+                if is_video_link && a.video.is_none() {
+                    a.video = Some(VideoChoice { is_audio: false, max_height: None, kbps: 192 });
+                } else if !is_video_link && a.video.is_some() && !a.forced_video {
+                    a.video = None;
+                }
+                // DEC-015: link host video — pilihan bentuk & kualitas + tawaran komponen.
+                if a.video.is_some() && urls.len() == 1 {
+                    let mut v = a.video.clone().expect("checked above");
+                    ui.horizontal(|ui| {
+                        ui.label("Format:");
+                        ui.selectable_value(&mut v.is_audio, false, "Video");
+                        ui.selectable_value(&mut v.is_audio, true, "Audio MP3");
+                        if v.is_audio {
+                            ui.label("MP3:");
+                            egui::ComboBox::from_id_salt("mp3k").selected_text(format!("{} kbps", v.kbps)).show_ui(ui, |ui| {
+                                for k in [128u32, 192, 320] { ui.selectable_value(&mut v.kbps, k, format!("{k} kbps")); }
+                            });
+                        } else {
+                            ui.label("Kualitas:");
+                            let label = |h: Option<u32>| h.map(|h| format!("{h}p")).unwrap_or_else(|| "Terbaik".into());
+                            let heights: Vec<Option<u32>> = [None, Some(2160), Some(1440), Some(1080), Some(720), Some(480), Some(360)].into();
+                            egui::ComboBox::from_id_salt("vidq").selected_text(label(v.max_height)).show_ui(ui, |ui| {
+                                for h in heights { ui.selectable_value(&mut v.max_height, h, label(h)); }
+                            });
+                        }
+                        a.video = Some(v);
+                    });
+                    if !tools_ready {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Komponen video (yt-dlp + ffmpeg, ±90 MB) belum terpasang.").color(FG_SECONDARY));
+                            let busy = a.tools_note.as_ref().is_some_and(|n| n.starts_with("Mengunduh"));
+                            if ui.add_enabled(!busy, egui::Button::new("Unduh komponen")).clicked() {
+                                want_tools = true;
+                                a.tools_note = Some("Mengunduh komponen video...".into());
+                            }
+                        });
+                    }
+                    if let Some(n) = &a.tools_note {
+                        ui.label(RichText::new(n).font(theme::mono(11.0)).color(FG_SECONDARY));
+                    }
+                }
                 ui.horizontal(|ui| {
                     let probe_clicked = ui.add_enabled(urls.len() == 1 && a.torrent_file.is_none(), egui::Button::new("Periksa")).clicked();
-                    if probe_clicked && torrent::is_magnet(&urls[0]) {
+                    if probe_clicked && a.video.is_some() {
+                        a.probe = "Memeriksa video...".into();
+                        video_probe_url = Some(urls[0].clone());
+                    } else if probe_clicked && torrent::is_magnet(&urls[0]) {
                         // A magnet needs no server round-trip: the swarm supplies metadata later.
                         a.probe = match torrent::parse_magnet(&urls[0]) {
                             Ok(m) => format!("Torrent  |  hash {}...  |  {}", &m.info_hash[..12], m.name.unwrap_or_else(|| "nama dari peer".into())),
@@ -1627,6 +1791,8 @@ impl App {
                                 http::probe(&client, &url, &http::RequestContext::default()).await
                             };
                             let msg = match probed {
+                                // DEC-015: halaman HTML → dialog menawarkan "Coba sebagai video".
+                                Ok(p) if p.mime_type.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("text/html")) => (format!("{}  |  halaman web (text/html), bukan berkas", crate::format::bytes(p.total_bytes.unwrap_or(-1))), None),
                                 Ok(p) => (format!("{}  |  {}", crate::format::bytes(p.total_bytes.unwrap_or(-1)), if p.range == RangeSupport::Supported { "Mendukung Range" } else { "Tanpa Range (satu koneksi)" }), p.file_name),
                                 Err(e) => (format!("{}: {}", e.code, e.message), None),
                             };
@@ -1635,6 +1801,13 @@ impl App {
                         });
                     }
                     ui.label(RichText::new(&a.probe).font(theme::mono(12.0)).color(FG_SECONDARY));
+                    if a.offer_video && a.video.is_none() && urls.len() == 1 && ui.button("Coba sebagai video").clicked() {
+                        a.forced_video = true;
+                        a.offer_video = false;
+                        a.video = Some(VideoChoice { is_audio: false, max_height: None, kbps: 192 });
+                        a.probe = "Memeriksa video...".into();
+                        video_probe_url = Some(urls[0].clone());
+                    }
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Pilih berkas .torrent...").clicked() {
@@ -1711,6 +1884,12 @@ impl App {
             });
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
 
+        // DEC-015: link video tanpa komponen tidak dibuat; pesannya jelas.
+        if submit.is_some() && a.video.is_some() && !tools_ready {
+            a.err = Some("ERR_VIDEO_TOOLS_MISSING: unduh komponen video dulu (tombol \"Unduh komponen\").".into());
+            submit = None;
+        }
+
         if let Some(start) = submit {
             let urls: Vec<String> = a.urls.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
             let single = urls.len() == 1;
@@ -1728,7 +1907,19 @@ impl App {
                 }
             }
             for url in urls {
-                let name = (single && !a.file_name.trim().is_empty()).then(|| a.file_name.trim().to_string());
+                // DEC-015: link video dibungkus dengan bentuk/kualitas dari dialog.
+                let url = match (&a.video, single) {
+                    (Some(v), true) if unduhkilat_core::engine::ytdlp::parse(&url).is_none() => {
+                        use unduhkilat_core::engine::ytdlp::{wrap, VideoKind};
+                        let kind = if v.is_audio { VideoKind::AudioMp3 { kbps: v.kbps } } else { VideoKind::Video { max_height: v.max_height } };
+                        wrap(&url, &kind)
+                    }
+                    _ => url,
+                };
+                let is_video = unduhkilat_core::engine::ytdlp::parse(&url).is_some();
+                let name = (single && !a.file_name.trim().is_empty()).then(|| a.file_name.trim().to_string())
+                    // Video tanpa nama: placeholder, nanti diganti judul oleh engine.
+                    .or_else(|| is_video.then(|| if a.video.as_ref().is_some_and(|v| v.is_audio) { "audio.mp3".to_string() } else { "video.mp4".to_string() }));
                 let target = (!a.destination.trim().is_empty()).then(|| {
                     let n = name.clone().or_else(|| http::file_name_from_url(&url)).unwrap_or_else(|| "download".into());
                     std::path::PathBuf::from(a.destination.trim()).join(n)
@@ -1778,6 +1969,8 @@ impl App {
             }
         }
         if !close { self.add = Some(a); }
+        if let Some(u) = video_probe_url { self.probe_video(&u); }
+        if want_tools { self.install_video_tools(); }
         self.last_refresh = Instant::now() - Duration::from_secs(10);
     }
 }
@@ -1789,12 +1982,13 @@ impl App {
         let Some(mut s) = self.settings.take() else { self.open_settings_screen(); return };
         let mut save = false;
         let mut check_now = false;
+        let mut video_update_now = false;
         ui.label(RichText::new("Pengaturan").font(theme::bold(17.0)));
         ui.add_space(6.0);
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(180.0);
-                for (t, name) in [(SettingsTab::Engine, "Mesin Unduhan"), (SettingsTab::Categories, "Kategori & Folder"), (SettingsTab::Speed, "Batas Kecepatan"), (SettingsTab::Behaviour, "Jendela & Notifikasi"), (SettingsTab::Network, "Jaringan & Proxy"), (SettingsTab::Torrent, "Torrent"), (SettingsTab::Terminal, "Terminal"), (SettingsTab::Browser, "Integrasi Browser")] {
+                for (t, name) in [(SettingsTab::Engine, "Mesin Unduhan"), (SettingsTab::Categories, "Kategori & Folder"), (SettingsTab::Speed, "Batas Kecepatan"), (SettingsTab::Behaviour, "Jendela & Notifikasi"), (SettingsTab::Network, "Jaringan & Proxy"), (SettingsTab::Torrent, "Torrent"), (SettingsTab::Video, "Video"), (SettingsTab::Terminal, "Terminal"), (SettingsTab::Browser, "Integrasi Browser")] {
                     if ui.selectable_label(s.tab == t, name).clicked() { s.tab = t; }
                 }
             });
@@ -1940,6 +2134,29 @@ impl App {
                         ui.label(RichText::new("Nilai bawaan ini masih sementara (PROVISIONAL). Sesi torrent baru dibuat saat torrent pertama dijalankan, bukan saat aplikasi dibuka. Mengubah DHT, UPnP, atau port menjeda torrent yang sedang berjalan; lanjutkan secara manual.").color(FG_SECONDARY));
                         ui.label(RichText::new("Dengan proxy SOCKS5, DHT, UPnP, dan port masuk dimatikan otomatis. Proxy HTTP tidak bisa membawa BitTorrent, sehingga torrent ditolak (bukan dialihkan langsung).").color(FG_SECONDARY));
                     }
+                    SettingsTab::Video => {
+                        // DEC-015: versi komponen terpasang + tombol perbarui (yt-dlp dan ffmpeg).
+                        let dir = self.paths.data_dir.join("tools");
+                        let (y, f) = (dir.join("yt-dlp.exe").exists(), dir.join("ffmpeg.exe").exists());
+                        egui::Grid::new("g_video").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                            ui.label("yt-dlp:");
+                            ui.label(RichText::new(s.video_versions.0.clone().unwrap_or_else(|| if y { "terpasang".into() } else { "belum terpasang".into() })).font(theme::mono(12.0)));
+                            ui.end_row();
+                            ui.label("ffmpeg:");
+                            ui.label(RichText::new(s.video_versions.1.clone().unwrap_or_else(|| if f { "terpasang".into() } else { "belum terpasang".into() })).font(theme::mono(12.0)));
+                            ui.end_row();
+                            ui.label("Folder:");
+                            ui.label(RichText::new(dir.display().to_string()).font(theme::mono(12.0)));
+                            ui.end_row();
+                        });
+                        if ui.button(if y { "Perbarui komponen video" } else { "Unduh komponen video (±90 MB)" }).clicked() {
+                            video_update_now = true;
+                        }
+                        if let Some(n) = &s.video_note {
+                            ui.label(RichText::new(n).color(FG_SECONDARY));
+                        }
+                        ui.label(RichText::new("Link YouTube, Instagram, TikTok, X, Facebook, Vimeo, Dailymotion, dan Twitch diunduh lewat yt-dlp sebagai MP4 atau MP3. Hanya konten publik. yt-dlp diperbarui otomatis sekali sehari bila \"Cek versi baru\" aktif.").color(FG_SECONDARY));
+                    }
                     SettingsTab::Behaviour => {
                         ui.checkbox(&mut s.close_to_tray, "Tutup jendela ke tray (unduhan tetap berjalan)");
                         ui.checkbox(&mut s.toast, "Tampilkan notifikasi saat unduhan selesai");
@@ -2046,6 +2263,11 @@ impl App {
         }
         if check_now {
             self.check_updates(true);
+        }
+        if video_update_now {
+            // Atas permintaan eksplisit pengguna: pasang ulang komponen terbaru.
+            s.video_note = Some("Mengunduh komponen video... (lihat hasil di dialog Tambah atau buka ulang Pengaturan)".into());
+            self.install_video_tools();
         }
         self.settings = Some(s);
     }

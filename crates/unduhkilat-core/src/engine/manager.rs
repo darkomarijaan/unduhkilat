@@ -460,9 +460,14 @@ impl Manager {
             .filter(|n| !n.is_empty())
             .or_else(|| match &torrent {
                 Some((m, _)) => Some(m.name.clone().unwrap_or_else(|| m.info_hash.clone())),
+                // Video: nama dari URL halaman tidak berarti; placeholder diganti judul saat jalan.
+                None if is_video => Some(match super::ytdlp::parse(&req.url).map(|v| v.kind) {
+                    Some(super::ytdlp::VideoKind::AudioMp3 { .. }) => "audio.mp3".into(),
+                    _ => "video.mp4".into(),
+                }),
                 None => http::file_name_from_url(&req.url),
             })
-            .unwrap_or_else(|| if is_video { "video.mp4".into() } else { "download".to_string() });
+            .unwrap_or_else(|| "download".to_string());
 
         // Category routing (FR-029/030/032).
         let cats = self.db().read(repo::list_categories)?;
