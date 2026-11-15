@@ -138,6 +138,9 @@ async fn run_inner(ctx: &TransferCtx, id: &str, cancel: &CancellationToken, item
     if super::remote::is_remote(&dl.original_url) {
         return super::remote::run_remote(ctx, id, cancel, item_bucket).await;
     }
+    if let Some(vreq) = super::ytdlp::parse(&dl.original_url) {
+        return super::ytdlp::run_video(ctx, id, &vreq, cancel, item_bucket).await;
+    }
     let scheme = url::Url::parse(&dl.original_url).map(|u| u.scheme().to_string()).unwrap_or_default();
     let is_ftp = match scheme.as_str() {
         "http" | "https" => false,

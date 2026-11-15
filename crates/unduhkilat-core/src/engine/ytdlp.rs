@@ -4,9 +4,14 @@
 //! Item video adalah unduhan biasa di tabel `downloads` dengan `original_url`
 //! `video:<opsi>|<url asli>` — pola yang sama dengan awalan `server://`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::error::{AppError, ErrorCode};
+use tokio_util::sync::CancellationToken;
+
+use crate::error::{AppError, ErrorCode, Result};
+
+use super::transfer::{Outcome, TransferCtx};
+use super::throttle::TokenBucket;
 
 /// Bentuk hasil unduhan: video MP4 (batas tinggi opsional) atau audio MP3.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +181,330 @@ pub fn map_error(text: &str) -> AppError {
     }
     let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("yt-dlp gagal");
     AppError::new(ErrorCode::ErrVideoExtractFailed, format!("yt-dlp: {last}"))
+}
+
+// ---- eksekusi ---------------------------------------------------------------
+
+/// Metadata dari `yt-dlp -J` (tombol Periksa dan penamaan otomatis).
+#[derive(Debug, Clone)]
+pub struct VideoMeta {
+    pub title: String,
+    pub duration: Option<i64>,
+    /// Tinggi resolusi unik, terbesar lebih dulu.
+    pub heights: Vec<u32>,
+}
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
+/// Spawn proses (tanpa jendela) dengan stdout/stderr piped. `args[0]` adalah program.
+fn spawn(args: &[String], work: &Path) -> Result<std::process::Child> {
+    let mut cmd = std::process::Command::new(&args[0]);
+    cmd.args(&args[1..]).current_dir(work);
+    #[cfg(windows)]
+    cmd.creation_flags(crate::tools::CREATE_NO_WINDOW);
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.spawn().map_err(|e| AppError::new(ErrorCode::ErrVideoToolsMissing, format!("cannot run {}: {e}", args[0])))
+}
+
+/// Argumen lengkap termasuk program di depan: `[exe, ...flags]`.
+fn with_exe(exe: &Path, args: Vec<String>) -> Vec<String> {
+    let mut v = vec![exe.to_string_lossy().into_owned()];
+    v.extend(args);
+    v
+}
+
+/// Jalankan `yt-dlp -J --no-playlist` dan urai JSON-nya.
+pub async fn probe_metadata(exe: &Path, url: &str) -> Result<VideoMeta> {
+    let args = vec![exe.to_string_lossy().into_owned(), "-J".into(), "--no-playlist".into(), url.into()];
+    let out = tokio::task::spawn_blocking(move || {
+        let mut c = std::process::Command::new(&args[0]);
+        c.args(&args[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        c.creation_flags(crate::tools::CREATE_NO_WINDOW);
+        c.output()
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?
+    .map_err(|e| AppError::new(ErrorCode::ErrVideoToolsMissing, format!("cannot run yt-dlp: {e}")))?;
+    if !out.status.success() {
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        return Err(map_error(&text));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| AppError::new(ErrorCode::ErrMediaParseFailed, format!("metadata bukan JSON: {e}")))?;
+    let title = v["title"].as_str().unwrap_or("video").to_string();
+    let duration = v["duration"].as_i64();
+    let mut heights: Vec<u32> = v["formats"].as_array().map(|fs| fs.iter().filter_map(|f| f["height"].as_u64()).map(|h| h as u32).collect()).unwrap_or_default();
+    heights.sort_unstable();
+    heights.dedup();
+    heights.reverse();
+    Ok(VideoMeta { title, duration, heights })
+}
+
+/// Jalankan satu unduhan video di antrian (dipanggil `run_inner` untuk URL `video:`).
+pub async fn run_video(ctx: &TransferCtx, id: &str, req: &VideoRequest, cancel: &CancellationToken, _bucket: std::sync::Arc<TokenBucket>) -> Result<Outcome> {
+    // 1. Komponen harus ada.
+    let tools_dir = ctx.cfg.tools_dir.clone().ok_or_else(|| AppError::new(ErrorCode::ErrVideoToolsMissing, "komponen video belum terpasang"))?;
+    let exe = tools_dir.join(&ctx.cfg.video_ytdlp_name);
+    if !exe.exists() {
+        return Err(AppError::new(ErrorCode::ErrVideoToolsMissing, format!("{} tidak ditemukan", exe.display())));
+    }
+
+    // 2. Batas kecepatan: yang lebih kecil antara item dan global (0 = tanpa batas).
+    let dl = ctx.db.read(|c| crate::repo::get_download(c, id))?;
+    let global = ctx.db.read(|c| crate::repo::get_setting(c, crate::config::keys::GLOBAL_SPEED_LIMIT_KBPS))?.and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+    let limit = match (dl.speed_limit_kbps, global) {
+        (0, g) => g,
+        (a, 0) => a,
+        (a, b) => a.min(b),
+    };
+    let proxy = crate::engine::torrent::socks_url(&ctx.proxy()).ok().flatten();
+
+    // 3. Metadata untuk nama akhir (judul), lalu nama akhir dan cek tabrakan.
+    let target0 = PathBuf::from(&dl.target_path);
+    let out_dir = target0.parent().ok_or_else(|| AppError::new(ErrorCode::ErrInvalidPath, "target has no parent"))?.to_path_buf();
+    std::fs::create_dir_all(&out_dir).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
+    let meta = match probe_metadata(&exe, &req.url).await {
+        Ok(m) => Some(m),
+        Err(e) if matches!(e.code, ErrorCode::ErrVideoLoginRequired) => return Err(e),
+        Err(e) if e.message.contains("tidak tersedia") => return Err(e),
+        Err(_) => None, // metadata gagal: lanjut tanpa judul (nama dari DB)
+    };
+    let placeholder = dl.file_name == "video.mp4" || dl.file_name == "audio.mp3";
+    let final_name = if placeholder {
+        let title = meta.as_ref().map(|m| m.title.as_str()).unwrap_or("video");
+        final_name(title, &req.kind)
+    } else {
+        dl.file_name.clone()
+    };
+    let final_path = out_dir.join(&final_name);
+    if final_path.exists() {
+        return Err(AppError::new(ErrorCode::ErrNameCollision, format!("{} already exists", final_path.display())));
+    }
+
+    // 4. Folder kerja tersembunyi + stub output.
+    let work = out_dir.join(format!(".uk-video-{id}"));
+    std::fs::create_dir_all(&work).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
+    let stub = work.join("out");
+
+    // 5. Jalankan dengan satu kali ulang bila error menandai versi usang.
+    let mut stale_retried = false;
+    let result = loop {
+        let r = run_once(ctx, id, req, &exe, &stub, proxy.as_deref(), limit, &work, &final_path, cancel).await;
+        match &r {
+            Err(e) if e.code == ErrorCode::ErrVideoExtractFailed && is_stale_error(&e.message) && !stale_retried => {
+                stale_retried = true; // jaring pengaman: perbarui yt-dlp sekali, lalu ulang
+                let _ = crate::tools::maybe_auto_update(&ctx.db, &ctx.client(), &tools_dir, true).await;
+            }
+            _ => break r,
+        }
+    };
+
+    // 6. Beres-beres: folder kerja dihapus apa pun hasilnya.
+    std::fs::remove_dir_all(&work).ok();
+    result
+}
+
+/// Satu eksekusi yt-dlp: spawn dalam Job Object (KILL_ON_JOB_CLOSE), progres per baris,
+/// hasil dipindah ke nama akhir.
+#[allow(clippy::too_many_arguments)]
+async fn run_once(
+    ctx: &TransferCtx,
+    id: &str,
+    req: &VideoRequest,
+    exe: &Path,
+    stub: &Path,
+    proxy: Option<&str>,
+    limit: u32,
+    work: &Path,
+    final_path: &Path,
+    cancel: &CancellationToken,
+) -> Result<Outcome> {
+    let args = with_exe(exe, build_download_args(req, stub, ctx.cfg.tools_dir.as_deref().unwrap_or(work), proxy, limit));
+    let mut child = spawn(&args, work)?;
+    let pid = child.id();
+
+    // Job Object: seluruh pohon proses (termasuk ffmpeg) dibunuh saat guard drop.
+    #[cfg(windows)]
+    let _job = unsafe { JobGuard::assign(&child)? };
+
+    // Pembaca stdout: tiap baris progres diteruskan via channel (tidak memblokir cancel).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressSample>();
+    let stdout = child.stdout.take().expect("stdout piped");
+    let reader = tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let mut r = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match r.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if let Some(p) = parse_progress_line(&line) {
+                        if tx.send(p).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    // Pembaca stderr (teks error bila gagal).
+    let stderr = child.stderr.take().expect("stderr piped");
+    let err_task = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut s = Vec::new();
+        let mut e = stderr;
+        let _ = e.read_to_end(&mut s);
+        String::from_utf8_lossy(&s).into_owned()
+    });
+
+    // Tunggu proses selesai; sambil jalan, sebar progres.
+    let wait = tokio::task::spawn_blocking(move || child.wait());
+    let mut sum_downloaded = 0i64; // jumlah berkas-berkas yang sudah selesai (video lalu audio)
+    let mut prev_part = 0i64; // downloaded berkas yang sedang berjalan
+    let mut last_total = -1i64;
+    let mut speed: u64 = 0;
+    let mut total: i64 = -1;
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                cancelled = true;
+                kill_tree(pid);
+                break;
+            }
+            sample = rx.recv() => {
+                let Some(p) = sample else { break }; // pipa tutup: proses hampir selesai
+                if last_total >= 0 && p.total >= 0 && p.total != last_total && p.downloaded < prev_part {
+                    sum_downloaded += prev_part; // berkas baru mulai (video -> audio)
+                    prev_part = 0;
+                }
+                last_total = p.total;
+                prev_part = p.downloaded;
+                speed = p.speed;
+                let done = sum_downloaded + prev_part;
+                total = if p.total > 0 { sum_downloaded + p.total } else { -1 };
+                let _ = ctx.events.send(super::EngineEvent::Progress {
+                    id: id.to_string(), downloaded_bytes: done, total_bytes: total,
+                    current_speed_bps: speed, active_connections: 1, phase: None,
+                });
+            }
+        }
+    }
+    let status = match wait.await {
+        Ok(Ok(st)) => Some(st),
+        _ => None,
+    };
+    let _ = reader.await;
+    let err_text = err_task.await.unwrap_or_default();
+    if cancelled {
+        return Ok(Outcome::Stopped);
+    }
+
+    // Proses selesai normal: exit sukses DAN berkas hasil ada (bukan sukses diam).
+    if !status.is_some_and(|s| s.success()) {
+        return Err(map_error(&err_text));
+    }
+    let produced = find_produced(work, req)?;
+    let Some(produced) = produced else {
+        return Err(AppError::new(ErrorCode::ErrVideoExtractFailed, "yt-dlp selesai tetapi tidak ada berkas hasil"));
+    };
+    if final_path.exists() {
+        return Err(AppError::new(ErrorCode::ErrNameCollision, format!("{} already exists", final_path.display())));
+    }
+    std::fs::rename(&produced, final_path).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
+    let size = std::fs::metadata(final_path).map(|m| m.len() as i64).unwrap_or(0);
+    let (id2, t, f) = (id.to_string(), size, final_path.to_string_lossy().into_owned());
+    let name2 = final_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    ctx.db.write(move |c| {
+        crate::repo::set_downloaded_bytes(c, &id2, t)?;
+        c.execute("UPDATE downloads SET total_bytes=?2, target_path=?3, file_name=?4 WHERE id=?1", rusqlite::params![id2, t, f, name2]).map(|_| ()).map_err(Into::into)
+    }).await?;
+    let _ = ctx.events.send(super::EngineEvent::Progress {
+        id: id.to_string(), downloaded_bytes: size, total_bytes: size,
+        current_speed_bps: 0, active_connections: 0, phase: Some("menggabungkan".into()),
+    });
+    Ok(Outcome::Completed)
+}
+
+/// Cari berkas hasil di folder kerja: satu-satunya `.mp4`/`.mp3` (bukan `.part`).
+fn find_produced(work: &Path, req: &VideoRequest) -> Result<Option<PathBuf>> {
+    let want_ext = match req.kind {
+        VideoKind::Video { .. } => "mp4",
+        VideoKind::AudioMp3 { .. } => "mp3",
+    };
+    let mut found = None;
+    let entries = std::fs::read_dir(work).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case(want_ext)).unwrap_or(false) {
+            found = Some(p);
+            break;
+        }
+    }
+    Ok(found)
+}
+
+/// Kill proses beserta anaknya (pohon proses) — tanpa jendela.
+fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(crate::tools::CREATE_NO_WINDOW)
+        .output();
+    #[cfg(not(windows))]
+    let _ = pid;
+}
+
+/// Job Object KILL_ON_JOB_CLOSE: proses anak dimasukkan saat spawn; drop guard =
+/// seluruh pohon dibunuh Windows (pengaman kedua di luar `taskkill`).
+/// Raw pointer → kirim Send manual: hanya dipakai untuk Terminate/Close dari thread mana pun.
+#[cfg(windows)]
+struct JobGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for JobGuard {}
+
+#[cfg(windows)]
+impl JobGuard {
+    unsafe fn assign(child: &std::process::Child) -> Result<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects as jo;
+        let handle = jo::CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if handle.is_null() {
+            return Err(AppError::internal("CreateJobObjectW gagal"));
+        }
+        let mut info: jo::JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = jo::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = jo::SetInformationJobObject(handle, jo::JobObjectExtendedLimitInformation, &info as *const _ as *const std::ffi::c_void, std::mem::size_of::<jo::JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32);
+        if ok == 0 {
+            CloseHandle(handle);
+            return Err(AppError::internal("SetInformationJobObject gagal"));
+        }
+        let proc_handle = windows_sys::Win32::System::Threading::OpenProcess(windows_sys::Win32::System::Threading::PROCESS_SET_QUOTA | windows_sys::Win32::System::Threading::PROCESS_TERMINATE, 0, child.id());
+        if proc_handle.is_null() {
+            CloseHandle(handle);
+            return Err(AppError::internal("OpenProcess gagal"));
+        }
+        let ok = jo::AssignProcessToJobObject(handle, proc_handle);
+        CloseHandle(proc_handle);
+        if ok == 0 {
+            CloseHandle(handle);
+            return Err(AppError::internal("AssignProcessToJobObject gagal"));
+        }
+        Ok(Self { handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, 1) };
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+    }
 }
 
 #[cfg(test)]

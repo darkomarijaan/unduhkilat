@@ -430,7 +430,14 @@ impl Manager {
                 return Err(AppError::new(ErrorCode::ErrAlreadyExists, "this torrent is already in the list"));
             }
         }
-        if torrent.is_none() {
+        if torrent.is_none() && super::ytdlp::parse(&req.url).is_none() {
+            // Link host video otomatis menjadi item video (DEC-015); URL `video:` lolos skema.
+            if let Some(w) = super::ytdlp::auto_wrap(&req.url) {
+                req.url = w;
+            }
+        }
+        let is_video = super::ytdlp::parse(&req.url).is_some();
+        if torrent.is_none() && !is_video {
             let parsed = url::Url::parse(&req.url).map_err(|_| AppError::new(ErrorCode::ErrInvalidUrlScheme, format!("not a valid URL: {}", req.url)))?;
             if !matches!(parsed.scheme(), "http" | "https" | "ftp") {
                 return Err(AppError::new(ErrorCode::ErrInvalidUrlScheme, format!("only http, https, ftp and magnet links are supported, got {}", parsed.scheme())));
@@ -455,7 +462,7 @@ impl Manager {
                 Some((m, _)) => Some(m.name.clone().unwrap_or_else(|| m.info_hash.clone())),
                 None => http::file_name_from_url(&req.url),
             })
-            .unwrap_or_else(|| "download".to_string());
+            .unwrap_or_else(|| if is_video { "video.mp4".into() } else { "download".to_string() });
 
         // Category routing (FR-029/030/032).
         let cats = self.db().read(repo::list_categories)?;
