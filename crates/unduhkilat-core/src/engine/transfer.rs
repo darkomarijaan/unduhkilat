@@ -255,7 +255,7 @@ async fn run_inner(ctx: &TransferCtx, id: &str, cancel: &CancellationToken, item
                         let live = workers.len() as u32;
                         let _ = ctx.events.send(EngineEvent::Progress {
                             id: id.to_string(), downloaded_bytes: bytes, total_bytes: dl.total_bytes,
-                            current_speed_bps: speed, active_connections: live,
+                            current_speed_bps: speed, active_connections: live, phase: None,
                         });
                     }
                     Err(e) => { if first_err.is_none() { first_err = Some(e); child.cancel(); } }

@@ -559,7 +559,7 @@ pub async fn run_torrent(ctx: &TransferCtx, id: &str, cancel: &CancellationToken
         let (speed, conns) = st.live.as_ref().map(|l| (l.download_speed.as_bytes(), l.snapshot.peer_stats.live as u32)).unwrap_or((0, 0));
         let total = st.total_bytes as i64;
         let done = st.progress_bytes as i64;
-        let _ = ctx.events.send(EngineEvent::Progress { id: id.to_string(), downloaded_bytes: done, total_bytes: total, current_speed_bps: speed, active_connections: conns });
+        let _ = ctx.events.send(EngineEvent::Progress { id: id.to_string(), downloaded_bytes: done, total_bytes: total, current_speed_bps: speed, active_connections: conns, phase: None });
         if st.finished {
             let (id2, d) = (id.to_string(), total);
             ctx.db.write(move |c| repo::set_downloaded_bytes(c, &id2, d)).await?;

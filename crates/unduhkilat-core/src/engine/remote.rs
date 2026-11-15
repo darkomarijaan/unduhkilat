@@ -267,7 +267,7 @@ impl Meter {
         if self.last_emit.elapsed() >= Duration::from_millis(250) {
             let dt = self.last_emit.elapsed().as_secs_f64().max(0.001);
             let speed = ((bytes - self.last_bytes).max(0) as f64 / dt) as u64;
-            let _ = ctx.events.send(EngineEvent::Progress { id: id.to_string(), downloaded_bytes: bytes, total_bytes: total, current_speed_bps: speed, active_connections: 1 });
+            let _ = ctx.events.send(EngineEvent::Progress { id: id.to_string(), downloaded_bytes: bytes, total_bytes: total, current_speed_bps: speed, active_connections: 1, phase: None });
             self.last_emit = Instant::now();
             self.last_bytes = bytes;
         }

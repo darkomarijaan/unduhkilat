@@ -27,6 +27,8 @@ pub enum EngineEvent {
         total_bytes: i64,
         current_speed_bps: u64,
         active_connections: u32,
+        /// Fase khusus unduhan video, mis. `Some("menggabungkan")`; `None` untuk unduhan biasa.
+        phase: Option<String>,
     },
     StateChanged {
         id: String,
