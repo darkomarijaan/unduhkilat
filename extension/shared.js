@@ -178,7 +178,35 @@
     return exts.some((e) => list.includes(e));
   }
 
-  const api = { parseSkipList, shouldSkipCapture, RANGE_PARAMS, FRESH_WINDOW_MS, isFreshDownload, isHttp, normalizeUrl, classify, isMediaResponse, isTinyMedia, headerMap, sizeFromHeaders, cookieHeader, baseName, fileNameFromUrl, mergeCandidate };
+  // ---- DEC-015: situs video (yt-dlp) ------------------------------------------------------
+  // Kembar dengan crates/unduhkilat-core/src/engine/ytdlp.rs (is_video_host); ubah keduanya bersamaan.
+  const VIDEO_HOSTS = ['youtube.com', 'youtu.be', 'instagram.com', 'facebook.com', 'fb.watch',
+    'tiktok.com', 'x.com', 'twitter.com', 'vimeo.com', 'dailymotion.com', 'twitch.tv'];
+
+  function isVideoHost(url) {
+    let host;
+    try { host = new URL(url).hostname.toLowerCase(); } catch (e) { return false; }
+    if (host.startsWith('www.')) host = host.slice(4);
+    return VIDEO_HOSTS.some((h) => host === h || host.endsWith('.' + h));
+  }
+
+  /**
+   * Di host video, potongan stream (googlevideo.com dll.) selalu gagal diambil ulang di luar
+   * browser: sembunyikan, dan tawarkan SATU kandidat yang mengirim URL halaman ke aplikasi
+   * (yt-dlp yang mengunduh). Host lain tidak diubah.
+   */
+  function candidatesForPage(list, pageUrl) {
+    if (!isVideoHost(pageUrl)) return list;
+    const kept = list.filter((c) => c.kind === 'page' || !/(^|\.)googlevideo\.com$/i.test(hostOf(c.url)));
+    const others = kept.filter((c) => c.kind !== 'page');
+    return [{ key: 'page:' + pageUrl, url: pageUrl, mime: '', size: null, sources: ['page'], kind: 'page', label: 'Video halaman ini' }, ...others];
+  }
+
+  function hostOf(u) {
+    try { return new URL(u).hostname; } catch (e) { return ''; }
+  }
+
+  const api = { parseSkipList, shouldSkipCapture, RANGE_PARAMS, FRESH_WINDOW_MS, isFreshDownload, isHttp, normalizeUrl, classify, isMediaResponse, isTinyMedia, headerMap, sizeFromHeaders, cookieHeader, baseName, fileNameFromUrl, mergeCandidate, isVideoHost, candidatesForPage };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.UK = api;
 })(typeof self !== 'undefined' ? self : globalThis);

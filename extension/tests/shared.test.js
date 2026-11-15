@@ -108,3 +108,36 @@ test('shouldSkipCapture keeps capturing other types and with an empty list', () 
   assert.ok(!UK.shouldSkipCapture(['pdf'], '', 'https://a.test/pdf', ''));
   assert.ok(!UK.shouldSkipCapture(['pdf'], '.pdf', 'https://a.test/x', ''));
 });
+
+// ---- DEC-015: host video — kandidat "Video halaman ini" ---------------------------------------
+
+test('isVideoHost matches known hosts and subdomains, rejects lookalikes', () => {
+  for (const u of ['https://www.youtube.com/watch?v=1', 'https://m.youtube.com/watch?v=1', 'https://music.youtube.com/watch?v=1',
+    'https://youtu.be/abc', 'https://www.instagram.com/reel/1/', 'https://fb.watch/x/', 'https://x.com/u/status/1', 'https://www.tiktok.com/@u/video/1']) {
+    assert.equal(UK.isVideoHost(u), true, u);
+  }
+  for (const u of ['https://notyoutube.com/watch', 'https://evil.com/?u=youtube.com', 'not a url', '']) {
+    assert.equal(UK.isVideoHost(u), false, u);
+  }
+});
+
+test('candidatesForPage hides googlevideo chunks and adds one page candidate on a video host', () => {
+  const page = 'https://www.youtube.com/watch?v=DjJbAHis1uQ';
+  const list = [
+    { key: 'a', url: 'https://rr1---sn-x.googlevideo.com/videoplayback?itag=137', kind: 'file', label: 'MP4' },
+    { key: 'b', url: 'https://rr1---sn-x.googlevideo.com/videoplayback?itag=140', kind: 'file', label: 'M4A' },
+  ];
+  const out = UK.candidatesForPage(list, page);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].kind, 'page');
+  assert.equal(out[0].url, page);
+  assert.equal(out[0].label, 'Video halaman ini');
+  // Not added twice when the panel asks again.
+  assert.equal(UK.candidatesForPage(out, page).length, 1);
+});
+
+test('candidatesForPage leaves other hosts untouched', () => {
+  const list = [{ key: 'a', url: 'https://cdn.test/v.mp4', kind: 'file', label: 'MP4' }];
+  assert.deepEqual(UK.candidatesForPage(list, 'https://example.com/page'), list);
+  assert.deepEqual(UK.candidatesForPage(list, ''), list);
+});

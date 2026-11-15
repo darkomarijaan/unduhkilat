@@ -215,9 +215,15 @@ function candidatesFor(tabId) {
   return m;
 }
 
+/** URL halaman tiap tab (DEC-015: di host video, kandidat diganti "Video halaman ini"). */
+const tabPageUrl = new Map();
+
+function pageCandidates(tabId) {
+  return UK.candidatesForPage([...candidatesFor(tabId).values()], tabPageUrl.get(tabId) || '');
+}
+
 function publish(tabId) {
-  const list = [...candidatesFor(tabId).values()];
-  chrome.tabs.sendMessage(tabId, { type: 'candidates', list }).catch(() => {});
+  chrome.tabs.sendMessage(tabId, { type: 'candidates', list: pageCandidates(tabId) }).catch(() => {});
 }
 
 function onHeaders(d) {
@@ -236,12 +242,24 @@ function onHeaders(d) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab ? sender.tab.id : msg.tabId;
+  if (sender.tab && sender.tab.url) tabPageUrl.set(tabId, sender.tab.url);
   if (msg.type === 'dom-media' && tabId != null) {
     for (const it of msg.items || []) UK.mergeCandidate(candidatesFor(tabId), { url: it.url, mime: it.mime, size: null, sources: ['page'] });
     publish(tabId);
     sendResponse({ ok: true });
   } else if (msg.type === 'get-candidates') {
-    sendResponse({ list: [...candidatesFor(tabId).values()], connected });
+    sendResponse({ list: pageCandidates(tabId), connected });
+  } else if (msg.type === 'send-media' && msg.kind === 'page') {
+    // DEC-015: kirim URL HALAMAN; aplikasi mengunduhnya lewat yt-dlp (alur usulan yang sama).
+    (async () => {
+      try {
+        await handOver('media.send_to_app', { url: msg.url, mime_type: '', file_name: '', total_bytes: null, referer: '', user_agent: navigator.userAgent, cookies: '' });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.code === 'ERR_NATIVE_HOST_NOT_FOUND' ? 'UnduhKilat tidak aktif. Jalankan aplikasi portabel.' : e.message || String(e.code) });
+      }
+    })();
+    return true; // async response
   } else if (msg.type === 'send-media') {
     (async () => {
       const key = UK.normalizeUrl(msg.url);
