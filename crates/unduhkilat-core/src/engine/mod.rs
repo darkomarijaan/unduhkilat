@@ -12,6 +12,7 @@ pub mod segments;
 pub mod throttle;
 pub mod torrent;
 pub mod transfer;
+pub mod ytdlp;
 
 use crate::models::DownloadState;
 use serde::Serialize;
