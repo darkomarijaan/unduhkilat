@@ -22,6 +22,7 @@ pub mod protocol;
 pub mod repo;
 pub mod server;
 pub mod term;
+pub mod tools;
 pub mod update;
 
 pub use error::{AppError, ErrorCode, Result};
