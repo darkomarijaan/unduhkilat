@@ -86,9 +86,58 @@ pub struct ProgressSample {
     pub speed: u64,
 }
 
+/// Nama berkas hasil di folder kerja, tanpa ekstensi (`-o out.%(ext)s`).
+const STUB_NAME: &str = "out";
+
+/// Nama sementara item video yang belum punya judul: unik, agar beberapa link tanpa
+/// nama ke folder yang sama tidak saling bertabrakan. Diganti judul saat unduhan berjalan.
+pub fn placeholder_name(kind: &VideoKind) -> String {
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    match kind {
+        VideoKind::Video { .. } => format!("video-{tag}.mp4"),
+        VideoKind::AudioMp3 { .. } => format!("audio-{tag}.mp3"),
+    }
+}
+
+/// `true` untuk nama sementara (bentuk lama `video.mp4`/`audio.mp3` atau [`placeholder_name`]).
+pub fn is_placeholder_name(name: &str) -> bool {
+    if name == "video.mp4" || name == "audio.mp3" {
+        return true;
+    }
+    let tagged = |prefix: &str, ext: &str| {
+        name.strip_prefix(prefix).and_then(|r| r.strip_suffix(ext)).is_some_and(|t| t.len() == 8 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    tagged("video-", ".mp4") || tagged("audio-", ".mp3")
+}
+
+/// Nilai `--proxy` dari setelan proxy aplikasi: Direct = `""` (paksa langsung, abaikan proxy
+/// Windows), System = tidak diberikan (yt-dlp memakai proxy sistem), Manual = proxy itu sendiri
+/// (HTTP maupun SOCKS) — tidak pernah diam-diam lewat jalur langsung.
+pub fn proxy_arg(p: &crate::engine::proxy::ProxyConfig) -> Option<String> {
+    use crate::engine::proxy::{split_scheme, ProxyMode};
+    match p.mode {
+        ProxyMode::Direct => Some(String::new()),
+        ProxyMode::System => None,
+        ProxyMode::Manual => {
+            let (scheme, host) = split_scheme(&p.host);
+            let enc = |s: &str| -> String {
+                s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+            };
+            let auth = match (&p.username, &p.password) {
+                (Some(u), Some(pw)) => format!("{}:{}@", enc(u), enc(pw)),
+                (Some(u), None) => format!("{}@", enc(u)),
+                _ => String::new(),
+            };
+            Some(format!("{scheme}://{auth}{host}:{}", p.port))
+        }
+    }
+}
+
 /// Susun argumen `yt-dlp` untuk satu unduhan video/audio. `out_stub` adalah jalur
-/// hasil TANPA ekstensi (yt-dlp menambahkan `.mp4`/`.mp3` sendiri).
-pub fn build_download_args(req: &VideoRequest, out_stub: &Path, ffmpeg_dir: &Path, proxy: Option<&str>, limit_kbps: u32) -> Vec<String> {
+/// hasil TANPA ekstensi (yt-dlp menambahkan `.mp4`/`.mp3` sendiri). Tanpa ffmpeg,
+/// video diambil sebagai SATU berkas jadi (tanpa penggabungan yang akan meninggalkan
+/// video tanpa suara). URL selalu paling akhir, setelah `--`.
+pub fn build_download_args(req: &VideoRequest, out_stub: &Path, ffmpeg_dir: &Path, has_ffmpeg: bool, proxy: Option<&str>, limit_kbps: u32) -> Vec<String> {
     let mut a = vec![
         "--newline".into(),
         "--progress-template".into(),
@@ -105,12 +154,16 @@ pub fn build_download_args(req: &VideoRequest, out_stub: &Path, ffmpeg_dir: &Pat
     ];
     match &req.kind {
         VideoKind::Video { max_height } => {
-            // MP4: utamakan H.264 + AAC; kalau resolusi itu hanya ada VP9/AV1, tetap digabung ke MP4.
             let cap = max_height.map(|h| format!("[height<={h}]")).unwrap_or_default();
             a.push("-f".into());
-            a.push(format!("bv*{cap}[vcodec^=avc1]+ba[acodec^=mp4a]/bv*{cap}+ba/b"));
-            a.push("--merge-output-format".into());
-            a.push("mp4".into());
+            if has_ffmpeg {
+                // MP4: utamakan H.264 + AAC; kalau resolusi itu hanya ada VP9/AV1, tetap digabung ke MP4.
+                a.push(format!("bv*{cap}[vcodec^=avc1]+ba[acodec^=mp4a]/bv*{cap}+ba/b"));
+                a.push("--merge-output-format".into());
+                a.push("mp4".into());
+            } else {
+                a.push(format!("b{cap}[ext=mp4]/b{cap}/b"));
+            }
         }
         VideoKind::AudioMp3 { kbps } => {
             a.push("-x".into());
@@ -128,6 +181,8 @@ pub fn build_download_args(req: &VideoRequest, out_stub: &Path, ffmpeg_dir: &Pat
         a.push("--limit-rate".into());
         a.push(format!("{limit_kbps}K"));
     }
+    a.push("--".into());
+    a.push(req.url.clone());
     a
 }
 
@@ -214,9 +269,32 @@ fn with_exe(exe: &Path, args: Vec<String>) -> Vec<String> {
     v
 }
 
-/// Jalankan `yt-dlp -J --no-playlist` dan urai JSON-nya.
-pub async fn probe_metadata(exe: &Path, url: &str) -> Result<VideoMeta> {
-    let args: [String; 4] = [exe.to_string_lossy().into_owned(), "-J".into(), "--no-playlist".into(), url.into()];
+/// Kegagalan yt-dlp sebelum dipetakan: teks mentahnya dipakai untuk mengenali versi usang.
+struct RawFailure(String);
+
+impl RawFailure {
+    fn into_error(self) -> AppError {
+        map_error(&self.0)
+    }
+}
+
+/// Jalankan `yt-dlp -J --no-playlist` dan urai JSON-nya. `proxy` mengikuti [`proxy_arg`].
+pub async fn probe_metadata(exe: &Path, url: &str, proxy: Option<&str>) -> Result<VideoMeta> {
+    probe_raw(exe, url, proxy).await.map_err(|e| match e {
+        Ok(raw) => raw.into_error(),
+        Err(app) => app,
+    })
+}
+
+/// `Err(Ok(raw))` = yt-dlp gagal (teks mentah); `Err(Err(e))` = gagal menjalankan/mengurai.
+async fn probe_raw(exe: &Path, url: &str, proxy: Option<&str>) -> std::result::Result<VideoMeta, std::result::Result<RawFailure, AppError>> {
+    let mut args = vec![exe.to_string_lossy().into_owned(), "-J".into(), "--no-playlist".into()];
+    if let Some(p) = proxy {
+        args.push("--proxy".into());
+        args.push(p.into());
+    }
+    args.push("--".into());
+    args.push(url.into());
     let out = tokio::task::spawn_blocking(move || {
         let mut c = std::process::Command::new(&args[0]);
         c.args(&args[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
@@ -225,13 +303,13 @@ pub async fn probe_metadata(exe: &Path, url: &str) -> Result<VideoMeta> {
         c.output()
     })
     .await
-    .map_err(|e| AppError::internal(e.to_string()))?
-    .map_err(|e| AppError::new(ErrorCode::ErrVideoToolsMissing, format!("cannot run yt-dlp: {e}")))?;
+    .map_err(|e| Err(AppError::internal(e.to_string())))?
+    .map_err(|e| Err(AppError::new(ErrorCode::ErrVideoToolsMissing, format!("cannot run yt-dlp: {e}"))))?;
     if !out.status.success() {
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        return Err(map_error(&text));
+        return Err(Ok(RawFailure(text)));
     }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| AppError::new(ErrorCode::ErrMediaParseFailed, format!("metadata bukan JSON: {e}")))?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| Err(AppError::new(ErrorCode::ErrMediaParseFailed, format!("metadata bukan JSON: {e}"))))?;
     let title = v["title"].as_str().unwrap_or("video").to_string();
     let duration = v["duration"].as_i64();
     let mut heights: Vec<u32> = v["formats"].as_array().map(|fs| fs.iter().filter_map(|f| f["height"].as_u64()).map(|h| h as u32).collect()).unwrap_or_default();
@@ -258,19 +336,36 @@ pub async fn run_video(ctx: &TransferCtx, id: &str, req: &VideoRequest, cancel: 
         (a, 0) => a,
         (a, b) => a.min(b),
     };
-    let proxy = crate::engine::torrent::socks_url(&ctx.proxy()).ok().flatten();
+    let proxy = proxy_arg(&ctx.proxy());
+    let has_ffmpeg = tools_dir.join("ffmpeg.exe").exists();
+    if matches!(req.kind, VideoKind::AudioMp3 { .. }) && !has_ffmpeg {
+        // Konversi MP3 butuh ffmpeg; jangan biarkan yt-dlp menyimpan berkas audio lain diam-diam.
+        return Err(AppError::new(ErrorCode::ErrVideoToolsMissing, "ffmpeg belum terpasang; MP3 butuh ffmpeg"));
+    }
 
-    // 3. Metadata untuk nama akhir (judul), lalu nama akhir dan cek tabrakan.
+    // 3. Metadata untuk nama akhir (judul). Versi usang (mis. cek bot) → perbarui sekali, ulang.
     let target0 = PathBuf::from(&dl.target_path);
     let out_dir = target0.parent().ok_or_else(|| AppError::new(ErrorCode::ErrInvalidPath, "target has no parent"))?.to_path_buf();
     std::fs::create_dir_all(&out_dir).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
-    let meta = match probe_metadata(&exe, &req.url).await {
-        Ok(m) => Some(m),
-        Err(e) if matches!(e.code, ErrorCode::ErrVideoLoginRequired) => return Err(e),
-        Err(e) if e.message.contains("tidak tersedia") => return Err(e),
-        Err(_) => None, // metadata gagal: lanjut tanpa judul (nama dari DB)
+    let mut stale_retried = false;
+    let meta = loop {
+        match probe_raw(&exe, &req.url, proxy.as_deref()).await {
+            Ok(m) => break Some(m),
+            Err(Ok(raw)) if is_stale_error(&raw.0) && !stale_retried => {
+                stale_retried = true;
+                let _ = crate::tools::maybe_auto_update(&ctx.db, &ctx.client(), &tools_dir, true).await;
+            }
+            Err(Ok(raw)) => {
+                let e = raw.into_error();
+                if e.code == ErrorCode::ErrVideoLoginRequired || e.message.contains("tidak tersedia") {
+                    return Err(e);
+                }
+                break None; // metadata gagal: lanjut tanpa judul (nama dari DB)
+            }
+            Err(Err(_)) => break None,
+        }
     };
-    let placeholder = dl.file_name == "video.mp4" || dl.file_name == "audio.mp3";
+    let placeholder = is_placeholder_name(&dl.file_name);
     let final_name = if placeholder {
         let title = meta.as_ref().map(|m| m.title.as_str()).unwrap_or("video");
         final_name(title, &req.kind)
@@ -285,28 +380,46 @@ pub async fn run_video(ctx: &TransferCtx, id: &str, req: &VideoRequest, cancel: 
     // 4. Folder kerja tersembunyi + stub output.
     let work = out_dir.join(format!(".uk-video-{id}"));
     std::fs::create_dir_all(&work).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
-    let stub = work.join("out");
+    let stub = work.join(STUB_NAME);
 
-    // 5. Jalankan dengan satu kali ulang bila error menandai versi usang.
-    let mut stale_retried = false;
+    // 5. Jalankan dengan satu kali ulang bila keluaran mentah menandai versi usang
+    //    (dicek SEBELUM pemetaan: "Sign in to confirm you're not a bot" juga tampak seperti login).
     let result = loop {
-        let r = run_once(ctx, id, req, &exe, &stub, proxy.as_deref(), limit, &work, &final_path, cancel).await;
-        match &r {
-            Err(e) if e.code == ErrorCode::ErrVideoExtractFailed && is_stale_error(&e.message) && !stale_retried => {
+        match run_once(ctx, id, req, &exe, &stub, has_ffmpeg, proxy.as_deref(), limit, &work, &final_path, cancel).await {
+            Ok(Err(raw)) if is_stale_error(&raw.0) && !stale_retried => {
                 stale_retried = true; // jaring pengaman: perbarui yt-dlp sekali, lalu ulang
                 let _ = crate::tools::maybe_auto_update(&ctx.db, &ctx.client(), &tools_dir, true).await;
             }
-            _ => break r,
+            Ok(Err(raw)) => break Err(raw.into_error()),
+            Ok(Ok(o)) => break Ok(o),
+            Err(e) => break Err(e),
         }
     };
 
-    // 6. Beres-beres: folder kerja dihapus apa pun hasilnya.
-    std::fs::remove_dir_all(&work).ok();
+    // 6. Beres-beres. Berhenti (jeda/batal/ulang) menyimpan folder kerja: `.part` di dalamnya
+    //    dilanjutkan yt-dlp (`--continue`) saat item dijalankan lagi. Batal dan ulang
+    //    membersihkannya lewat manager ([`discard_work`]).
+    if !matches!(result, Ok(Outcome::Stopped)) {
+        std::fs::remove_dir_all(&work).ok();
+    }
     result
 }
 
+/// Folder kerja item video (`<folder tujuan>/.uk-video-<id>`).
+pub fn work_dir(target_path: &Path, id: &str) -> Option<PathBuf> {
+    target_path.parent().map(|d| d.join(format!(".uk-video-{id}")))
+}
+
+/// Buang sisa unduhan video yang dihentikan (dipakai saat batal dan ulang dari awal).
+pub fn discard_work(target_path: &Path, id: &str) {
+    if let Some(w) = work_dir(target_path, id) {
+        std::fs::remove_dir_all(w).ok();
+    }
+}
+
 /// Satu eksekusi yt-dlp: spawn dalam Job Object (KILL_ON_JOB_CLOSE), progres per baris,
-/// hasil dipindah ke nama akhir.
+/// hasil dipindah ke nama akhir. `Ok(Err(raw))` = yt-dlp gagal; teks mentahnya dikembalikan
+/// supaya penelepon bisa mengenali versi usang sebelum memetakannya ke kode error.
 #[allow(clippy::too_many_arguments)]
 async fn run_once(
     ctx: &TransferCtx,
@@ -314,13 +427,14 @@ async fn run_once(
     req: &VideoRequest,
     exe: &Path,
     stub: &Path,
+    has_ffmpeg: bool,
     proxy: Option<&str>,
     limit: u32,
     work: &Path,
     final_path: &Path,
     cancel: &CancellationToken,
-) -> Result<Outcome> {
-    let args = with_exe(exe, build_download_args(req, stub, ctx.cfg.tools_dir.as_deref().unwrap_or(work), proxy, limit));
+) -> Result<std::result::Result<Outcome, RawFailure>> {
+    let args = with_exe(exe, build_download_args(req, stub, ctx.cfg.tools_dir.as_deref().unwrap_or(work), has_ffmpeg, proxy, limit));
     let mut child = spawn(&args, work)?;
     let pid = child.id();
 
@@ -394,12 +508,12 @@ async fn run_once(
     let _ = reader.await;
     let err_text = err_task.await.unwrap_or_default();
     if cancelled {
-        return Ok(Outcome::Stopped);
+        return Ok(Ok(Outcome::Stopped));
     }
 
     // Proses selesai normal: exit sukses DAN berkas hasil ada (bukan sukses diam).
     if !status.is_some_and(|s| s.success()) {
-        return Err(map_error(&err_text));
+        return Ok(Err(RawFailure(err_text)));
     }
     let produced = find_produced(work, req)?;
     let Some(produced) = produced else {
@@ -420,25 +534,18 @@ async fn run_once(
         id: id.to_string(), downloaded_bytes: size, total_bytes: size,
         current_speed_bps: 0, active_connections: 0, phase: Some("menggabungkan".into()),
     });
-    Ok(Outcome::Completed)
+    Ok(Ok(Outcome::Completed))
 }
 
-/// Cari berkas hasil di folder kerja: satu-satunya `.mp4`/`.mp3` (bukan `.part`).
+/// Cari berkas hasil di folder kerja: tepat `out.mp4`/`out.mp3`. Potongan format yang belum
+/// digabung (`out.f137.mp4`) dan `.part` bukan hasil — menerimanya berarti video tanpa suara.
 fn find_produced(work: &Path, req: &VideoRequest) -> Result<Option<PathBuf>> {
-    let want_ext = match req.kind {
-        VideoKind::Video { .. } => "mp4",
-        VideoKind::AudioMp3 { .. } => "mp3",
+    let want = match req.kind {
+        VideoKind::Video { .. } => format!("{STUB_NAME}.mp4"),
+        VideoKind::AudioMp3 { .. } => format!("{STUB_NAME}.mp3"),
     };
-    let mut found = None;
     let entries = std::fs::read_dir(work).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case(want_ext)).unwrap_or(false) {
-            found = Some(p);
-            break;
-        }
-    }
-    Ok(found)
+    Ok(entries.flatten().map(|e| e.path()).find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(&want))))
 }
 
 /// Kill proses beserta anaknya (pohon proses) — tanpa jendela.
@@ -507,9 +614,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn args_end_with_the_video_url() {
+        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: None } };
+        let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), true, None, 0);
+        assert_eq!(&a[a.len() - 2..], ["--".to_string(), "https://youtu.be/1".to_string()]);
+    }
+
+    #[test]
+    fn args_without_ffmpeg_pick_a_single_file_format() {
+        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: Some(720) } };
+        let s = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), false, None, 0).join(" ");
+        assert!(s.contains("-f b[height<=720][ext=mp4]/b[height<=720]/b"), "{s}");
+        assert!(!s.contains("merge-output-format") && !s.contains("+ba"), "{s}");
+    }
+
+    #[test]
+    fn proxy_arg_follows_the_proxy_mode() {
+        use crate::engine::proxy::{ProxyConfig, ProxyMode};
+        assert_eq!(proxy_arg(&ProxyConfig { mode: ProxyMode::Direct, ..Default::default() }).as_deref(), Some(""));
+        assert_eq!(proxy_arg(&ProxyConfig { mode: ProxyMode::System, ..Default::default() }), None);
+        let http = ProxyConfig { mode: ProxyMode::Manual, host: "10.0.0.1".into(), port: 8080, ..Default::default() };
+        assert_eq!(proxy_arg(&http).as_deref(), Some("http://10.0.0.1:8080"));
+        let socks = ProxyConfig {
+            mode: ProxyMode::Manual, host: "socks5://h".into(), port: 1080,
+            username: Some("u".into()), password: Some(zeroize::Zeroizing::new("p:w".into())),
+        };
+        assert_eq!(proxy_arg(&socks).as_deref(), Some("socks5://u:p%3Aw@h:1080"));
+    }
+
+    #[test]
+    fn placeholder_names_are_unique_and_recognised() {
+        let a = placeholder_name(&VideoKind::Video { max_height: None });
+        let b = placeholder_name(&VideoKind::Video { max_height: None });
+        assert_ne!(a, b);
+        assert!(a.starts_with("video-") && a.ends_with(".mp4"), "{a}");
+        assert!(placeholder_name(&VideoKind::AudioMp3 { kbps: 192 }).ends_with(".mp3"));
+        for n in [a.as_str(), "video.mp4", "audio.mp3"] {
+            assert!(is_placeholder_name(n), "{n}");
+        }
+        for n in ["Judul Video.mp4", "video-nothex1.mp4", "video.mkv", "my-video.mp4"] {
+            assert!(!is_placeholder_name(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn find_produced_skips_unmerged_format_parts() {
+        let dir = std::env::temp_dir().join(format!("uk-produced-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let req = VideoRequest { url: "u".into(), kind: VideoKind::Video { max_height: None } };
+        std::fs::write(dir.join("out.f137.mp4"), b"video only").unwrap();
+        std::fs::write(dir.join("out.mp4.part"), b"partial").unwrap();
+        assert_eq!(find_produced(&dir, &req).unwrap(), None);
+        std::fs::write(dir.join("out.mp4"), b"merged").unwrap();
+        assert_eq!(find_produced(&dir, &req).unwrap(), Some(dir.join("out.mp4")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn args_video_caps_height_and_merges_mp4() {
         let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: Some(720) } };
-        let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), None, 0);
+        let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), true, None, 0);
         let s = a.join(" ");
         assert!(s.contains("-f bv*[height<=720]"), "{s}");
         assert!(s.contains("vcodec^=avc1"), "{s}");
@@ -524,7 +688,7 @@ mod tests {
     #[test]
     fn args_audio_uses_mp3_kbps() {
         let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::AudioMp3 { kbps: 192 } };
-        let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), None, 0);
+        let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), true, None, 0);
         let s = a.join(" ");
         assert!(s.contains("-x --audio-format mp3 --audio-quality 192K"), "{s}");
         assert!(!s.contains("merge-output-format"), "{s}");
@@ -533,7 +697,7 @@ mod tests {
     #[test]
     fn args_limit_rate_and_proxy_when_set() {
         let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: None } };
-        let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), Some("socks5://10.0.0.1:1080"), 500);
+        let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), true, Some("socks5://10.0.0.1:1080"), 500);
         let s = a.join(" ");
         assert!(s.contains("--proxy socks5://10.0.0.1:1080"), "{s}");
         assert!(s.contains("--limit-rate 500K"), "{s}");

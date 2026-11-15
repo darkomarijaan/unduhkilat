@@ -12,7 +12,7 @@ use crate::models::{Download, DownloadState};
 use crate::repo;
 use futures_util::future::BoxFuture;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -461,13 +461,23 @@ impl Manager {
             .or_else(|| match &torrent {
                 Some((m, _)) => Some(m.name.clone().unwrap_or_else(|| m.info_hash.clone())),
                 // Video: nama dari URL halaman tidak berarti; placeholder diganti judul saat jalan.
-                None if is_video => Some(match super::ytdlp::parse(&req.url).map(|v| v.kind) {
-                    Some(super::ytdlp::VideoKind::AudioMp3 { .. }) => "audio.mp3".into(),
-                    _ => "video.mp4".into(),
-                }),
+                None if is_video => None,
                 None => http::file_name_from_url(&req.url),
             })
             .unwrap_or_else(|| "download".to_string());
+        // Video tanpa nama pilihan pengguna (kosong atau placeholder): nama sementara UNIK,
+        // supaya beberapa link tanpa nama ke folder yang sama tidak saling menolak.
+        let video_kind = super::ytdlp::parse(&req.url).map(|v| v.kind);
+        let file_name = match &video_kind {
+            Some(k) if file_name == "download" || super::ytdlp::is_placeholder_name(&file_name) => super::ytdlp::placeholder_name(k),
+            _ => file_name,
+        };
+        if let (Some(k), Some(p)) = (&video_kind, req.target_path.as_mut()) {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if super::ytdlp::is_placeholder_name(&name) {
+                p.set_file_name(super::ytdlp::placeholder_name(k));
+            }
+        }
 
         // Category routing (FR-029/030/032).
         let cats = self.db().read(repo::list_categories)?;
@@ -935,6 +945,13 @@ impl Manager {
             self.db().write(move |c| Ok(c.execute("UPDATE torrents SET started=0, uploaded_bytes=0, seed_state='none' WHERE download_id=?1", [&id3]).map(|_| ())?)).await?;
             return Ok(());
         }
+        if super::ytdlp::parse(&dl.original_url).is_some() {
+            // Video: hanya sisa unduhan di folder kerja yang dibuang. `target_path` bisa berupa
+            // hasil jadi (nama judul) — tidak pernah dikosongkan; run berikutnya menolak dengan
+            // ERR_NAME_COLLISION bila hasil itu masih ada.
+            super::ytdlp::discard_work(Path::new(&dl.target_path), id);
+            return Ok(());
+        }
         // The segment plan is gone, so the next run re-probes and re-allocates. For an upload
         // `target_path` is the user's own file: it is never touched.
         let path = PathBuf::from(&dl.target_path);
@@ -963,6 +980,9 @@ impl Manager {
         // (UI, tests, a crash-restart) must never find the file still on disk.
         if torrent::is_magnet(&dl.original_url) {
             self.inner.ctx.torrent.forget(id, delete_file).await?;
+        } else if super::ytdlp::parse(&dl.original_url).is_some() {
+            // Video yang dibatalkan belum punya hasil jadi; sisa `.part` di folder kerja dibuang.
+            super::ytdlp::discard_work(Path::new(&dl.target_path), id);
         } else if delete_file && !super::remote::leaves_local_files_alone(&dl.original_url) {
             // For an upload `target_path` is the user's own source file: it is never deleted.
             let _ = std::fs::remove_file(&dl.target_path);

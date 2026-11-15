@@ -372,8 +372,10 @@ impl App {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let exe = tools.join("yt-dlp.exe");
         let url = url.to_string();
+        // Periksa memakai proxy yang sama dengan unduhan (FR-015).
+        let proxy = unduhkilat_core::engine::ytdlp::proxy_arg(&self.manager.proxy_config());
         self.rt.spawn(async move {
-            let r = unduhkilat_core::engine::ytdlp::probe_metadata(&exe, &url).await.map_err(|e| format!("{}: {}", e.code, e.message));
+            let r = unduhkilat_core::engine::ytdlp::probe_metadata(&exe, &url, proxy.as_deref()).await.map_err(|e| format!("{}: {}", e.code, e.message));
             let _ = tx.send(Msg::VideoProbe(r));
             ctx.request_repaint();
         });
@@ -385,7 +387,7 @@ impl App {
         dir.join("yt-dlp.exe").exists().then_some(dir)
     }
 
-    /// DEC-015: tawarkan pengunduhan komponen video (~90 MB) lalu pasang.
+    /// DEC-015: tawarkan pengunduhan komponen video (±180 MB) lalu pasang.
     fn install_video_tools(&mut self) {
         let (tx, ctx, client) = (self.tx.clone(), self.ctx.clone(), self.manager.client());
         let dir = self.paths.data_dir.join("tools");
@@ -1742,7 +1744,7 @@ impl App {
                     });
                     if !tools_ready {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Komponen video (yt-dlp + ffmpeg, ±90 MB) belum terpasang.").color(FG_SECONDARY));
+                            ui.label(RichText::new("Komponen video (yt-dlp + ffmpeg, ±180 MB unduhan) belum terpasang.").color(FG_SECONDARY));
                             let busy = a.tools_note.as_ref().is_some_and(|n| n.starts_with("Mengunduh"));
                             if ui.add_enabled(!busy, egui::Button::new("Unduh komponen")).clicked() {
                                 want_tools = true;
@@ -1916,12 +1918,11 @@ impl App {
                     }
                     _ => url,
                 };
+                // Video tanpa nama: engine memberi nama sementara unik lalu menggantinya dengan judul.
+                let name = (single && !a.file_name.trim().is_empty()).then(|| a.file_name.trim().to_string());
                 let is_video = unduhkilat_core::engine::ytdlp::parse(&url).is_some();
-                let name = (single && !a.file_name.trim().is_empty()).then(|| a.file_name.trim().to_string())
-                    // Video tanpa nama: placeholder, nanti diganti judul oleh engine.
-                    .or_else(|| is_video.then(|| if a.video.as_ref().is_some_and(|v| v.is_audio) { "audio.mp3".to_string() } else { "video.mp4".to_string() }));
                 let target = (!a.destination.trim().is_empty()).then(|| {
-                    let n = name.clone().or_else(|| http::file_name_from_url(&url)).unwrap_or_else(|| "download".into());
+                    let n = name.clone().or_else(|| if is_video { Some("video.mp4".into()) } else { http::file_name_from_url(&url) }).unwrap_or_else(|| "download".into());
                     std::path::PathBuf::from(a.destination.trim()).join(n)
                 });
                 let req = NewDownload {
@@ -2149,7 +2150,7 @@ impl App {
                             ui.label(RichText::new(dir.display().to_string()).font(theme::mono(12.0)));
                             ui.end_row();
                         });
-                        if ui.button(if y { "Perbarui komponen video" } else { "Unduh komponen video (±90 MB)" }).clicked() {
+                        if ui.button(if y { "Perbarui komponen video" } else { "Unduh komponen video (±180 MB)" }).clicked() {
                             video_update_now = true;
                         }
                         if let Some(n) = &s.video_note {
