@@ -216,7 +216,7 @@ fn with_exe(exe: &Path, args: Vec<String>) -> Vec<String> {
 
 /// Jalankan `yt-dlp -J --no-playlist` dan urai JSON-nya.
 pub async fn probe_metadata(exe: &Path, url: &str) -> Result<VideoMeta> {
-    let args = vec![exe.to_string_lossy().into_owned(), "-J".into(), "--no-playlist".into(), url.into()];
+    let args: [String; 4] = [exe.to_string_lossy().into_owned(), "-J".into(), "--no-playlist".into(), url.into()];
     let out = tokio::task::spawn_blocking(move || {
         let mut c = std::process::Command::new(&args[0]);
         c.args(&args[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());

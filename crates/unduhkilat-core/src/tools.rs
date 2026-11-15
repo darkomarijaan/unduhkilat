@@ -120,7 +120,7 @@ async fn run_version(exe: &Path, clean: impl Fn(&str) -> String) -> Option<Strin
         .output()
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
-    s.lines().next().map(|l| clean(l)).filter(|l| !l.trim().is_empty())
+    s.lines().next().map(clean).filter(|l| !l.trim().is_empty())
 }
 
 /// `CREATE_NO_WINDOW`: tidak ada jendela konsol hitam saat komponen dijalankan.
