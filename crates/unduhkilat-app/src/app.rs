@@ -114,6 +114,9 @@ struct AddDialog {
     forced_video: bool,
     /// Periksa HTTP menemukan halaman HTML: tawarkan "Coba sebagai video".
     offer_video: bool,
+    /// Judul dan durasi (detik) dari Periksa video; dipakai untuk nama berkas dan batas potong.
+    video_title: Option<String>,
+    video_duration: Option<i64>,
 }
 
 /// Pilihan bentuk unduhan video di dialog Tambah (DEC-015 §5.3).
@@ -123,6 +126,16 @@ struct VideoChoice {
     /// `None` = kualitas terbaik; `Some(h)` = batas tinggi piksel.
     max_height: Option<u32>,
     kbps: u32,
+    /// Isian potong Dari/Sampai (spec 2026-11-17); kosong = seluruh video.
+    cut_from: String,
+    cut_to: String,
+}
+
+impl VideoChoice {
+    fn kind(&self) -> unduhkilat_core::engine::ytdlp::VideoKind {
+        use unduhkilat_core::engine::ytdlp::VideoKind;
+        if self.is_audio { VideoKind::AudioMp3 { kbps: self.kbps } } else { VideoKind::Video { max_height: self.max_height } }
+    }
 }
 
 /// File search screen state (DEC-009).
@@ -353,11 +366,11 @@ impl App {
 
     pub fn open_add_dialog(&mut self, url: &str) {
         let connections = self.manager.db().read(|c| repo::get_setting(c, keys::DEFAULT_CONNECTIONS)).ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(EngineConfig::default().default_connections);
-        let video = unduhkilat_core::engine::ytdlp::is_video_host(url).then_some(VideoChoice { is_audio: false, max_height: None, kbps: 192 });
+        let video = unduhkilat_core::engine::ytdlp::is_video_host(url).then_some(VideoChoice { is_audio: false, max_height: None, kbps: 192, cut_from: String::new(), cut_to: String::new() });
         self.add = Some(AddDialog {
             urls: url.to_string(), file_name: String::new(), category: None, destination: String::new(), connections,
             priority: 0, referer: String::new(), cookies: String::new(), user_agent: String::new(), probe: String::new(), err: None,
-            origin: None, torrent_file: None, video, tools_note: None, forced_video: false, offer_video: false,
+            origin: None, torrent_file: None, video, tools_note: None, forced_video: false, offer_video: false, video_title: None, video_duration: None,
         });
     }
 
@@ -616,6 +629,8 @@ impl App {
                                 let dur = m.duration.filter(|d| *d > 0).map(|d| format!("{}:{:02}", d / 60, d % 60)).unwrap_or_default();
                                 let best = m.heights.first().map(|h| format!("{h}p")).unwrap_or_else(|| "terbaik".into());
                                 a.probe = format!("Video  |  \"{}\"  |  {dur}  |  sampai {best}", m.title);
+                                a.video_title = Some(m.title.clone());
+                                a.video_duration = m.duration.filter(|d| *d > 0);
                                 if a.file_name.is_empty() {
                                     let kind = unduhkilat_core::engine::ytdlp::VideoKind::Video { max_height: None };
                                     a.file_name = unduhkilat_core::engine::ytdlp::final_name(&m.title, &kind, None);
@@ -1716,7 +1731,7 @@ impl App {
                 // Deteksi ulang saat link diketik/ditempel: host video memunculkan pilihan format.
                 let is_video_link = urls.len() == 1 && unduhkilat_core::engine::ytdlp::is_video_host(&urls[0]);
                 if is_video_link && a.video.is_none() {
-                    a.video = Some(VideoChoice { is_audio: false, max_height: None, kbps: 192 });
+                    a.video = Some(VideoChoice { is_audio: false, max_height: None, kbps: 192, cut_from: String::new(), cut_to: String::new() });
                 } else if !is_video_link && a.video.is_some() && !a.forced_video {
                     a.video = None;
                 }
@@ -1740,8 +1755,20 @@ impl App {
                                 for h in heights { ui.selectable_value(&mut v.max_height, h, label(h)); }
                             });
                         }
-                        a.video = Some(v);
                     });
+                    // Potong (spec 2026-11-17): kosong = seluruh video; awal ikut keyframe terdekat.
+                    ui.horizontal(|ui| {
+                        ui.label("Potong:");
+                        ui.label("Dari");
+                        ui.add(egui::TextEdit::singleline(&mut v.cut_from).desired_width(70.0).hint_text("m:ss"));
+                        ui.label("Sampai");
+                        ui.add(egui::TextEdit::singleline(&mut v.cut_to).desired_width(70.0).hint_text("m:ss"));
+                        ui.label(RichText::new("kosong = seluruh video").color(FG_SECONDARY));
+                    });
+                    if let Err(msg) = unduhkilat_core::engine::ytdlp::section_from_inputs(&v.cut_from, &v.cut_to, a.video_duration) {
+                        ui.label(RichText::new(msg).color(DANGER));
+                    }
+                    a.video = Some(v);
                     if !tools_ready {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Komponen video (yt-dlp + ffmpeg, ±180 MB unduhan) belum terpasang.").color(FG_SECONDARY));
@@ -1806,7 +1833,7 @@ impl App {
                     if a.offer_video && a.video.is_none() && urls.len() == 1 && ui.button("Coba sebagai video").clicked() {
                         a.forced_video = true;
                         a.offer_video = false;
-                        a.video = Some(VideoChoice { is_audio: false, max_height: None, kbps: 192 });
+                        a.video = Some(VideoChoice { is_audio: false, max_height: None, kbps: 192, cut_from: String::new(), cut_to: String::new() });
                         a.probe = "Memeriksa video...".into();
                         video_probe_url = Some(urls[0].clone());
                     }
@@ -1870,8 +1897,10 @@ impl App {
                 });
                 if let Some(e) = &a.err { ui.label(RichText::new(e).color(DANGER)); }
                 ui.add_space(12.0);
+                // Rentang potong yang tidak valid menahan Mulai/Antrikan (catatan merah di atas).
+                let cut_ok = a.video.as_ref().is_none_or(|v| unduhkilat_core::engine::ytdlp::section_from_inputs(&v.cut_from, &v.cut_to, a.video_duration).is_ok());
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!urls.is_empty() || a.torrent_file.is_some(), |ui| {
+                    ui.add_enabled_ui(cut_ok && (!urls.is_empty() || a.torrent_file.is_some()), |ui| {
                         if ui.add(primary_button("Mulai Mengunduh")).clicked() { submit = Some(true); }
                         if ui.button("Antrikan Saja").clicked() { submit = Some(false); }
                     });
@@ -1909,17 +1938,28 @@ impl App {
                 }
             }
             for url in urls {
-                // DEC-015: link video dibungkus dengan bentuk/kualitas dari dialog.
+                // DEC-015: link video dibungkus dengan bentuk/kualitas/potongan dari dialog.
+                let mut auto_name: Option<String> = None;
                 let url = match (&a.video, single) {
                     (Some(v), true) if unduhkilat_core::engine::ytdlp::parse(&url).is_none() => {
-                        use unduhkilat_core::engine::ytdlp::{wrap, VideoKind};
-                        let kind = if v.is_audio { VideoKind::AudioMp3 { kbps: v.kbps } } else { VideoKind::Video { max_height: v.max_height } };
-                        wrap(&url, &kind, None)
+                        use unduhkilat_core::engine::ytdlp::{final_name, section_from_inputs, wrap, VideoKind};
+                        let kind = v.kind();
+                        let section = section_from_inputs(&v.cut_from, &v.cut_to, a.video_duration).ok().flatten();
+                        // Nama hasil Periksa (bentuk apa pun) ikut format dan rentang terakhir;
+                        // nama yang diketik pengguna tidak diubah.
+                        if let Some(t) = &a.video_title {
+                            let typed = a.file_name.trim();
+                            let probed = [VideoKind::Video { max_height: None }, VideoKind::AudioMp3 { kbps: 0 }].iter().any(|k| final_name(t, k, None) == typed);
+                            if probed {
+                                auto_name = Some(final_name(t, &kind, section));
+                            }
+                        }
+                        wrap(&url, &kind, section)
                     }
                     _ => url,
                 };
                 // Video tanpa nama: engine memberi nama sementara unik lalu menggantinya dengan judul.
-                let name = (single && !a.file_name.trim().is_empty()).then(|| a.file_name.trim().to_string());
+                let name = auto_name.or_else(|| (single && !a.file_name.trim().is_empty()).then(|| a.file_name.trim().to_string()));
                 let is_video = unduhkilat_core::engine::ytdlp::parse(&url).is_some();
                 let target = (!a.destination.trim().is_empty()).then(|| {
                     let n = name.clone().or_else(|| if is_video { Some("video.mp4".into()) } else { http::file_name_from_url(&url) }).unwrap_or_else(|| "download".into());
