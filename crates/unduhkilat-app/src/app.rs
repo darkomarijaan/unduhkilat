@@ -117,6 +117,13 @@ struct AddDialog {
     /// Judul dan durasi (detik) dari Periksa video; dipakai untuk nama berkas dan batas potong.
     video_title: Option<String>,
     video_duration: Option<i64>,
+    /// Link yang diperiksa; judul/durasi hanya berlaku selama link di dialog masih sama.
+    probed_url: Option<String>,
+}
+
+/// `true` bila hasil Periksa untuk `probed` masih berlaku: dialog berisi tepat satu link itu.
+fn probe_is_current(probed: Option<&str>, urls: &[String]) -> bool {
+    matches!(probed, Some(p) if urls.len() == 1 && urls[0] == p)
 }
 
 /// Pilihan bentuk unduhan video di dialog Tambah (DEC-015 §5.3).
@@ -207,7 +214,8 @@ enum Msg {
     Notice(String),
     Probe(String, Option<String>),
     /// DEC-015: hasil `yt-dlp -J` untuk tombol Periksa pada link video.
-    VideoProbe(std::result::Result<unduhkilat_core::engine::ytdlp::VideoMeta, String>),
+    /// Hasil Periksa video beserta link yang diperiksa (hasil untuk link lama diabaikan).
+    VideoProbe(String, std::result::Result<unduhkilat_core::engine::ytdlp::VideoMeta, String>),
     /// DEC-015: status pengunduhan komponen video (byte terunduh atau pesan akhir).
     ToolsNote(Option<String>),
     Torrent(String, Option<TorrentInfo>),
@@ -370,7 +378,7 @@ impl App {
         self.add = Some(AddDialog {
             urls: url.to_string(), file_name: String::new(), category: None, destination: String::new(), connections,
             priority: 0, referer: String::new(), cookies: String::new(), user_agent: String::new(), probe: String::new(), err: None,
-            origin: None, torrent_file: None, video, tools_note: None, forced_video: false, offer_video: false, video_title: None, video_duration: None,
+            origin: None, torrent_file: None, video, tools_note: None, forced_video: false, offer_video: false, video_title: None, video_duration: None, probed_url: None,
         });
     }
 
@@ -389,7 +397,7 @@ impl App {
         let proxy = unduhkilat_core::engine::ytdlp::proxy_arg(&self.manager.proxy_config());
         self.rt.spawn(async move {
             let r = unduhkilat_core::engine::ytdlp::probe_metadata(&exe, &url, proxy.as_deref()).await.map_err(|e| format!("{}: {}", e.code, e.message));
-            let _ = tx.send(Msg::VideoProbe(r));
+            let _ = tx.send(Msg::VideoProbe(url, r));
             ctx.request_repaint();
         });
     }
@@ -622,10 +630,16 @@ impl App {
                         }
                     }
                 }
-                Msg::VideoProbe(r) => {
+                Msg::VideoProbe(url, r) => {
                     if let Some(a) = self.add.as_mut() {
+                        // Link sudah diganti sebelum hasil tiba: hasil ini milik video lain.
+                        let urls: Vec<String> = a.urls.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                        if !probe_is_current(Some(&url), &urls) {
+                            continue;
+                        }
                         match r {
                             Ok(m) => {
+                                a.probed_url = Some(url);
                                 let dur = m.duration.filter(|d| *d > 0).map(|d| format!("{}:{:02}", d / 60, d % 60)).unwrap_or_default();
                                 let best = m.heights.first().map(|h| format!("{h}p")).unwrap_or_else(|| "terbaik".into());
                                 a.probe = format!("Video  |  \"{}\"  |  {dur}  |  sampai {best}", m.title);
@@ -1728,6 +1742,20 @@ impl App {
                     urls_edit.request_focus();
                 }
                 let urls: Vec<String> = a.urls.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                // Link diganti setelah Periksa: judul/durasi lama tidak berlaku lagi (batas potong
+                // dan nama otomatis akan salah). Nama hasil Periksa ikut dibuang; ketikan pengguna tidak.
+                if a.video_title.is_some() && !probe_is_current(a.probed_url.as_deref(), &urls) {
+                    if let Some(t) = a.video_title.take() {
+                        use unduhkilat_core::engine::ytdlp::{final_name, VideoKind};
+                        let typed = a.file_name.trim();
+                        if [VideoKind::Video { max_height: None }, VideoKind::AudioMp3 { kbps: 0 }].iter().any(|k| final_name(&t, k, None) == typed) {
+                            a.file_name.clear();
+                        }
+                    }
+                    a.video_duration = None;
+                    a.probed_url = None;
+                    a.probe.clear();
+                }
                 // Deteksi ulang saat link diketik/ditempel: host video memunculkan pilihan format.
                 let is_video_link = urls.len() == 1 && unduhkilat_core::engine::ytdlp::is_video_host(&urls[0]);
                 if is_video_link && a.video.is_none() {
@@ -2609,5 +2637,20 @@ fn percent_encode(s: &str) -> String {
 fn open_in_browser(url: &str) {
     if url.starts_with("https://") {
         let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+    }
+}
+
+#[cfg(test)]
+mod potong_tests {
+    use super::probe_is_current;
+
+    #[test]
+    fn probe_result_only_counts_for_the_probed_link() {
+        let a = "https://youtu.be/a".to_string();
+        let b = "https://youtu.be/b".to_string();
+        assert!(probe_is_current(Some(&a), std::slice::from_ref(&a)));
+        assert!(!probe_is_current(Some(&a), std::slice::from_ref(&b)), "link diganti: hasil Periksa basi");
+        assert!(!probe_is_current(Some(&a), &[a.clone(), b.clone()]));
+        assert!(!probe_is_current(None, std::slice::from_ref(&a)));
     }
 }

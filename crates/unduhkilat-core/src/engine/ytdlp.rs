@@ -77,10 +77,9 @@ pub fn section_from_inputs(from: &str, to: &str, duration: Option<i64>) -> std::
             return Err("Dari melewati durasi video".into());
         }
     }
-    if let (Some(a), Some(b)) = (f, t) {
-        if a >= b {
-            return Err("Dari harus lebih kecil dari Sampai".into());
-        }
+    // Dari kosong = 0, jadi Sampai 0 juga rentang kosong.
+    if t.is_some_and(|b| f.unwrap_or(0) >= b) {
+        return Err("Dari harus lebih kecil dari Sampai".into());
     }
     if f.is_none() && t.is_none() {
         return Ok(None);
@@ -126,7 +125,7 @@ fn parse_section(s: &str) -> Option<Section> {
     let (from, to) = (num(a)?, num(b)?);
     match (from, to) {
         (None, None) => None,
-        (Some(f), Some(t)) if f >= t => None,
+        (f, Some(t)) if f.unwrap_or(0) >= t => None,
         _ => Some(Section { from, to }),
     }
 }
@@ -286,7 +285,8 @@ pub fn parse_progress_line(line: &str) -> Option<ProgressSample> {
         if s.eq_ignore_ascii_case("n/a") || s.eq_ignore_ascii_case("na") { return Some(-1); }
         s.parse::<i64>().ok()
     };
-    let downloaded = num(it.next())?;
+    // Byte terunduh tak pernah negatif (UI dan ekstensi membacanya apa adanya).
+    let downloaded = num(it.next())?.max(0);
     let total = num(it.next())?;
     // yt-dlp mencetak speed sebagai float, atau `NA` bila belum diketahui.
     let speed = match it.next()? {
@@ -1006,5 +1006,19 @@ mod tests {
         assert_eq!(final_name("Judul", &v, Some(Section { from: Some(90), to: Some(165) })), "Judul [01.30-02.45].mp4");
         assert_eq!(final_name("Judul", &VideoKind::AudioMp3 { kbps: 192 }, Some(Section { from: Some(90), to: None })), "Judul [01.30-akhir].mp3");
         assert_eq!(final_name("Judul", &v, Some(Section { from: None, to: Some(3723) })), "Judul [awal-1.02.03].mp4");
+    }
+
+    #[test]
+    fn zero_length_ranges_are_rejected() {
+        assert!(section_from_inputs("", "0:00", None).is_err());
+        assert!(section_from_inputs("0:00", "0", None).is_err());
+        assert!(parse("video:v=best;t=-0|https://a").is_none());
+        assert!(parse("video:v=best;t=0-0|https://a").is_none());
+    }
+
+    #[test]
+    fn progress_na_downloaded_is_never_negative() {
+        let p = parse_progress_line("UK NA NA NA").unwrap();
+        assert_eq!((p.downloaded, p.total, p.speed), (0, -1, 0));
     }
 }
