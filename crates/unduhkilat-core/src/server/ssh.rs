@@ -80,7 +80,13 @@ impl SshSession {
     }
 }
 
-const CANCELLED: &str = "Sambungan dibatalkan.";
+/// Keepalive tiap 15 detik menjaga NAT/router tetap mengingat sambungan; baru dianggap putus
+/// setelah 8 kali tak dijawab (±2 menit), sehingga gangguan jaringan singkat tidak memutus
+/// sesi terminal (dan program di dalamnya, mis. Claude Code).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEPALIVE_MAX: usize = 8;
+
+pub(crate) const CANCELLED: &str = "Sambungan dibatalkan.";
 
 fn cancelled() -> AppError {
     AppError::new(ErrorCode::ErrConnectionDropped, CANCELLED)
@@ -269,7 +275,7 @@ async fn open_hop(
         abort: abort.clone(),
         prompting: prompting.clone(),
     };
-    let config = Arc::new(client::Config { keepalive_interval: Some(Duration::from_secs(30)), keepalive_max: 3, ..Default::default() });
+    let config = Arc::new(client::Config { keepalive_interval: Some(KEEPALIVE_INTERVAL), keepalive_max: KEEPALIVE_MAX, ..Default::default() });
 
     let result = match prev {
         None => {

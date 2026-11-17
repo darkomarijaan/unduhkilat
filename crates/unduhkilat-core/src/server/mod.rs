@@ -11,3 +11,4 @@ pub mod fs;
 pub mod pool;
 pub mod exec;
 pub mod stats;
+pub mod reconnect;

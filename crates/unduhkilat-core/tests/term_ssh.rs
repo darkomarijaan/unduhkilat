@@ -183,3 +183,28 @@ async fn server_without_exec_hides_the_stats() {
     io.control.close();
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_connection_ends_without_exit_status_and_triggers_reconnect() {
+    let ssh = TestSsh::start(shell_server(true)).await;
+    let (sess, dir) = session(&ssh).await;
+    let mut io = open_shell(sess, 80, 24).await.unwrap();
+    ssh.kill_connections().await;
+    let code = read_until(&mut io, "\u{0}never").await.expect("the stream ends when the connection drops");
+    assert_eq!(code, None, "a dropped connection carries no exit status");
+    assert!(unduhkilat_core::server::reconnect::after_end(code), "so the tab reconnects automatically");
+    // The server is still there: a fresh connection works right away.
+    let (sess2, dir2) = session(&ssh).await;
+    let mut io2 = open_shell(sess2, 80, 24).await.expect("reconnects");
+    io2.control.write(b"lagi\n").unwrap();
+    assert_eq!(read_until(&mut io2, "lagi").await, None);
+    io2.control.close();
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::remove_dir_all(dir2).ok();
+}
+
+#[test]
+fn typed_exit_does_not_reconnect() {
+    // exit_status_is_reported shows `exit` ends with Some(0).
+    assert!(!unduhkilat_core::server::reconnect::after_end(Some(0)));
+}
