@@ -236,3 +236,63 @@ async fn collision_at_final_name_refuses() {
     assert_eq!(std::fs::read(env.path("videos/Judul Video.mp4")).unwrap(), b"precious", "the existing file is untouched");
     env.manager.shutdown(Duration::from_secs(5)).await.unwrap();
 }
+
+// ---- potong video (spec 2026-11-17) ----------------------------------------
+
+/// Item video dengan rentang potong 0:10–0:20.
+fn cut_req(env: &Env) -> NewDownload {
+    NewDownload { url: "video:v=best;t=10-20|https://example.com/watch?v=ok".into(), ..video_req(env) }
+}
+
+/// Potongan butuh ffmpeg; engine hanya memeriksa keberadaan berkasnya.
+fn fake_ffmpeg(tools: &Path) {
+    std::fs::write(tools.join("ffmpeg.exe"), b"").unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cut_video_lands_under_name_with_range() {
+    const MODE: &str = "ok";
+    let (env, tools) = video_env(MODE).await;
+    fake_ffmpeg(&tools);
+    std::fs::write(tools.join("meta.json"), serde_json::json!({"title": "Judul Video", "duration": 60, "formats": []}).to_string()).unwrap();
+    let dl = env.manager.create(cut_req(&env)).await.unwrap();
+    let st = wait_state(&env, &dl.id, 60).await;
+    let done = env.manager.get(&dl.id).unwrap();
+    assert_eq!(st, DownloadState::Completed, "err={:?} msg={:?}", done.error_code, done.error_message);
+    assert!(env.path("videos").join("Judul Video [00.10-00.20].mp4").exists(), "name={}", done.file_name);
+    env.manager.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cut_video_without_ffmpeg_fails_with_tools_missing() {
+    const MODE: &str = "ok";
+    let (env, _tools) = video_env(MODE).await;
+    let dl = env.manager.create(cut_req(&env)).await.unwrap();
+    let st = wait_state(&env, &dl.id, 60).await;
+    let done = env.manager.get(&dl.id).unwrap();
+    assert_eq!(st, DownloadState::Failed);
+    assert_eq!(done.error_code.as_deref(), Some("ERR_VIDEO_TOOLS_MISSING"), "msg={:?}", done.error_message);
+    env.manager.shutdown(Duration::from_secs(5)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_cut_restarts_without_old_part() {
+    const MODE: &str = "resume";
+    let (env, tools) = video_env(MODE).await;
+    fake_ffmpeg(&tools);
+    let dl = env.manager.create(cut_req(&env)).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !tools.join("resume-ran.txt").exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(tools.join("resume-ran.txt").exists(), "first run started; state={:?}", env.manager.get(&dl.id).unwrap());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    env.manager.pause(&dl.id).await.unwrap();
+    assert_eq!(wait_state(&env, &dl.id, 30).await, DownloadState::Paused);
+    env.manager.resume(&dl.id).await.unwrap();
+    let st = wait_state(&env, &dl.id, 60).await;
+    let done = env.manager.get(&dl.id).unwrap();
+    assert_eq!(st, DownloadState::Completed, "err={:?} msg={:?}", done.error_code, done.error_message);
+    assert!(!tools.join("resume-saw-part.txt").exists(), "a cut restarts from an empty work folder");
+    env.manager.shutdown(Duration::from_secs(5)).await.unwrap();
+}

@@ -258,6 +258,12 @@ pub fn build_download_args(req: &VideoRequest, out_stub: &Path, ffmpeg_dir: &Pat
             a.push(format!("{kbps}K"));
         }
     }
+    if let Some(s) = req.section {
+        // Tanpa --force-keyframes-at-cuts: cepat, tanpa encode ulang; awal ikut keyframe.
+        let to = s.to.map(|t| t.to_string()).unwrap_or_else(|| "inf".into());
+        a.push("--download-sections".into());
+        a.push(format!("*{}-{to}", s.from.unwrap_or(0)));
+    }
     if let Some(p) = proxy {
         a.push("--proxy".into());
         a.push(p.into());
@@ -277,18 +283,24 @@ pub fn parse_progress_line(line: &str) -> Option<ProgressSample> {
     let mut it = rest.split_whitespace();
     let num = |s: Option<&str>| -> Option<i64> {
         let s = s?;
-        if s.eq_ignore_ascii_case("n/a") { return Some(-1); }
+        if s.eq_ignore_ascii_case("n/a") || s.eq_ignore_ascii_case("na") { return Some(-1); }
         s.parse::<i64>().ok()
     };
     let downloaded = num(it.next())?;
     let total = num(it.next())?;
-    let speed = it.next()?.parse::<u64>().ok()?;
+    // yt-dlp mencetak speed sebagai float, atau `NA` bila belum diketahui.
+    let speed = match it.next()? {
+        s if s.eq_ignore_ascii_case("na") || s.eq_ignore_ascii_case("n/a") => 0,
+        s => s.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)? as u64,
+    };
     Some(ProgressSample { downloaded, total, speed })
 }
 
 /// Nama berkas akhir dari judul: disanitasi, dipotong ±120 karakter, ekstensi sesuai bentuk.
 /// Judul bukan jalur: `/` dan `\` juga diganti `_` (bukan dipakai sebagai pemisah).
-pub fn final_name(title: &str, kind: &VideoKind) -> String {
+/// Item potongan diberi akhiran rentang (`Judul [01.30-02.45].mp4`) agar tidak bertabrakan
+/// dengan unduhan utuhnya; akhiran tidak ikut terpotong.
+pub fn final_name(title: &str, kind: &VideoKind, section: Option<Section>) -> String {
     let ext = match kind {
         VideoKind::Video { .. } => ".mp4",
         VideoKind::AudioMp3 { .. } => ".mp3",
@@ -296,7 +308,17 @@ pub fn final_name(title: &str, kind: &VideoKind) -> String {
     let no_path: String = title.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
     let clean = crate::engine::http::sanitize_file_name(&no_path);
     let stem: String = clean.chars().take(120).collect();
-    format!("{stem}{ext}")
+    let suffix = section.map(|s| format!(" [{}-{}]", clock_label(s.from, "awal"), clock_label(s.to, "akhir"))).unwrap_or_default();
+    format!("{stem}{suffix}{ext}")
+}
+
+/// Waktu untuk nama berkas (`:` dilarang di Windows): `MM.SS`, atau `H.MM.SS` mulai 1 jam.
+fn clock_label(secs: Option<u32>, open: &str) -> String {
+    match secs {
+        None => open.to_string(),
+        Some(s) if s >= 3600 => format!("{}.{:02}.{:02}", s / 3600, s % 3600 / 60, s % 60),
+        Some(s) => format!("{:02}.{:02}", s / 60, s % 60),
+    }
 }
 
 /// Tanda versi yt-dlp usang: layak coba perbarui lalu ulang sekali (spec §5.1).
@@ -427,6 +449,9 @@ pub async fn run_video(ctx: &TransferCtx, id: &str, req: &VideoRequest, cancel: 
         // Konversi MP3 butuh ffmpeg; jangan biarkan yt-dlp menyimpan berkas audio lain diam-diam.
         return Err(AppError::new(ErrorCode::ErrVideoToolsMissing, "ffmpeg belum terpasang; MP3 butuh ffmpeg"));
     }
+    if req.section.is_some() && !has_ffmpeg {
+        return Err(AppError::new(ErrorCode::ErrVideoToolsMissing, "ffmpeg belum terpasang; potong video butuh ffmpeg"));
+    }
 
     // 3. Metadata untuk nama akhir (judul). Versi usang (mis. cek bot) → perbarui sekali, ulang.
     let target0 = PathBuf::from(&dl.target_path);
@@ -453,7 +478,7 @@ pub async fn run_video(ctx: &TransferCtx, id: &str, req: &VideoRequest, cancel: 
     let placeholder = is_placeholder_name(&dl.file_name);
     let final_name = if placeholder {
         let title = meta.as_ref().map(|m| m.title.as_str()).unwrap_or("video");
-        final_name(title, &req.kind)
+        final_name(title, &req.kind, req.section)
     } else {
         dl.file_name.clone()
     };
@@ -464,6 +489,10 @@ pub async fn run_video(ctx: &TransferCtx, id: &str, req: &VideoRequest, cancel: 
 
     // 4. Folder kerja tersembunyi + stub output.
     let work = out_dir.join(format!(".uk-video-{id}"));
+    if req.section.is_some() {
+        // Potongan diunduh lewat ffmpeg, yang tidak bisa meneruskan `.part`: selalu mulai bersih.
+        std::fs::remove_dir_all(&work).ok();
+    }
     std::fs::create_dir_all(&work).map_err(|e| AppError::new(ErrorCode::ErrPathUnwritable, e.to_string()))?;
     let stub = work.join(STUB_NAME);
 
@@ -800,13 +829,22 @@ mod tests {
     }
 
     #[test]
+    fn progress_line_accepts_float_speed_and_na() {
+        // yt-dlp mencetak speed sebagai float dan field kosong sebagai `NA` (downloader ffmpeg).
+        let p = parse_progress_line("UK 1048576 NA 123456.78").unwrap();
+        assert_eq!((p.downloaded, p.total, p.speed), (1048576, -1, 123456));
+        let p = parse_progress_line("UK 2048 NA NA").unwrap();
+        assert_eq!((p.downloaded, p.total, p.speed), (2048, -1, 0));
+    }
+
+    #[test]
     fn final_name_sanitizes_and_truncates() {
-        assert_eq!(final_name("My Video", &VideoKind::Video { max_height: None }), "My Video.mp4");
-        assert_eq!(final_name("a<b>:c\"d/e", &VideoKind::AudioMp3 { kbps: 128 }), "a_b__c_d_e.mp3");
-        let long = final_name(&"x".repeat(300), &VideoKind::Video { max_height: None });
+        assert_eq!(final_name("My Video", &VideoKind::Video { max_height: None }, None), "My Video.mp4");
+        assert_eq!(final_name("a<b>:c\"d/e", &VideoKind::AudioMp3 { kbps: 128 }, None), "a_b__c_d_e.mp3");
+        let long = final_name(&"x".repeat(300), &VideoKind::Video { max_height: None }, None);
         assert_eq!(long.len(), 124, "120 karakter + .mp4");
         let windows = "g\\h:i*j?k|l<m>n\"o".replace('|', "_");
-        let n = final_name(&windows, &VideoKind::Video { max_height: None });
+        let n = final_name(&windows, &VideoKind::Video { max_height: None }, None);
         assert!(!n.contains(['\\', ':', '*', '?', '"', '<', '>']), "{n}");
     }
 
@@ -942,5 +980,31 @@ mod tests {
         assert!(section_from_inputs("1:30", "1:30", None).is_err());
         assert!(section_from_inputs("1:61", "", None).is_err());
         assert!(section_from_inputs("6:00", "", Some(300)).is_err());
+    }
+
+    #[test]
+    fn args_add_download_sections_only_when_cut() {
+        let mut req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: None }, section: None };
+        let s = build_download_args(&req, Path::new("C:/w/out"), Path::new("C:/t"), true, None, 0).join(" ");
+        assert!(!s.contains("--download-sections"), "{s}");
+        req.section = Some(Section { from: Some(90), to: Some(165) });
+        let a = build_download_args(&req, Path::new("C:/w/out"), Path::new("C:/t"), true, None, 0);
+        let i = a.iter().position(|x| x == "--download-sections").expect("ada");
+        assert_eq!(a[i + 1], "*90-165");
+        assert!(!a.iter().any(|x| x == "--force-keyframes-at-cuts"));
+        assert_eq!(&a[a.len() - 2..], ["--".to_string(), "https://youtu.be/1".to_string()]);
+        req.section = Some(Section { from: Some(90), to: None });
+        assert!(build_download_args(&req, Path::new("C:/w/out"), Path::new("C:/t"), true, None, 0).contains(&"*90-inf".to_string()));
+        req.section = Some(Section { from: None, to: Some(165) });
+        assert!(build_download_args(&req, Path::new("C:/w/out"), Path::new("C:/t"), true, None, 0).contains(&"*0-165".to_string()));
+    }
+
+    #[test]
+    fn final_name_appends_the_range() {
+        let v = VideoKind::Video { max_height: None };
+        assert_eq!(final_name("Judul", &v, None), "Judul.mp4");
+        assert_eq!(final_name("Judul", &v, Some(Section { from: Some(90), to: Some(165) })), "Judul [01.30-02.45].mp4");
+        assert_eq!(final_name("Judul", &VideoKind::AudioMp3 { kbps: 192 }, Some(Section { from: Some(90), to: None })), "Judul [01.30-akhir].mp3");
+        assert_eq!(final_name("Judul", &v, Some(Section { from: None, to: Some(3723) })), "Judul [awal-1.02.03].mp4");
     }
 }

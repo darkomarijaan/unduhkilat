@@ -618,7 +618,7 @@ impl App {
                                 a.probe = format!("Video  |  \"{}\"  |  {dur}  |  sampai {best}", m.title);
                                 if a.file_name.is_empty() {
                                     let kind = unduhkilat_core::engine::ytdlp::VideoKind::Video { max_height: None };
-                                    a.file_name = unduhkilat_core::engine::ytdlp::final_name(&m.title, &kind);
+                                    a.file_name = unduhkilat_core::engine::ytdlp::final_name(&m.title, &kind, None);
                                     if let Some(a) = self.add.as_mut() {
                                         if let Some(v) = a.video.as_mut() {
                                             // Nama mengikuti format: MP3 mengganti ekstensi.
