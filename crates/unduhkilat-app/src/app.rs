@@ -1914,7 +1914,7 @@ impl App {
                     (Some(v), true) if unduhkilat_core::engine::ytdlp::parse(&url).is_none() => {
                         use unduhkilat_core::engine::ytdlp::{wrap, VideoKind};
                         let kind = if v.is_audio { VideoKind::AudioMp3 { kbps: v.kbps } } else { VideoKind::Video { max_height: v.max_height } };
-                        wrap(&url, &kind)
+                        wrap(&url, &kind, None)
                     }
                     _ => url,
                 };

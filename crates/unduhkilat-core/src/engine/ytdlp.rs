@@ -25,6 +25,67 @@ pub enum VideoKind {
 pub struct VideoRequest {
     pub url: String,
     pub kind: VideoKind,
+    /// Rentang potong (spec 2026-11-17); `None` = seluruh video.
+    pub section: Option<Section>,
+}
+
+/// Rentang potong dalam detik bulat. Minimal satu ujung terisi; ujung kosong = awal/akhir
+/// video. Bila keduanya ada, `from < to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Section {
+    pub from: Option<u32>,
+    pub to: Option<u32>,
+}
+
+/// Urai waktu `ss`, `m:ss`, atau `h:mm:ss` (di-trim) menjadi detik. Bagian setelah `:`
+/// pertama harus < 60.
+pub fn parse_clock(s: &str) -> Option<u32> {
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut total: u32 = 0;
+    for (i, p) in parts.iter().enumerate() {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: u32 = p.parse().ok()?;
+        if i > 0 && n >= 60 {
+            return None;
+        }
+        total = total.checked_mul(60)?.checked_add(n)?;
+    }
+    Some(total)
+}
+
+/// Validasi isian Dari/Sampai dialog. Kosong = ujung terbuka; Dari `0` = dari awal;
+/// Sampai ≥ durasi = sampai akhir. `Ok(None)` = seluruh video (tanpa potongan).
+pub fn section_from_inputs(from: &str, to: &str, duration: Option<i64>) -> std::result::Result<Option<Section>, String> {
+    let read = |s: &str| -> std::result::Result<Option<u32>, String> {
+        if s.trim().is_empty() {
+            return Ok(None);
+        }
+        parse_clock(s).map(Some).ok_or_else(|| "Format waktu tidak valid (pakai ss, m:ss, atau h:mm:ss)".to_string())
+    };
+    let f = read(from)?.filter(|v| *v > 0);
+    let mut t = read(to)?;
+    if let Some(d) = duration.filter(|d| *d > 0) {
+        if t.is_some_and(|t| i64::from(t) >= d) {
+            t = None;
+        }
+        if f.is_some_and(|f| i64::from(f) >= d) {
+            return Err("Dari melewati durasi video".into());
+        }
+    }
+    if let (Some(a), Some(b)) = (f, t) {
+        if a >= b {
+            return Err("Dari harus lebih kecil dari Sampai".into());
+        }
+    }
+    if f.is_none() && t.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Section { from: f, to: t }))
 }
 
 /// Host situs video yang didukung yt-dlp (termasuk subdomain `www.`, `m.`, `music.`).
@@ -40,14 +101,34 @@ pub fn is_video_host(url: &str) -> bool {
     HOSTS.iter().any(|h| host == *h || host.strip_suffix(h).is_some_and(|s| s.ends_with('.')))
 }
 
-/// Bungkus URL asli menjadi bentuk `video:...` (kualitas terbaik untuk video).
-pub fn wrap(url: &str, kind: &VideoKind) -> String {
+/// Bungkus URL asli menjadi bentuk `video:<opsi>[;t=<dari>-<sampai>]|<url>`.
+pub fn wrap(url: &str, kind: &VideoKind, section: Option<Section>) -> String {
     let opt = match kind {
         VideoKind::Video { max_height: None } => "v=best".into(),
         VideoKind::Video { max_height: Some(h) } => format!("v={h}"),
         VideoKind::AudioMp3 { kbps } => format!("a=mp3-{kbps}"),
     };
-    format!("video:{opt}|{url}")
+    let cut = section.map(|s| {
+        let n = |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_default();
+        format!(";t={}-{}", n(s.from), n(s.to))
+    }).unwrap_or_default();
+    format!("video:{opt}{cut}|{url}")
+}
+
+/// Urai `t=<dari>-<sampai>` (detik, ujung boleh kosong, tidak keduanya; `dari < sampai`).
+fn parse_section(s: &str) -> Option<Section> {
+    let (a, b) = s.strip_prefix("t=")?.split_once('-')?;
+    let num = |x: &str| -> Option<Option<u32>> {
+        if x.is_empty() { return Some(None); }
+        if !x.bytes().all(|c| c.is_ascii_digit()) { return None; }
+        x.parse().ok().map(Some)
+    };
+    let (from, to) = (num(a)?, num(b)?);
+    match (from, to) {
+        (None, None) => None,
+        (Some(f), Some(t)) if f >= t => None,
+        _ => Some(Section { from, to }),
+    }
 }
 
 /// `Some(wrap(url, terbaik))` bila host dikenal dan URL belum berawalan `video:`.
@@ -55,16 +136,20 @@ pub fn auto_wrap(url: &str) -> Option<String> {
     if parse(url).is_some() {
         return None;
     }
-    is_video_host(url).then(|| wrap(url, &VideoKind::Video { max_height: None }))
+    is_video_host(url).then(|| wrap(url, &VideoKind::Video { max_height: None }, None))
 }
 
-/// Urai `video:<opsi>|<url>`; `|` pertama saja (URL asli boleh memuat `|`).
+/// Urai `video:<opsi>[;t=..]|<url>`; `|` pertama saja (URL asli boleh memuat `|`).
 pub fn parse(original_url: &str) -> Option<VideoRequest> {
     let rest = original_url.strip_prefix("video:")?;
-    let (opt, url) = rest.split_once('|')?;
+    let (opts, url) = rest.split_once('|')?;
     if url.is_empty() {
         return None;
     }
+    let (opt, section) = match opts.split_once(';') {
+        Some((base, extra)) => (base, Some(parse_section(extra)?)),
+        None => (opts, None),
+    };
     let kind = if opt == "v=best" {
         VideoKind::Video { max_height: None }
     } else if let Some(Ok(h)) = opt.strip_prefix("v=").map(str::parse::<u32>) {
@@ -74,7 +159,7 @@ pub fn parse(original_url: &str) -> Option<VideoRequest> {
     } else {
         return None;
     };
-    Some(VideoRequest { url: url.to_string(), kind })
+    Some(VideoRequest { url: url.to_string(), kind, section })
 }
 
 /// Sampel satu baris progres yt-dlp (`--progress-template`).
@@ -615,14 +700,14 @@ mod tests {
 
     #[test]
     fn args_end_with_the_video_url() {
-        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: None } };
+        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: None }, section: None };
         let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), true, None, 0);
         assert_eq!(&a[a.len() - 2..], ["--".to_string(), "https://youtu.be/1".to_string()]);
     }
 
     #[test]
     fn args_without_ffmpeg_pick_a_single_file_format() {
-        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: Some(720) } };
+        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: Some(720) }, section: None };
         let s = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), false, None, 0).join(" ");
         assert!(s.contains("-f b[height<=720][ext=mp4]/b[height<=720]/b"), "{s}");
         assert!(!s.contains("merge-output-format") && !s.contains("+ba"), "{s}");
@@ -661,7 +746,7 @@ mod tests {
     fn find_produced_skips_unmerged_format_parts() {
         let dir = std::env::temp_dir().join(format!("uk-produced-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let req = VideoRequest { url: "u".into(), kind: VideoKind::Video { max_height: None } };
+        let req = VideoRequest { url: "u".into(), kind: VideoKind::Video { max_height: None }, section: None };
         std::fs::write(dir.join("out.f137.mp4"), b"video only").unwrap();
         std::fs::write(dir.join("out.mp4.part"), b"partial").unwrap();
         assert_eq!(find_produced(&dir, &req).unwrap(), None);
@@ -672,7 +757,7 @@ mod tests {
 
     #[test]
     fn args_video_caps_height_and_merges_mp4() {
-        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: Some(720) } };
+        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: Some(720) }, section: None };
         let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), true, None, 0);
         let s = a.join(" ");
         assert!(s.contains("-f bv*[height<=720]"), "{s}");
@@ -687,7 +772,7 @@ mod tests {
 
     #[test]
     fn args_audio_uses_mp3_kbps() {
-        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::AudioMp3 { kbps: 192 } };
+        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::AudioMp3 { kbps: 192 }, section: None };
         let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), true, None, 0);
         let s = a.join(" ");
         assert!(s.contains("-x --audio-format mp3 --audio-quality 192K"), "{s}");
@@ -696,7 +781,7 @@ mod tests {
 
     #[test]
     fn args_limit_rate_and_proxy_when_set() {
-        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: None } };
+        let req = VideoRequest { url: "https://youtu.be/1".into(), kind: VideoKind::Video { max_height: None }, section: None };
         let a = build_download_args(&req, Path::new("C:/t/w"), Path::new("C:/t/tools"), true, Some("socks5://10.0.0.1:1080"), 500);
         let s = a.join(" ");
         assert!(s.contains("--proxy socks5://10.0.0.1:1080"), "{s}");
@@ -808,5 +893,54 @@ mod tests {
         assert_eq!(auto_wrap("https://youtu.be/abc").as_deref(), Some("video:v=best|https://youtu.be/abc"));
         assert!(auto_wrap("video:v=best|https://youtu.be/abc").is_none());
         assert!(auto_wrap("https://example.com/f.zip").is_none());
+    }
+
+    #[test]
+    fn parse_clock_accepts_seconds_minutes_hours() {
+        assert_eq!(parse_clock("90"), Some(90));
+        assert_eq!(parse_clock(" 1:30 "), Some(90));
+        assert_eq!(parse_clock("1:02:03"), Some(3723));
+        assert_eq!(parse_clock("0:05"), Some(5));
+        for bad in ["", "1:60", "1:2:60", "a", "1::2", "-5", "1:2:3:4", ":30"] {
+            assert_eq!(parse_clock(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_and_wrap_roundtrip_with_section() {
+        let s = Some(Section { from: Some(90), to: Some(165) });
+        let k = VideoKind::Video { max_height: Some(1080) };
+        let w = wrap("https://youtu.be/x", &k, s);
+        assert_eq!(w, "video:v=1080;t=90-165|https://youtu.be/x");
+        assert_eq!(parse(&w).unwrap().section, s);
+        let open_end = parse("video:a=mp3-192;t=90-|https://a").unwrap();
+        assert_eq!(open_end.section, Some(Section { from: Some(90), to: None }));
+        assert_eq!(open_end.kind, VideoKind::AudioMp3 { kbps: 192 });
+        let open_start = parse("video:v=best;t=-165|https://a").unwrap();
+        assert_eq!(open_start.section, Some(Section { from: None, to: Some(165) }));
+        assert_eq!(parse("video:v=best|https://a").unwrap().section, None);
+        assert_eq!(wrap("https://a", &VideoKind::Video { max_height: None }, None), "video:v=best|https://a");
+    }
+
+    #[test]
+    fn parse_rejects_bad_sections() {
+        assert!(parse("video:v=best;t=-|https://a").is_none());
+        assert!(parse("video:v=best;t=165-90|https://a").is_none());
+        assert!(parse("video:v=best;t=90-90|https://a").is_none());
+        assert!(parse("video:v=best;t=x-9|https://a").is_none());
+        assert!(parse("video:v=best;q=1|https://a").is_none());
+    }
+
+    #[test]
+    fn section_from_inputs_validates_and_normalizes() {
+        assert_eq!(section_from_inputs("", "", None), Ok(None));
+        assert_eq!(section_from_inputs("0:00", "", None), Ok(None));
+        assert_eq!(section_from_inputs(" 1:30 ", "2:45", None), Ok(Some(Section { from: Some(90), to: Some(165) })));
+        assert_eq!(section_from_inputs("", "2:45", None), Ok(Some(Section { from: None, to: Some(165) })));
+        assert_eq!(section_from_inputs("1:30", "10:00", Some(300)), Ok(Some(Section { from: Some(90), to: None })));
+        assert!(section_from_inputs("2:45", "1:30", None).is_err());
+        assert!(section_from_inputs("1:30", "1:30", None).is_err());
+        assert!(section_from_inputs("1:61", "", None).is_err());
+        assert!(section_from_inputs("6:00", "", Some(300)).is_err());
     }
 }
