@@ -545,6 +545,7 @@ use std::time::Instant;
 use unduhkilat_core::config::keys;
 use unduhkilat_core::repo;
 use unduhkilat_core::term::local::{detect_shells, spawn_local, ShellKind, ShellOptions};
+use unduhkilat_core::server::reconnect;
 use unduhkilat_core::server::service::OpenedTerminal;
 use unduhkilat_core::server::stats::{ServerStats, StatsState};
 use unduhkilat_core::term::folders::{self, SavedFolder};
@@ -767,6 +768,25 @@ pub struct TermTab {
     pub explorer: Option<super::explorer::ExplorerState>,
     /// System info of the server (SSH tabs with the info bar on).
     stats: Option<tokio::sync::watch::Receiver<StatsState>>,
+    /// Sambung ulang otomatis yang sedang berjalan (tab SSH yang sambungannya putus).
+    retry: Option<Retry>,
+}
+
+/// Jadwal sambung ulang otomatis sebuah tab SSH.
+#[derive(Debug, Clone)]
+struct Retry {
+    /// Percobaan berikutnya (mulai 1).
+    attempt: u32,
+    /// Waktu percobaan berikutnya dimulai.
+    at: Instant,
+    /// Alasan percobaan sebelumnya gagal.
+    last_error: Option<String>,
+}
+
+impl Retry {
+    fn first() -> Self {
+        Retry { attempt: 1, at: Instant::now() + reconnect::delay(1), last_error: None }
+    }
 }
 
 #[derive(Default)]
@@ -807,6 +827,7 @@ impl TermTab {
             cancel: None,
             explorer: None,
             stats: None,
+            retry: None,
         }
     }
 }
@@ -1036,6 +1057,7 @@ impl App {
                     cancel: None,
                     explorer: None,
                     stats: None,
+                    retry: None,
                 });
                 self.terminal.active = self.terminal.tabs.len() - 1;
                 self.screen = Screen::Terminal;
@@ -1067,6 +1089,7 @@ impl App {
             cancel: None,
             explorer: None,
             stats: None,
+            retry: None,
         });
         self.terminal.active = self.terminal.tabs.len() - 1;
         self.screen = Screen::Terminal;
@@ -1080,7 +1103,7 @@ impl App {
         let cancel = tokio_util::sync::CancellationToken::new();
         tab.cancel = Some(cancel.clone());
         tab.status = TabStatus::Connecting;
-        tab.session = None;
+        // Sesi lama (sudah berakhir) tetap tampil sampai sesi baru siap: isi layar tidak hilang.
         self.servers.shell_waiters.insert(tab_id);
         let stats = self.term_settings().server_stats;
         let (svc, tx, ctx) = (self.manager.servers(), self.tx.clone(), self.ctx.clone());
@@ -1113,21 +1136,51 @@ impl App {
                 tab.session = Some(session);
                 tab.status = TabStatus::Running;
                 tab.view = TerminalView::default();
+                tab.retry = None;
             }
-            Err(e) => self.terminal.tabs[idx].status = TabStatus::Failed(e.message),
+            Err(e) => {
+                let tab = &mut self.terminal.tabs[idx];
+                // Sedang sambung ulang dan galatnya galat jaringan: jadwalkan percobaan berikutnya.
+                tab.retry = match tab.retry.take() {
+                    Some(r) if reconnect::should_retry(&e) => {
+                        let attempt = r.attempt.saturating_add(1);
+                        Some(Retry { attempt, at: Instant::now() + reconnect::delay(attempt), last_error: Some(e.message.clone()) })
+                    }
+                    _ => None,
+                };
+                tab.status = TabStatus::Failed(e.message);
+            }
         }
     }
 
     /// Per-frame housekeeping that must run even while another screen is showing: clipboard requests
     /// from programs (OSC 52) and session status.
     pub(super) fn terminal_sync(&mut self, ctx: &egui::Context) {
+        let mut due = Vec::new();
         for tab in &mut self.terminal.tabs {
+            // Sambung ulang otomatis: mulai percobaan yang sudah waktunya, bangunkan UI untuk yang belum.
+            if let Some(r) = &tab.retry {
+                if tab.status != TabStatus::Connecting {
+                    let now = Instant::now();
+                    if now >= r.at {
+                        due.push(tab.id);
+                    } else {
+                        ctx.request_repaint_after(r.at - now);
+                    }
+                }
+            }
             let Some(s) = &tab.session else { continue };
             for text in s.take_clipboard() {
                 ctx.copy_text(text);
             }
-            if let SessionStatus::Ended(code) = s.status() {
+            // Hanya sesi yang sedang berjalan yang bisa berakhir; sesi lama yang dibiarkan tampil
+            // selama sambung ulang tidak boleh menimpa status Connecting/Failed.
+            if let (TabStatus::Running, SessionStatus::Ended(code)) = (&tab.status, s.status()) {
                 tab.status = TabStatus::Ended(code);
+                if matches!(tab.kind, TabKind::Ssh { .. }) && reconnect::after_end(code) {
+                    tab.retry = Some(Retry::first());
+                    ctx.request_repaint();
+                }
             }
             // Local shells report their folder after each command: keep the tab's name and folder current.
             if let (TabKind::Local(_), Some(dir)) = (&tab.kind, s.cwd()) {
@@ -1138,6 +1191,9 @@ impl App {
                     tab.cwd = dir;
                 }
             }
+        }
+        for id in due {
+            self.connect_ssh_tab(id);
         }
     }
 
@@ -1337,7 +1393,18 @@ impl App {
         if let Some(n) = outcome.notice.take() {
             self.notice = Some((n, Instant::now()));
         }
+        if outcome.stop_retry {
+            let tab = &mut self.terminal.tabs[idx];
+            tab.retry = None;
+            if tab.status == TabStatus::Connecting {
+                if let Some(c) = tab.cancel.take() {
+                    c.cancel();
+                }
+            }
+            return;
+        }
         if outcome.reconnect {
+            // "Sambung sekarang" saat menunggu jadwal: percobaan langsung, jadwal tetap berlaku bila gagal.
             self.connect_ssh_tab(id);
             return;
         }
@@ -1431,6 +1498,8 @@ struct TabOutcome {
     paste_confirm: Option<String>,
     restart: bool,
     reconnect: bool,
+    /// Hentikan sambung ulang otomatis (dan percobaan yang sedang berjalan).
+    stop_retry: bool,
     toggle_max: bool,
     notice: Option<String>,
     close: bool,
@@ -1485,6 +1554,25 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, serve
             }
         });
     });
+    // Sambung ulang otomatis menunggu jadwal: satu baris status untuk Ended maupun Failed.
+    if let (Some(r), false) = (&tab.retry, tab.status == TabStatus::Connecting) {
+        let secs = r.at.saturating_duration_since(Instant::now()).as_secs_f32().ceil() as u64;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Sambungan terputus. Menyambung ulang dalam {secs} dtk (percobaan {}).", r.attempt)).color(DANGER));
+            if ui.button("Sambung sekarang").clicked() {
+                out.reconnect = true;
+            }
+            if ui.button("Berhenti").on_hover_text("Hentikan sambung ulang otomatis").clicked() {
+                out.stop_retry = true;
+            }
+            if ui.button("Tutup").clicked() {
+                out.close = true;
+            }
+        });
+        if let Some(e) = &r.last_error {
+            ui.label(RichText::new(e).font(theme::mono(11.0)).color(FG_SECONDARY));
+        }
+    } else {
     match &tab.status {
         TabStatus::Ended(code) => {
             ui.horizontal(|ui| {
@@ -1518,13 +1606,21 @@ fn draw_tab(ui: &mut egui::Ui, tab: &mut TermTab, settings: &TermSettings, serve
         }
         TabStatus::Connecting => {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Menghubungkan lewat {}...", tab.subtitle)).color(FG_SECONDARY));
-                if ui.button("Batal").clicked() {
-                    out.close = true;
+                if let Some(r) = &tab.retry {
+                    ui.label(RichText::new(format!("Menyambung ulang lewat {} (percobaan {})...", tab.subtitle, r.attempt)).color(FG_SECONDARY));
+                    if ui.button("Berhenti").on_hover_text("Hentikan sambung ulang otomatis").clicked() {
+                        out.stop_retry = true;
+                    }
+                } else {
+                    ui.label(RichText::new(format!("Menghubungkan lewat {}...", tab.subtitle)).color(FG_SECONDARY));
+                    if ui.button("Batal").clicked() {
+                        out.close = true;
+                    }
                 }
             });
         }
         TabStatus::Running => {}
+    }
     }
     ui.add_space(4.0);
 
