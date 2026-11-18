@@ -47,6 +47,8 @@ pub enum ServersMsg {
     TestDone { result: Result<TestReport, unduhkilat_core::AppError> },
     Forgotten(Result<(), String>),
     ShellReady { tab_id: u64, result: unduhkilat_core::Result<unduhkilat_core::server::service::OpenedTerminal> },
+    /// Hasil pengecekan tmux untuk dialog Terminal; `generation` membedakan pengecekan yang basi.
+    TmuxProbed { generation: u64, result: unduhkilat_core::Result<unduhkilat_core::server::tmux::TmuxProbe> },
     HostKey { host: String, port: u16, key_type: String, fingerprint: String, reply: oneshot::Sender<bool> },
     Secret { server_name: String, kind: SecretKind, reply: oneshot::Sender<Option<String>> },
 }
@@ -103,6 +105,9 @@ pub struct ServersState {
     test_after_save: bool,
     /// Terminal tabs that are connecting: they wait for host-key and password answers too.
     pub shell_waiters: std::collections::HashSet<u64>,
+    /// Dialog pilihan sesi (langsung / tmux) yang terbuka sesudah menekan Terminal.
+    pub tmux: Option<super::tmux_dialog::TmuxDialog>,
+    pub tmux_generation: u64,
 }
 
 /// The one pinned host key that changed (taken from the error's details), so "forget" touches only it.
@@ -349,6 +354,7 @@ impl App {
                 self.servers.clear_prompts_if_idle();
                 self.terminal_ssh_ready(tab_id, result);
             }
+            ServersMsg::TmuxProbed { generation, result } => self.tmux_probed(generation, result),
             ServersMsg::HostKey { host, port, key_type, fingerprint, reply } => self.servers.offer_host_key(host, port, key_type, fingerprint, reply),
             ServersMsg::Secret { server_name, kind, reply } => self.servers.offer_secret(server_name, kind, reply),
         }
@@ -435,7 +441,7 @@ impl App {
                                 if ui.button("Berkas").on_hover_text("Jelajahi berkas di server ini").clicked() {
                                     open_files = Some(s.id.clone());
                                 }
-                                if s.protocol.supports_jump() && ui.button("Terminal").on_hover_text("Buka shell SSH di server ini").clicked() {
+                                if s.protocol.supports_jump() && ui.button("Terminal").on_hover_text("Buka shell SSH atau sesi tmux di server ini").clicked() {
                                     open_term = Some(s.id.clone());
                                 }
                             });
@@ -455,7 +461,7 @@ impl App {
             self.start_server_test(&id);
         }
         if let Some(id) = open_term {
-            self.open_ssh_terminal(&id);
+            self.open_tmux_dialog(&id);
         }
         if let Some(id) = open_files {
             self.open_files_tab(&id);
@@ -481,6 +487,7 @@ impl App {
         self.secret_prompt_window(ctx);
         self.confirm_windows(ctx);
         self.server_dialog(ctx);
+        self.tmux_dialog_window(ctx);
     }
 
     fn window(title: &str, width: f32) -> egui::Window<'static> {

@@ -31,6 +31,8 @@ use unduhkilat_core::{category, repo};
 mod servers;
 #[path = "terminal.rs"]
 mod terminal;
+#[path = "tmux_dialog.rs"]
+mod tmux_dialog;
 #[path = "explorer.rs"]
 mod explorer;
 

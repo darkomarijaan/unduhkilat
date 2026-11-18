@@ -9,6 +9,7 @@ use crate::server::model::{NewServer, Protocol, Server};
 use crate::server::secrets::{self, NewServerSecrets, SecretKind};
 use crate::server::ssh::{connect, ConnectOptions, Interact};
 use crate::server::store;
+use crate::server::tmux::{ShellLaunch, TmuxProbe};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -93,12 +94,27 @@ impl ServerService {
     /// shell's I/O, the names of every server traversed (ending with the target), and, with `stats`,
     /// the server's system info read over the same connection.
     pub async fn open_terminal(&self, id: &str, interact: Arc<dyn Interact>, cancel: CancellationToken, cols: u16, rows: u16, stats: bool) -> Result<OpenedTerminal> {
+        self.open_terminal_with(id, interact, cancel, cols, rows, stats, &ShellLaunch::Direct).await
+    }
+
+    /// Like [`Self::open_terminal`]; `launch` chooses a plain shell or a tmux session.
+    pub async fn open_terminal_with(&self, id: &str, interact: Arc<dyn Interact>, cancel: CancellationToken, cols: u16, rows: u16, stats: bool, launch: &ShellLaunch) -> Result<OpenedTerminal> {
         let opts = ConnectOptions { proxy: (self.proxy)(), ..Default::default() };
         let session = connect(&self.db, id, interact, opts, cancel).await?;
         let target_id = session.target.id.clone();
         let hop_names = self.db.read(|c| store::chain_for(c, &target_id))?.into_iter().map(|s| s.name).collect();
-        let (io, stats) = crate::server::shell::open_shell_with_stats(session, cols, rows, stats).await?;
+        let (io, stats) = crate::server::shell::open_shell_launch(session, cols, rows, stats, launch).await?;
         Ok(OpenedTerminal { io, hops: hop_names, stats })
+    }
+
+    /// Connect through the whole chain, ask the server which tmux sessions exist, and disconnect.
+    /// Only a connection failure is an `Err`; a missing tmux or a failed check is a [`TmuxProbe`].
+    pub async fn probe_tmux(&self, id: &str, interact: Arc<dyn Interact>, cancel: CancellationToken) -> Result<TmuxProbe> {
+        let opts = ConnectOptions { proxy: (self.proxy)(), ..Default::default() };
+        let session = connect(&self.db, id, interact, opts, cancel).await?;
+        let result = crate::server::tmux::probe(&session).await;
+        session.close().await;
+        Ok(result)
     }
 
     /// Connect through the whole chain, report, and disconnect. Nothing else is done on the server.

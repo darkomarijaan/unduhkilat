@@ -548,6 +548,7 @@ use unduhkilat_core::term::local::{detect_shells, spawn_local, ShellKind, ShellO
 use unduhkilat_core::server::reconnect;
 use unduhkilat_core::server::service::OpenedTerminal;
 use unduhkilat_core::server::stats::{ServerStats, StatsState};
+use unduhkilat_core::server::tmux::ShellLaunch;
 use unduhkilat_core::term::folders::{self, SavedFolder};
 use unduhkilat_core::term::session::SessionStatus;
 
@@ -770,6 +771,8 @@ pub struct TermTab {
     stats: Option<tokio::sync::watch::Receiver<StatsState>>,
     /// Sambung ulang otomatis yang sedang berjalan (tab SSH yang sambungannya putus).
     retry: Option<Retry>,
+    /// Cara tab SSH membuka shell-nya (langsung atau sesi tmux); dipakai juga saat sambung ulang.
+    launch: ShellLaunch,
 }
 
 /// Jadwal sambung ulang otomatis sebuah tab SSH.
@@ -828,6 +831,7 @@ impl TermTab {
             explorer: None,
             stats: None,
             retry: None,
+            launch: ShellLaunch::Direct,
         }
     }
 }
@@ -1058,6 +1062,7 @@ impl App {
                     explorer: None,
                     stats: None,
                     retry: None,
+                    launch: ShellLaunch::Direct,
                 });
                 self.terminal.active = self.terminal.tabs.len() - 1;
                 self.screen = Screen::Terminal;
@@ -1067,11 +1072,15 @@ impl App {
     }
 
     /// Open a tab with a shell on a saved server (SSH/SFTP), through its jump hosts. Nothing is
-    /// contacted until this is called.
-    pub fn open_ssh_terminal(&mut self, server_id: &str) {
+    /// contacted until this is called. `launch` is a plain shell or a tmux session (chosen in the
+    /// dialog of the Server screen).
+    pub fn open_ssh_terminal(&mut self, server_id: &str, launch: ShellLaunch) {
         let Some(server) = self.servers.servers.iter().find(|s| s.id == server_id).cloned() else { return };
         let via: Vec<String> = server.hops.iter().map(|id| self.servers.servers.iter().find(|x| &x.id == id).map(|x| x.name.clone()).unwrap_or_else(|| "?".into())).collect();
-        let (title, sub) = ssh_tab_labels(&server.name, &via);
+        let (mut title, sub) = ssh_tab_labels(&server.name, &via);
+        if let Some(label) = launch.tab_label() {
+            title = format!("{title} · {label}");
+        }
         let id = self.terminal.next_id;
         self.terminal.next_id += 1;
         self.terminal.tabs.push(TermTab {
@@ -1090,6 +1099,7 @@ impl App {
             explorer: None,
             stats: None,
             retry: None,
+            launch,
         });
         self.terminal.active = self.terminal.tabs.len() - 1;
         self.screen = Screen::Terminal;
@@ -1103,13 +1113,14 @@ impl App {
         let cancel = tokio_util::sync::CancellationToken::new();
         tab.cancel = Some(cancel.clone());
         tab.status = TabStatus::Connecting;
+        let launch = tab.launch.clone();
         // Sesi lama (sudah berakhir) tetap tampil sampai sesi baru siap: isi layar tidak hilang.
         self.servers.shell_waiters.insert(tab_id);
         let stats = self.term_settings().server_stats;
         let (svc, tx, ctx) = (self.manager.servers(), self.tx.clone(), self.ctx.clone());
         let interact = Arc::new(super::servers::UiInteract { tx: tx.clone(), ctx: ctx.clone() });
         self.rt.spawn(async move {
-            let result = svc.open_terminal(&server_id, interact, cancel, 100, 30, stats).await;
+            let result = svc.open_terminal_with(&server_id, interact, cancel, 100, 30, stats, &launch).await;
             let _ = tx.send(super::Msg::Servers(super::servers::ServersMsg::ShellReady { tab_id, result }));
             ctx.request_repaint();
         });
@@ -1137,6 +1148,8 @@ impl App {
                 tab.status = TabStatus::Running;
                 tab.view = TerminalView::default();
                 tab.retry = None;
+                // Sambung ulang berikutnya memasang kembali ke sesi yang sama, tanpa melepas klien lain.
+                tab.launch = tab.launch.for_reconnect();
             }
             Err(e) => {
                 let tab = &mut self.terminal.tabs[idx];
