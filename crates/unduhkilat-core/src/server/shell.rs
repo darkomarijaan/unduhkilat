@@ -2,6 +2,7 @@
 
 use crate::error::{AppError, ErrorCode, Result};
 use crate::server::ssh::SshSession;
+use crate::server::tmux::ShellLaunch;
 use crate::term::source::{SourceControl, SourceEvent, SourceIo};
 use russh::ChannelMsg;
 use std::sync::Arc;
@@ -73,6 +74,12 @@ pub async fn open_shell(session: SshSession, cols: u16, rows: u16) -> Result<Sou
 /// Like [`open_shell`]; with `stats`, also reads the server's system info over the same connection
 /// (see [`crate::server::stats`]) until the shell ends.
 pub async fn open_shell_with_stats(session: SshSession, cols: u16, rows: u16, stats: bool) -> Result<(SourceIo, Option<watch::Receiver<StatsState>>)> {
+    open_shell_launch(session, cols, rows, stats, &ShellLaunch::Direct).await
+}
+
+/// Like [`open_shell_with_stats`]; `launch` chooses a plain login shell or a tmux session. A tmux
+/// session runs as the command of the PTY channel, so detaching (or the session ending) ends the tab.
+pub async fn open_shell_launch(session: SshSession, cols: u16, rows: u16, stats: bool, launch: &ShellLaunch) -> Result<(SourceIo, Option<watch::Receiver<StatsState>>)> {
     let (cols, rows) = (cols.max(1), rows.max(1));
     let mut ch = session
         .handle()
@@ -81,8 +88,16 @@ pub async fn open_shell_with_stats(session: SshSession, cols: u16, rows: u16, st
         .map_err(|_| AppError::new(ErrorCode::ErrConnectionDropped, "Server menolak membuka kanal untuk shell."))?;
     ch.request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[]).await.map_err(|_| gone())?;
     expect_reply(&mut ch, "permintaan PTY").await?;
-    ch.request_shell(true).await.map_err(|_| gone())?;
-    expect_reply(&mut ch, "permintaan shell").await?;
+    match launch.command() {
+        None => {
+            ch.request_shell(true).await.map_err(|_| gone())?;
+            expect_reply(&mut ch, "permintaan shell").await?;
+        }
+        Some(cmd) => {
+            ch.exec(true, cmd.as_bytes()).await.map_err(|_| gone())?;
+            expect_reply(&mut ch, "perintah tmux").await?;
+        }
+    }
 
     let session = Arc::new(session);
     let stop = CancellationToken::new();

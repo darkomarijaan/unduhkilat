@@ -49,6 +49,18 @@ struct Shared {
     conn_handles: Arc<Mutex<Vec<server::Handle>>>,
     /// Answer `exec` requests for `tar` (a stand-in for a server with shell access).
     tar: Arc<AtomicBool>,
+    /// A stand-in for `tmux` on the server (see [`TestSsh::enable_tmux`]).
+    tmux: Arc<Mutex<TmuxFake>>,
+    /// Every `tmux attach-session` / `new-session` command line received over `exec`.
+    exec_log: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone, Default)]
+struct TmuxFake {
+    enabled: bool,
+    installed: bool,
+    /// What `tmux list-sessions -F ...` prints; empty means "no server running".
+    sessions: String,
 }
 
 #[derive(Clone)]
@@ -110,7 +122,7 @@ impl server::Handler for Conn {
 
     async fn channel_open_session(&mut self, c: Channel<Msg>, reply: server::ChannelOpenHandle, s: &mut Session) -> Result<(), Self::Error> {
         self.0.conn_handles.lock().unwrap().push(s.handle());
-        if self.0.sftp_root.is_some() {
+        if self.0.sftp_root.is_some() || self.0.tmux.lock().unwrap().enabled {
             self.1.lock().await.insert(c.id(), c);
         }
         reply.accept().await;
@@ -134,6 +146,39 @@ impl server::Handler for Conn {
     }
 
     async fn exec_request(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+        let text = String::from_utf8_lossy(data).into_owned();
+        let tmux = self.0.tmux.lock().unwrap().clone();
+        if tmux.enabled && text.contains("tmux") {
+            if text.contains("attach-session") || text.contains("new-session") {
+                // Like a shell on a PTY: input is echoed back, `exit` ends it.
+                self.0.exec_log.lock().unwrap().push(text);
+                self.1.lock().await.remove(&channel);
+                self.0.open_shells.fetch_add(1, Ordering::SeqCst);
+                self.0.shell_channels.lock().unwrap().push((channel, session.handle()));
+                session.channel_success(channel)?;
+                session.data(channel, b"[tmux]\r\n".to_vec())?;
+                return Ok(());
+            }
+            let Some(ch) = self.1.lock().await.remove(&channel) else {
+                session.channel_failure(channel)?;
+                return Ok(());
+            };
+            session.channel_success(channel)?;
+            let (out, status) = if !tmux.installed {
+                ("@notmux\n".to_string(), 0)
+            } else if tmux.sessions.is_empty() {
+                ("no server running on /tmp/tmux-1000/default\n".to_string(), 1)
+            } else {
+                (tmux.sessions.clone(), 0)
+            };
+            tokio::spawn(async move {
+                let _ = ch.data_bytes(out.into_bytes()).await;
+                let _ = ch.exit_status(status).await;
+                let _ = ch.eof().await;
+                let _ = ch.close().await;
+            });
+            return Ok(());
+        }
         let root = self.0.sftp_root.clone();
         let ch = if self.0.tar.load(Ordering::SeqCst) { self.1.lock().await.remove(&channel) } else { None };
         match (root, ch) {
@@ -240,6 +285,8 @@ impl TestSsh {
             conn_tasks: Arc::new(Mutex::new(Vec::new())),
             conn_handles: Arc::new(Mutex::new(Vec::new())),
             tar: Arc::new(AtomicBool::new(false)),
+            tmux: Arc::new(Mutex::new(TmuxFake::default())),
+            exec_log: Arc::new(Mutex::new(Vec::new())),
         };
         let (sc, fp) = new_config();
         let config = Arc::new(Mutex::new(sc));
@@ -294,6 +341,18 @@ impl TestSsh {
     /// From now on, `exec` of `tar` (and `command -v tar`) works on this server.
     pub fn enable_tar(&self) {
         self.shared.tar.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer `exec` of `tmux` like a server would: `installed = false` prints the "no tmux" marker,
+    /// otherwise `sessions` is the output of `tmux list-sessions -F ...` (empty: no server running).
+    /// Call before the first connection. `attach-session` and `new-session` open a toy PTY shell.
+    pub fn enable_tmux(&self, installed: bool, sessions: &str) {
+        *self.shared.tmux.lock().unwrap() = TmuxFake { enabled: true, installed, sessions: sessions.to_string() };
+    }
+
+    /// The `attach-session` / `new-session` command lines received so far.
+    pub fn exec_log(&self) -> Vec<String> {
+        self.shared.exec_log.lock().unwrap().clone()
     }
 
     pub fn login_count(&self) -> usize {
